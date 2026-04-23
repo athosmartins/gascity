@@ -748,7 +748,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | SupervisorFsPressureSkippedTickPayload | UnboundEventPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | UnboundEventPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -2827,6 +2827,20 @@ export type StatusWorkCounts = {
     ready: number;
 };
 
+export type StoreMaintenanceDonePayload = {
+    after_bytes: number;
+    before_bytes: number;
+    duration_s: number;
+    snapshot_path: string;
+};
+
+export type StoreMaintenanceFailedPayload = {
+    duration_s: number;
+    error_msg: string;
+    snapshot_path?: string;
+    stage: string;
+};
+
 export type SubmissionCapabilities = {
     supports_follow_up: boolean;
     supports_interrupt_now: boolean;
@@ -2996,6 +3010,10 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeExtmsgOutbound) | ({
     type: 'extmsg.unbound';
 } & TypedEventStreamEnvelopeExtmsgUnbound) | ({
+    type: 'gc.store.maintenance.done';
+} & TypedEventStreamEnvelopeGcStoreMaintenanceDone) | ({
+    type: 'gc.store.maintenance.failed';
+} & TypedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'mail.archived';
 } & TypedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -3336,6 +3354,34 @@ export type TypedEventStreamEnvelopeExtmsgUnbound = {
     subject?: string;
     ts: string;
     type: 'extmsg.unbound';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope gc.store.maintenance.done
+ */
+export type TypedEventStreamEnvelopeGcStoreMaintenanceDone = {
+    actor: string;
+    message?: string;
+    payload: StoreMaintenanceDonePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.done';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope gc.store.maintenance.failed
+ */
+export type TypedEventStreamEnvelopeGcStoreMaintenanceFailed = {
+    actor: string;
+    message?: string;
+    payload: StoreMaintenanceFailedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.failed';
     workflow?: WorkflowEventProjection;
 };
 
@@ -3803,6 +3849,10 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeExtmsgOutbound) | ({
     type: 'extmsg.unbound';
 } & TypedTaggedEventStreamEnvelopeExtmsgUnbound) | ({
+    type: 'gc.store.maintenance.done';
+} & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone) | ({
+    type: 'gc.store.maintenance.failed';
+} & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'mail.archived';
 } & TypedTaggedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -4163,6 +4213,36 @@ export type TypedTaggedEventStreamEnvelopeExtmsgUnbound = {
     subject?: string;
     ts: string;
     type: 'extmsg.unbound';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope gc.store.maintenance.done
+ */
+export type TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: StoreMaintenanceDonePayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.done';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope gc.store.maintenance.failed
+ */
+export type TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: StoreMaintenanceFailedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'gc.store.maintenance.failed';
     workflow?: WorkflowEventProjection;
 };
 
