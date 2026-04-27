@@ -175,8 +175,8 @@ gc session nudge deacon/ "DOG_DONE: backup — synced <count>/<total>, offsite: 
 
 **3. Close work and exit:**
 ```bash
-gc bd close <work-bead> --reason "Backup sync complete"
-gc runtime drain-ack
+{{binary}} bd close <work-bead> --reason "Backup sync complete"
+{{binary}} runtime drain-ack
 exit
 ```
 

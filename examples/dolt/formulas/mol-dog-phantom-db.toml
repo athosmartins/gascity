@@ -114,7 +114,7 @@ The exec order implementation in `assets/scripts/mol-dog-phantom-db.sh` sends th
 canonical escalation body; any formula-driven equivalent must include separate
 phantom and retired-replacement counts and state that no files were moved or deleted:
 ```bash
-gc mail send mayor/ -s "ESCALATION: Unservable Dolt databases detected [HIGH]" \\
+{{binary}} mail send mayor/ -s "ESCALATION: Unservable Dolt databases detected [HIGH]" \\
   -m "Found <count> unservable database directories: <names>. Phantoms: <count>; retired replacements: <count>. No files were moved or deleted."
 ```
 
@@ -141,8 +141,8 @@ gc session nudge deacon/ "DOG_DONE: phantom-db — scanned: <count>, phantoms: <
 
 **3. Close work and exit:**
 ```bash
-gc bd close <work-bead> --reason "Phantom DB scan complete"
-gc runtime drain-ack
+{{binary}} bd close <work-bead> --reason "Phantom DB scan complete"
+{{binary}} runtime drain-ack
 exit
 ```
 

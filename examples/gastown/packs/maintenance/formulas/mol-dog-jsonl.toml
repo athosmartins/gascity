@@ -114,7 +114,7 @@ Compare current export record counts against previous commit.
 - Log anomalies: sudden jumps = pollution, sudden drops = data loss
 - Escalate to Mayor:
   ```bash
-  gc mail send mayor/ -s "ESCALATION: JSONL spike detected [HIGH]" \\
+  {{binary}} mail send mayor/ -s "ESCALATION: JSONL spike detected [HIGH]" \\
     -m "Database: <db>, delta: <pct>%, threshold: {{spike_threshold}}"
   ```
 - Skip push so the spike snapshot stays local until a later successful run
@@ -167,7 +167,7 @@ Track consecutive failures. After {{max_push_failures}} consecutive failures,
 escalate once with an enriched body (archive path, failure count vs threshold,
 the last git push stderr, and remediation steps):
 ```bash
-gc mail send mayor/ -s "ESCALATION: JSONL push failed [HIGH]" \\
+{{binary}} mail send mayor/ -s "ESCALATION: JSONL push failed [HIGH]" \\
   -m "Order: mol-dog-jsonl
 Archive: <archive_repo>
 Consecutive failures: <n> (threshold: {{max_push_failures}})
@@ -207,8 +207,8 @@ gc session nudge deacon/ "DOG_DONE: jsonl — exported <count>/<total>, push: <s
 
 **3. Close work and exit:**
 ```bash
-gc bd close <work-bead> --reason "JSONL export complete"
-gc runtime drain-ack
+{{binary}} bd close <work-bead> --reason "JSONL export complete"
+{{binary}} runtime drain-ack
 exit
 ```
 

@@ -1,8 +1,8 @@
 description = """
 Deacon patrol loop. Poured as a root-only wisp on startup:
 
-  gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}'
-  gc bd update $WISP --assignee=$GC_AGENT
+  {{binary}} bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}'
+  {{binary}} bd update $WISP --assignee=$GC_AGENT
 
 Each wisp is ONE iteration: check inbox, run town-wide coordination
 tasks, pour the next iteration. On crash, re-read the formula steps
@@ -24,7 +24,7 @@ can't or shouldn't do.
    (Not "are they running" — that's the controller's job.)
 2. **Utility agent health** — detect stuck dogs, dispatch shutdown dance.
 3. **Orphan process cleanup** — kill leaked claude/node subagent processes.
-4. **System diagnostics** — run `gc doctor`, act on findings.
+4. **System diagnostics** — run `{{binary}} doctor`, act on findings.
 
 Mechanical tasks (gate evaluation, cross-rig deps, orphan bead sweeps,
 wisp compaction) are handled by exec orders in the maintenance
@@ -69,7 +69,7 @@ RSS_MB=$((RSS / 1024))
 
 If RSS > 1500 MB or context feels heavy, request a restart:
 ```bash
-gc runtime request-restart
+{{binary}} runtime request-restart
 ```
 This sets `GC_RESTART_REQUESTED` metadata on the session and blocks
 forever. The controller will kill and restart the session on the next
@@ -78,7 +78,7 @@ the new session re-reads formula steps and resumes from context.
 
 **2. Check mail:**
 ```bash
-gc mail inbox
+{{binary}} mail inbox
 ```
 
 Handle each message type:
@@ -86,7 +86,7 @@ Handle each message type:
 **HELP / Escalation:**
 Assess the request. Can you help directly? If not, escalate:
 ```bash
-gc mail send mayor/ -s "ESCALATION: <agent> needs help" -m "<details>"
+{{binary}} mail send mayor/ -s "ESCALATION: <agent> needs help" -m "<details>"
 ```
 Archive after handling.
 
@@ -163,7 +163,7 @@ something is stuck. This is exactly why an LLM does it, not Go code.
 
 **For stuck coordination agents, file a warrant:**
 ```bash
-gc bd create --type=task --label=warrant \
+{{binary}} bd create --type=task --label=warrant \
   --title="Stuck: <rig>/<role>" \
   --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 ```
@@ -195,9 +195,9 @@ closes that gap.
 - `B` = the most recent bead.updated_at across those beads (work signal)
 
 ```bash
-gc agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
-    ASSIGNED=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
-    LATEST=$(gc bd list --status=open --assignee="$AGENT" --json --limit=0 \\
+{{binary}} agents list --json --active | jq -r '.[] | .agent_id' | while read -r AGENT; do
+    ASSIGNED=$({{binary}} bd list --status=open --assignee="$AGENT" --json --limit=0 | jq 'length')
+    LATEST=$({{binary}} bd list --status=open --assignee="$AGENT" --json --limit=0 \\
         | jq -r '[.[].updated_at] | max // ""')
     printf '%s\\t%s\\t%s\\n' "$AGENT" "$ASSIGNED" "$LATEST"
 done
@@ -231,7 +231,7 @@ If the nudge doesn't unstick within the next patrol cycle, escalate
 by filing a warrant for the dog pool:
 
 ```bash
-gc bd create --type=task --label=warrant \\
+{{binary}} bd create --type=task --label=warrant \\
     --title="Stuck queue: <session> — $ASSIGNED beads, no activity $duration" \\
     --metadata '{"target":"<session>","reason":"queue starvation: N beads, no bead.updated_at progress","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 ```
@@ -259,7 +259,7 @@ wisp timestamps.
 
 **Step 1: Find active utility agent work:**
 ```bash
-gc bd list --status=in_progress --metadata-field gc.routed_to={{binding_prefix}}dog --json --limit=0
+{{binary}} bd list --status=in_progress --metadata-field gc.routed_to={{binding_prefix}}dog --json --limit=0
 ```
 
 **Step 2: For each, assess progress:**
@@ -272,7 +272,7 @@ No hardcoded thresholds. Use judgment.
 
 **Step 3: For stuck utility agents, file a warrant:**
 ```bash
-gc bd create --type=task --label=warrant \
+{{binary}} bd create --type=task --label=warrant \
   --title="Stuck dog: <agent>" \
   --metadata '{"target":"<session>","reason":"<reason>","requester":"deacon","gc.routed_to":"{{binding_prefix}}dog"}'
 ```
@@ -328,7 +328,7 @@ are wedged (the latter is what first prompted this check to exist).
 process is listening on the port, or a process is listening but not
 answering SQL (wedged goroutines, migration lock, saturated pool).
 ```bash
-gc mail send mayor/ -s "ESCALATION: Dolt server unreachable [CRITICAL]" \\
+{{binary}} mail send mayor/ -s "ESCALATION: Dolt server unreachable [CRITICAL]" \\
   -m "gc dolt health reports server.reachable=false"
 ```
 
@@ -370,10 +370,10 @@ id = "system-health"
 title = "Run system diagnostics"
 needs = ["dolt-health"]
 description = """
-Run `gc doctor` for a quick workspace health check.
+Run `{{binary}} doctor` for a quick workspace health check.
 
 ```bash
-gc doctor
+{{binary}} doctor
 ```
 
 **For simple findings:** Act directly (e.g., stale lock files, temp
@@ -381,7 +381,7 @@ directory cleanup).
 
 **For complex findings:** Escalate to mayor with context:
 ```bash
-gc mail send mayor/ -s "DOCTOR: <finding>" -m "<details>"
+{{binary}} mail send mayor/ -s "DOCTOR: <finding>" -m "<details>"
 ```
 
 Close this step after check."""
@@ -399,21 +399,21 @@ End of patrol cycle. Pour the next iteration, then wait or exit.
 
 If context feels heavy or RSS is high:
 ```bash
-gc runtime request-restart
+{{binary}} runtime request-restart
 ```
 This blocks forever. The controller restarts you. The next wisp
 is already assigned — the new session resumes from context.
 
 **2. Quick inbox check (end-of-cycle hygiene):**
 ```bash
-gc mail inbox
+{{binary}} mail inbox
 ```
 Handle any urgent messages that arrived during patrol. Archive the rest.
 
 **3. Pour next iteration BEFORE burning:**
 ```bash
-NEXT=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
-gc bd update "$NEXT" --assignee=$GC_AGENT
+NEXT=$({{binary}} bd mol wisp mol-deacon-patrol --root-only --var binding_prefix='{{binding_prefix}}' --json | jq -r '.new_epic_id')
+{{binary}} bd update "$NEXT" --assignee=$GC_AGENT
 ```
 
 **4. Wait before next cycle:**
@@ -421,11 +421,11 @@ gc bd update "$NEXT" --assignee=$GC_AGENT
 sleep {{event_timeout}}
 ```
 
-Previous implementation watched `gc events --type=bead.updated` for fast wake-up, but cache-reconcile fires that event constantly, turning the watch into a tight loop with no useful backoff. Fixed sleep gives predictable idle cost.
+Previous implementation watched `{{binary}} events --type=bead.updated` for fast wake-up, but cache-reconcile fires that event constantly, turning the watch into a tight loop with no useful backoff. Fixed sleep gives predictable idle cost.
 
 **5. Burn this wisp:**
 ```bash
-gc bd mol burn <this-wisp-id> --force
+{{binary}} bd mol burn <this-wisp-id> --force
 ```
 
 The new wisp is ready. Re-read formula steps to start

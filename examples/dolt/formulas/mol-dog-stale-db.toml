@@ -3,7 +3,7 @@ Detect and clean stale Dolt databases and orphan Dolt processes.
 
 This formula shells out to `gc dolt-cleanup --json`, parses the
 `gc.dolt.cleanup.v1` envelope, and emits one summary line per stage
-to `gc events` so operators skimming a long scrollback can spot
+to `{{binary}} events` so operators skimming a long scrollback can spot
 trends. The full JSON report is appended to the work bead so a
 follow-up reader can `bd show <id>` to see details.
 
@@ -78,7 +78,7 @@ DRAIN_ACKED=0
 cleanup() {
   rm -rf "$TMP_DIR"
   if [ "$DRAIN_ACKED" -ne 1 ]; then
-    gc runtime drain-ack || true
+    {{binary}} runtime drain-ack || true
   fi
 }
 trap cleanup EXIT
@@ -106,7 +106,7 @@ run_or_warn() {
 
 drain_ack_once() {
   if [ "$DRAIN_ACKED" -ne 1 ]; then
-    gc runtime drain-ack
+    {{binary}} runtime drain-ack
     DRAIN_ACKED=1
   fi
 }
