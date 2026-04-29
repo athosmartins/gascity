@@ -16,7 +16,7 @@ import (
 // as migration proceeds.
 func TestNoHardcodedGCInErrorMessages(t *testing.T) {
 	// Ratchet threshold — set to current count. Lower this as files are migrated.
-	const maxViolations = 153
+	const maxViolations = 95
 
 	dir := "."
 	entries, err := os.ReadDir(dir)

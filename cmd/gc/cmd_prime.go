@@ -258,7 +258,7 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 	if strictMode {
 		switch {
 		case agentName == "":
-			fmt.Fprintf(stderr, "gc prime: --strict requires an agent name (from args, GC_ALIAS, or GC_AGENT)\n") //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: --strict requires an agent name (from args, GC_ALIAS, or GC_AGENT)\n", cmdName("prime")) //nolint:errcheck
 			return 1
 		case len(resolvedAgents) == 0:
 			fmt.Fprintf(stderr, "%s: agent %q not found in city config\n", cmdName("prime"), agentName) //nolint:errcheck

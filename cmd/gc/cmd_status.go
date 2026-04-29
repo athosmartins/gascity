@@ -69,7 +69,7 @@ func cmdRigStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) int 
 		}
 	}
 	if !found {
-		fmt.Fprintln(stderr, rigNotFoundMsg("gc rig status", rigName, cfg)) //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, rigNotFoundMsg(cmdName("rig status"), rigName, cfg)) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 

@@ -1032,13 +1032,13 @@ func printSourceWorkflowConflict(stderr io.Writer, conflictErr *sourceworkflow.C
 	}
 	_, _ = fmt.Fprintf(
 		stderr,
-		"gc sling: source bead %s already has live workflow(s): %s\n",
+		cmdName("sling")+": source bead %s already has live workflow(s): %s\n",
 		conflictErr.SourceBeadID,
 		strings.Join(conflictErr.WorkflowIDs, ","),
 	)
 	_, _ = fmt.Fprintf(
 		stderr,
-		"gc sling: use --force to override, or %s to clean up\n",
+		cmdName("sling")+": use --force to override, or %s to clean up\n",
 		sourceWorkflowCleanupCommand(conflictErr.SourceBeadID, storeRef),
 	)
 }
