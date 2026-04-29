@@ -91,7 +91,7 @@ func finalizeInit(cityPath string, stdout, stderr io.Writer, opts initFinalizeOp
 	}
 	prefix := config.EffectiveHQPrefix(cfg)
 	if _, err := initDirIfReady(cityPath, cityPath, prefix); err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", opts.commandName, err)        //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: %v\n", opts.commandName, err)                   //nolint:errcheck // best-effort stderr
 		fmt.Fprintf(stderr, "hint: run %q for diagnostics\n", cmdName("doctor")) //nolint:errcheck // best-effort stderr
 		return 1
 	}

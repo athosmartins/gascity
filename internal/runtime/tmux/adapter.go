@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/overlay"
+	"github.com/gastownhall/gascity/internal/progname"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
-	"github.com/gastownhall/gascity/internal/progname"
 )
 
 // Provider adapts [Tmux] to the [runtime.Provider] interface.

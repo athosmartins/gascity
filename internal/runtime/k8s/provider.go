@@ -17,8 +17,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/progname"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 // Compile-time interface check.

@@ -35,7 +35,7 @@ gc [flags]
 | [gc doctor](#gc-doctor) | Check workspace health |
 | [gc dolt-cleanup](#gc-dolt-cleanup) | Find and remove orphaned Dolt databases (Go-side core) |
 | [gc event](#gc-event) | Event operations |
-| [gc events](#gc-events) | Show events from the GC API |
+| [gc events](#gc-events) | Show events from the gc API |
 | [gc formula](#gc-formula) | Manage and inspect formulas |
 | [gc graph](#gc-graph) | Show dependency graph for beads |
 | [gc handoff](#gc-handoff) | Send handoff mail and restart controller-managed sessions |
@@ -1219,7 +1219,7 @@ gc event emit <type> [flags]
 
 ## gc events
 
-Show events from the GC API with optional filtering.
+Show events from the gc API with optional filtering.
 
 The API is the source of truth for both city-scoped and supervisor-scoped
 events. In a city directory (or with --city), this command reflects the
@@ -1248,7 +1248,7 @@ gc events
 |------|------|---------|-------------|
 | `--after` | uint64 |  | Resume from this city event sequence number (city scope only) |
 | `--after-cursor` | string |  | Resume from this supervisor event cursor (supervisor scope only) |
-| `--api` | string |  | GC API server URL override (auto-discovered by default) |
+| `--api` | string |  | gc API server URL override (auto-discovered by default) |
 | `--follow` | bool |  | Continuously stream events as they arrive |
 | `--payload-match` | stringArray |  | Filter by payload field (key=value or key.subkey=value, repeatable) |
 | `--seq` | bool |  | Print the current head cursor and exit |

@@ -2502,10 +2502,10 @@ func TestIdeaToPlanFormulaUsesSupportedPrimitives(t *testing.T) {
 	body := string(data)
 	for _, want := range []string{
 		`formula = "mol-idea-to-plan"`,
-		`gc sling "$REVIEW_TARGET" "$LEG_BEAD" --on {{review_formula}}`,
-		`gc bd create`,
-		`gc mail send`,
-		`gc bd dep add`,
+		`{{binary}} sling "$REVIEW_TARGET" "$LEG_BEAD" --on {{review_formula}}`,
+		`{{binary}} bd create`,
+		`{{binary}} mail send`,
+		`{{binary}} bd dep add`,
 		`Do NOT use unsupported upstream shortcuts`,
 		`This is the only required human gate.`,
 	} {
@@ -2526,9 +2526,9 @@ func TestReviewLegFormulaPersistsReportAndNotifiesCoordinator(t *testing.T) {
 	for _, want := range []string{
 		`formula = "mol-review-leg"`,
 		`coordinator`,
-		`gc bd update {{issue}} --notes`,
-		`gc mail send "$COORD"`,
-		`gc bd update {{issue}} --status=closed`,
+		`{{binary}} bd update {{issue}} --notes`,
+		`{{binary}} mail send "$COORD"`,
+		`{{binary}} bd update {{issue}} --status=closed`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("review-leg formula missing %q", want)

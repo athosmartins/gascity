@@ -122,7 +122,7 @@ func containsHardcodedGC(line string) bool {
 
 // isAllowlisted returns true if the line matches a known-safe pattern
 // that is NOT a hardcoded binary name.
-func isAllowlisted(line, filename string, lineNo int) bool {
+func isAllowlisted(line, filename string, _ int) bool {
 	// .gc/ runtime directory references
 	if strings.Contains(line, `".gc`) {
 		return true

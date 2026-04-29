@@ -14,8 +14,10 @@ import (
 //	-X main.binaryName=city
 var binaryName = "gc"
 
-var progOnce sync.Once
-var progCached string
+var (
+	progOnce   sync.Once
+	progCached string
+)
 
 // prog returns the binary name for use in error messages, help text, and
 // examples. It prefers os.Args[0] at runtime, falling back to the

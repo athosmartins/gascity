@@ -351,7 +351,7 @@ func cmdRuntimeDrainCheck(args []string, jsonOutput bool, stdout, stderr io.Writ
 		target, err := resolveSessionRuntimeTarget(args[0], stderr)
 		if err != nil {
 			cmdErr(stderr, "runtime drain-check", err)
-			return 1                                                 // silent — same as current "not draining" behavior
+			return 1 // silent — same as current "not draining" behavior
 		}
 		sp := newSessionProvider()
 		dops := newDrainOps(sp)

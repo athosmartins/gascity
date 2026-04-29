@@ -31,7 +31,7 @@
 #   GC_DOLT_GC_DRY_RUN   (optional) — when set, prints what would happen
 #                        but does not execute CALL DOLT_GC().
 set -e
-GC_BIN="${GC_BIN:-gc}"u
+GC_BIN="${GC_BIN:-gc}"
 
 : "${GC_CITY_PATH:?GC_CITY_PATH must be set}"
 : "${GC_DOLT_PORT:=}"

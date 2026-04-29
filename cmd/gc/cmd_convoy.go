@@ -568,7 +568,7 @@ func openAllConvoyStoresAt(cityPath string, stderr io.Writer, cmdName string) ([
 		return openStoreAtForCity(storeDir, cityPath)
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)                   //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)                           //nolint:errcheck // best-effort stderr
 		fmt.Fprintf(stderr, "hint: run %q for diagnostics\n", prog()+" doctor") //nolint:errcheck // best-effort stderr
 		return nil, 1
 	}
@@ -706,7 +706,7 @@ func openConvoyStoreByIDAt(convoyID, cityPath string, stderr io.Writer, cmdName 
 		return openStoreAtForCity(storeDir, cityPath)
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)                   //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err)                           //nolint:errcheck // best-effort stderr
 		fmt.Fprintf(stderr, "hint: run %q for diagnostics\n", prog()+" doctor") //nolint:errcheck // best-effort stderr
 		return nil, 1
 	}
