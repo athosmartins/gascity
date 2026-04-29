@@ -95,7 +95,7 @@ and can be managed even when the controller is offline.`,
 			if len(args) == 0 {
 				return cmd.Help()
 			}
-			fmt.Fprintf(stderr, "gc trace: unknown subcommand %q\n", args[0]) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: unknown subcommand %q\n", cmdName("trace"), args[0]) //nolint:errcheck
 			return errExit
 		},
 	}
@@ -249,16 +249,16 @@ func newTraceTailCmd(stdout, stderr io.Writer) *cobra.Command {
 
 func cmdTraceStart(template, forDuration string, auto bool, level string, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(template) == "" {
-		fmt.Fprintln(stderr, "gc trace start: missing --template") //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: missing --template\n", cmdName("trace start")) //nolint:errcheck
 		return 1
 	}
 	dur, err := time.ParseDuration(forDuration)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc trace start: invalid --for %q: %v\n", forDuration, err) //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: invalid --for %q: %v\n", cmdName("trace start"), forDuration, err) //nolint:errcheck
 		return 1
 	}
 	if dur <= 0 {
-		fmt.Fprintf(stderr, "gc trace start: invalid duration %q\n", forDuration) //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: invalid duration %q\n", cmdName("trace start"), forDuration) //nolint:errcheck
 		return 1
 	}
 	cityPath, err := resolveCity()
@@ -303,7 +303,7 @@ func cmdTraceStart(template, forDuration string, auto bool, level string, stdout
 
 func cmdTraceStop(template string, all bool, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(template) == "" {
-		fmt.Fprintln(stderr, "gc trace stop: missing --template") //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: missing --template\n", cmdName("trace stop")) //nolint:errcheck
 		return 1
 	}
 	cityPath, err := resolveCity()
@@ -419,7 +419,7 @@ func cmdTraceShow(template, since, traceID, tickID, recordType, reason string, j
 	if since != "" {
 		d, err := time.ParseDuration(since)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc trace show: invalid --since %q: %v\n", since, err) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: invalid --since %q: %v\n", cmdName("trace show"), since, err) //nolint:errcheck
 			return 1
 		}
 		filter.Since = time.Now().Add(-d)
@@ -484,7 +484,7 @@ func cmdTraceReasons(template, since string, stdout, stderr io.Writer) int {
 	if since != "" {
 		d, err := time.ParseDuration(since)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc trace reasons: invalid --since %q: %v\n", since, err) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: invalid --since %q: %v\n", cmdName("trace reasons"), since, err) //nolint:errcheck
 			return 1
 		}
 		filter.Since = time.Now().Add(-d)
@@ -519,7 +519,7 @@ func cmdTraceTail(template, since string, stdout, stderr io.Writer) int {
 	if since != "" {
 		d, err := time.ParseDuration(since)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc trace tail: invalid --since %q: %v\n", since, err) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: invalid --since %q: %v\n", cmdName("trace tail"), since, err) //nolint:errcheck
 			return 1
 		}
 		filter.Since = time.Now().Add(-d)

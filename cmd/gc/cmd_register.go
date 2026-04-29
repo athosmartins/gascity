@@ -67,7 +67,7 @@ func doRegisterWithOptionsJSON(args []string, nameOverride string, jsonOut bool,
 
 	// Verify it's a city directory (city.toml is the defining marker).
 	if _, sErr := os.Stat(filepath.Join(cityPath, "city.toml")); sErr != nil {
-		fmt.Fprintf(stderr, "gc register: %s is not a city directory (no city.toml found)\n", cityPath) //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: %s is not a city directory (no city.toml found)\n", cmdName("register"), cityPath) //nolint:errcheck
 		return 1
 	}
 	registerName, err := resolveRegistrationName(cityPath, nameOverride)

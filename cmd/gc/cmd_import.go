@@ -484,7 +484,7 @@ func doImportAdd(fs fsys.FS, cityPath, source, nameOverride, versionFlag string,
 		name = deriveImportName(source)
 	}
 	if name == "" {
-		fmt.Fprintln(stderr, "gc import add: could not derive import name; use --name") //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: could not derive import name; use --name\n", cmdName("import add")) //nolint:errcheck
 		return 1
 	}
 	if strings.HasPrefix(name, "default-rig:") {
@@ -492,7 +492,7 @@ func doImportAdd(fs fsys.FS, cityPath, source, nameOverride, versionFlag string,
 		return 1
 	}
 	if _, exists := scope.imports[name]; exists {
-		fmt.Fprintf(stderr, "gc import add: import %q already exists\n", name) //nolint:errcheck
+		fmt.Fprintf(stderr, "%s: import %q already exists\n", cmdName("import add"), name) //nolint:errcheck
 		return 1
 	}
 
@@ -555,7 +555,7 @@ func doImportRemove(fs fsys.FS, cityPath, name string, stdout, stderr io.Writer)
 			return 1
 		}
 		if !removed {
-			fmt.Fprintf(stderr, "gc import remove: import %q not found\n", name) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: import %q not found\n", cmdName("import remove"), name) //nolint:errcheck
 			return 1
 		}
 	} else {
@@ -711,11 +711,11 @@ func doImportUpgrade(cityPath, target string, stdout, stderr io.Writer) int {
 		}
 		targetImp, ok := lookupInspectableImport(target, inspectImports)
 		if !ok {
-			fmt.Fprintf(stderr, "gc import upgrade: import %q not found\n", target) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: import %q not found\n", cmdName("import upgrade"), target) //nolint:errcheck
 			return 1
 		}
 		if !isRemoteImportSource(targetImp.Source) {
-			fmt.Fprintf(stderr, "gc import upgrade: import %q is a path import and cannot be upgraded\n", target) //nolint:errcheck
+			fmt.Fprintf(stderr, "%s: import %q is a path import and cannot be upgraded\n", cmdName("import upgrade"), target) //nolint:errcheck
 			return 1
 		}
 		lock, err = syncImportsSelective(cityPath, allImports, map[string]struct{}{

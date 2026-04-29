@@ -683,7 +683,7 @@ Use --delete with --apply to also delete closed beads.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if deleteBeads && !apply {
-				fmt.Fprintln(stderr, "gc workflow delete-source: --delete requires --apply") //nolint:errcheck
+				fmt.Fprintf(stderr, "%s: --delete requires --apply\n", cmdName("workflow delete-source")) //nolint:errcheck
 				return errExit
 			}
 			selector, err := parseSourceWorkflowStoreSelector(rigName, storeRef)
@@ -777,7 +777,7 @@ func cmdWorkflowDelete(workflowID string, force, deleteBeads bool, stdout, stder
 		}
 	}
 	if total == 0 {
-		fmt.Fprintf(stderr, "gc workflow delete: no beads found for workflow %s\n", workflowID) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: no beads found for workflow %s\n", cmdName("workflow delete"), workflowID) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
@@ -1160,7 +1160,7 @@ func cmdWorkflowReopenSource(sourceBeadID string, selector sourceWorkflowStoreSe
 		return 1
 	}
 	if target.storeView.store == nil || strings.TrimSpace(target.sourceBead.ID) == "" {
-		_, _ = fmt.Fprintf(stderr, "gc workflow reopen-source: getting bead %q: %v\n", sourceBeadID, beads.ErrNotFound)
+		_, _ = fmt.Fprintf(stderr, "%s: getting bead %q: %v\n", cmdName("workflow reopen-source"), sourceBeadID, beads.ErrNotFound)
 		return 1
 	}
 	ctx, cancel := sourceWorkflowCommandContext()
