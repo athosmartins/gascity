@@ -129,6 +129,46 @@ func TestRunDoltCleanup_FlagOverridesEverything(t *testing.T) {
 	}
 }
 
+func TestRunDoltCleanup_RigsProtectedFromRegistry(t *testing.T) {
+	// Wireframe-6 schema requires rigs_protected to enumerate registered rigs.
+	// One entry per registered rig (HQ + non-HQ); each rig's DB name equals
+	// its rig name in this codebase (`gascity`, `beads`, etc.). Order is
+	// HQ-first to match the resolver's port-resolution preference.
+	fs := fsys.NewFake()
+	rigs := []resolverRig{
+		{Name: "gascity", Path: "/city", HQ: true},
+		{Name: "beads", Path: "/beads", HQ: false},
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		Rigs:  rigs,
+		FS:    fs,
+		JSON:  true,
+		Probe: false,
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	}
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	want := []CleanupRigProtection{
+		{Rig: "gascity", DB: "gascity"},
+		{Rig: "beads", DB: "beads"},
+	}
+	if len(r.RigsProtected) != len(want) {
+		t.Fatalf("RigsProtected len = %d, want %d (got %v)", len(r.RigsProtected), len(want), r.RigsProtected)
+	}
+	for i, w := range want {
+		if r.RigsProtected[i] != w {
+			t.Errorf("RigsProtected[%d] = %+v, want %+v", i, r.RigsProtected[i], w)
+		}
+	}
+}
+
 func TestRunDoltCleanup_DryRunReportsReapPlanWithoutKilling(t *testing.T) {
 	fs := fsys.NewFake()
 	fs.Files["/city/.beads/dolt-server.port"] = []byte("28231\n")

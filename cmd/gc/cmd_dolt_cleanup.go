@@ -163,6 +163,7 @@ func runDoltCleanup(opts cleanupOptions, stdout, stderr io.Writer) int {
 			Source:   resolution.Source,
 			Fallback: resolution.Fallback,
 		},
+		RigsProtected: rigProtections(opts.Rigs),
 	}
 
 	if opts.Probe {
@@ -373,6 +374,19 @@ schema (gc.dolt.cleanup.v1) is stable from day one.`,
 	return cmd
 }
 
+
+// rigProtections projects the resolver's rig list into the JSON-envelope
+// rigs_protected entries. Each rig's DB name equals its rig name in the gc
+// data model (`gascity`, `beads`, etc.). Order is HQ-first to match the
+// port-resolution preference, so the human-readable PROTECTED section and
+// JSON output enumerate rigs in the same operator-meaningful order.
+func rigProtections(rigs []resolverRig) []CleanupRigProtection {
+	out := make([]CleanupRigProtection, 0, len(rigs))
+	for _, r := range orderRigsHQFirst(rigs) {
+		out = append(out, CleanupRigProtection{Rig: r.Name, DB: r.Name})
+	}
+	return out
+}
 
 // loadResolverRigs builds the resolver's rig list from a city config. The HQ
 // rig (the city itself) is added first so it wins the AD-04 §4.1 tie when
