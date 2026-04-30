@@ -485,17 +485,17 @@ func newDoltCleanupCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Find and remove orphaned Dolt databases (Go-side core)",
 		Long: `gc dolt-cleanup is the Go-side implementation of the operational Dolt
 cleanup tool. It resolves the Dolt server port via the AD-04 chain
-(--port > city dolt.port > <rigRoot>/.beads/dolt-server.port > 3307)
-and reaps orphaned dolt sql-server processes left over from leaked
-test harnesses.
+(--port > city dolt.port > <rigRoot>/.beads/dolt-server.port > 3307),
+drops stale test/agent databases, calls DOLT_PURGE_DROPPED_DATABASES
+to reclaim disk, and reaps orphaned dolt sql-server processes left
+over from leaked test harnesses.
 
-Dry-run by default. Pass --force to actually kill orphans (SIGTERM
-followed by SIGKILL after a short grace period). Active rig dolt
-servers and processes outside the test-config-path allowlist are
-always protected — see the PROTECTED section of the report.
+Dry-run by default. Pass --force to actually drop, purge, and kill.
+Active rig dolt servers, registered rig databases, and processes
+outside the test-config-path allowlist are always protected — see
+the PROTECTED section of the report.
 
-Drop and purge stages are wired in subsequent commits; the JSON
-schema (gc.dolt.cleanup.v1) is stable from day one.`,
+JSON envelope schema is stable: gc.dolt.cleanup.v1.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cityPath, err := resolveCity()
@@ -521,6 +521,26 @@ schema (gc.dolt.cleanup.v1) is stable from day one.`,
 				Host:     cfg.Dolt.Host,
 				HomeDir:  homeDir,
 			}
+
+			// Resolve the port first so we can open a Dolt connection at the
+			// right address. Failing to open the connection isn't fatal —
+			// the report still renders, just with empty drop/purge sections
+			// and an entry in errors.
+			resolution := ResolveDoltPort(PortResolverInput{
+				Flag: opts.Flag, CityPort: opts.CityPort, Rigs: opts.Rigs, FS: opts.FS,
+			})
+			host := opts.Host
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			client, openErr := newSQLCleanupDoltClient(host, strconv.Itoa(resolution.Port))
+			if openErr != nil {
+				fmt.Fprintf(stderr, "gc dolt-cleanup: warn: %v\n", openErr) //nolint:errcheck
+			} else {
+				opts.DoltClient = client
+				defer client.Close() //nolint:errcheck
+			}
+
 			if code := runDoltCleanup(opts, stdout, stderr); code != 0 {
 				return errExit
 			}
