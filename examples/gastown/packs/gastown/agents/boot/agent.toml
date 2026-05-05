@@ -2,3 +2,8 @@ scope = "city"
 wake_mode = "fresh"
 work_dir = ".gc/agents/boot"
 max_active_sessions = 1
+# Throttle re-spawn: with wake_mode = "fresh", the controller's
+# drain-followup poke would otherwise re-spawn boot within ~15s of
+# every drain, regardless of patrol_interval. min_wake_interval bounds
+# the wake cadence from the bead's last_woke_at.
+min_wake_interval = "5m"

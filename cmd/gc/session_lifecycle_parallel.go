@@ -112,6 +112,38 @@ func startCandidateHasTemplateDependencies(candidate startCandidate, cfg *config
 	return cfgAgent != nil && len(cfgAgent.DependsOn) > 0
 }
 
+// minWakeIntervalDefersCandidate reports whether the candidate's agent has
+// a positive min_wake_interval and the candidate's previous successful
+// wake completed too recently for a new wake. Returns false (do not defer)
+// when no throttle is configured, when creation_complete_at is missing or
+// unparseable, or when the candidate has no backing agent in cfg. Uses
+// creation_complete_at rather than last_woke_at because last_woke_at is
+// cleared by the death/churn tracking path during the gap between drain
+// and the next wake attempt; creation_complete_at survives that gap and
+// represents the previous successful wake.
+func minWakeIntervalDefersCandidate(candidate startCandidate, cfg *config.City, clk clock.Clock) bool {
+	if candidate.session == nil {
+		return false
+	}
+	cfgAgent := findAgentByTemplate(cfg, candidate.logicalTemplate(cfg))
+	if cfgAgent == nil {
+		return false
+	}
+	mwi := cfgAgent.MinWakeIntervalDuration()
+	if mwi <= 0 {
+		return false
+	}
+	completedStr := strings.TrimSpace(candidate.session.Metadata["creation_complete_at"])
+	if completedStr == "" {
+		return false
+	}
+	completed, err := time.Parse(time.RFC3339, completedStr)
+	if err != nil {
+		return false
+	}
+	return clk.Now().Sub(completed) < mwi
+}
+
 func asyncStartBatchNeedsFollowUp(candidates []startCandidate, cfg *config.City) bool {
 	for _, candidate := range candidates {
 		if startCandidateHasTemplateDependencies(candidate, cfg) {
@@ -1490,6 +1522,10 @@ func executePlannedStartsTraced(
 		for _, candidate := range waveCandidates {
 			if !allDependenciesAliveForTemplateWithClock(candidate.logicalTemplate(cfg), cfg, desiredState, sp, cityName, store, clk) {
 				logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "blocked_on_dependencies", time.Time{}, time.Time{}, nil)
+				continue
+			}
+			if minWakeIntervalDefersCandidate(candidate, cfg, clk) {
+				logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_min_wake_interval", time.Time{}, time.Time{}, nil)
 				continue
 			}
 			ready = append(ready, candidate)
