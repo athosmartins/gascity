@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -1450,6 +1452,113 @@ func TestVerifyBeadsInPodChecksCanonicalFiles(t *testing.T) {
 	}
 }
 
+func TestInitBeadsInPod_PatchCmdReferencesIdentityToml(t *testing.T) {
+	fake := newFakeK8sOps()
+	hostScope := t.TempDir()
+	writeHostIdentityFile(t, hostScope, "canonical")
+	cfg := runtime.Config{
+		WorkDir: hostScope,
+		Env: map[string]string{
+			"GC_DOLT_HOST":    podManagedDoltHost,
+			"GC_DOLT_PORT":    podManagedDoltPort,
+			"GC_BEADS_PREFIX": "demo",
+		},
+	}
+
+	if err := initBeadsInPod(context.Background(), fake, "gc-test-pod", cfg, "/workspace/demo", podManagedDoltHost, podManagedDoltPort); err != nil {
+		t.Fatalf("initBeadsInPod: %v", err)
+	}
+	script := firstShellScript(t, fake)
+	if !strings.Contains(script, ".beads/identity.toml") {
+		t.Fatalf("patch script missing identity.toml:\n%s", script)
+	}
+}
+
+func TestInitBeadsInPod_PatchCmdSkipsIdentityWhenHostL1Absent(t *testing.T) {
+	fake := newFakeK8sOps()
+	cfg := runtime.Config{
+		WorkDir: t.TempDir(),
+		Env: map[string]string{
+			"GC_DOLT_HOST":    podManagedDoltHost,
+			"GC_DOLT_PORT":    podManagedDoltPort,
+			"GC_BEADS_PREFIX": "demo",
+		},
+	}
+
+	if err := initBeadsInPod(context.Background(), fake, "gc-test-pod", cfg, "/workspace/demo", podManagedDoltHost, podManagedDoltPort); err != nil {
+		t.Fatalf("initBeadsInPod: %v", err)
+	}
+	script := firstShellScript(t, fake)
+	if !strings.Contains(script, "if [ -n '' ]") {
+		t.Fatalf("patch script did not render empty identity guard when host L1 is absent:\n%s", script)
+	}
+}
+
+func TestInitBeadsInPod_PatchCmdBase64EncodesL1Content(t *testing.T) {
+	fake := newFakeK8sOps()
+	hostScope := t.TempDir()
+	identityBody := "[project]\nid = \"canonical\"\n"
+	writeHostIdentityFileBody(t, hostScope, identityBody)
+	cfg := runtime.Config{
+		WorkDir: hostScope,
+		Env: map[string]string{
+			"GC_DOLT_HOST":    podManagedDoltHost,
+			"GC_DOLT_PORT":    podManagedDoltPort,
+			"GC_BEADS_PREFIX": "demo",
+		},
+	}
+
+	if err := initBeadsInPod(context.Background(), fake, "gc-test-pod", cfg, "/workspace/demo", podManagedDoltHost, podManagedDoltPort); err != nil {
+		t.Fatalf("initBeadsInPod: %v", err)
+	}
+	script := firstShellScript(t, fake)
+	encoded := base64.StdEncoding.EncodeToString([]byte(identityBody))
+	if !strings.Contains(script, encoded) {
+		t.Fatalf("patch script missing encoded L1 %q:\n%s", encoded, script)
+	}
+}
+
+func TestVerifyBeadsInPod_RequiresIdentityToml(t *testing.T) {
+	fake := newFakeK8sOps()
+	cfg := runtime.Config{
+		Env: map[string]string{
+			"GC_DOLT_PORT": podManagedDoltPort,
+		},
+	}
+
+	if err := verifyBeadsInPod(context.Background(), fake, "gc-test-pod", cfg, "/workspace/demo", podManagedDoltHost, podManagedDoltPort); err != nil {
+		t.Fatalf("verifyBeadsInPod: %v", err)
+	}
+	script := firstShellScript(t, fake)
+	if !strings.Contains(script, "test -f .beads/identity.toml") {
+		t.Fatalf("verify script missing identity.toml check:\n%s", script)
+	}
+}
+
+func TestHostScopeForPod_RigPath(t *testing.T) {
+	cfg := runtime.Config{
+		WorkDir: "/host/city/rigs/frontend",
+		Env: map[string]string{
+			"GC_CITY": "/host/city",
+		},
+	}
+	if got := hostScopeForPod(cfg, "/workspace/rigs/frontend"); got != "/host/city/rigs/frontend" {
+		t.Fatalf("hostScopeForPod = %q, want rig path", got)
+	}
+}
+
+func TestHostScopeForPod_CityPath(t *testing.T) {
+	cfg := runtime.Config{
+		WorkDir: "/host/city",
+		Env: map[string]string{
+			"GC_CITY": "/host/city",
+		},
+	}
+	if got := hostScopeForPod(cfg, "/workspace"); got != "/host/city" {
+		t.Fatalf("hostScopeForPod = %q, want city path", got)
+	}
+}
+
 func TestVerifyBeadsInPodRunsForManagedProjection(t *testing.T) {
 	fake := newFakeK8sOps()
 	cfg := runtime.Config{
@@ -1881,6 +1990,33 @@ func containsStr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func firstShellScript(t *testing.T, fake *fakeK8sOps) string {
+	t.Helper()
+	for _, c := range fake.calls {
+		if c.method == "execInPod" && len(c.cmd) >= 3 && c.cmd[0] == "sh" && c.cmd[1] == "-c" {
+			return c.cmd[2]
+		}
+	}
+	t.Fatal("no sh -c exec call found")
+	return ""
+}
+
+func writeHostIdentityFile(t *testing.T, scopeRoot, id string) {
+	t.Helper()
+	writeHostIdentityFileBody(t, scopeRoot, "[project]\nid = \""+id+"\"\n")
+}
+
+func writeHostIdentityFileBody(t *testing.T, scopeRoot, body string) {
+	t.Helper()
+	path := filepath.Join(scopeRoot, ".beads", "identity.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBuildPodServiceAccount(t *testing.T) {
