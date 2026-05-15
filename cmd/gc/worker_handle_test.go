@@ -26,11 +26,6 @@ type countingSessionLookupStore struct {
 	listCalls int
 }
 
-type falseNegativeWorkerHandleProvider struct {
-	*runtime.Fake
-	falseNames map[string]bool
-}
-
 func (s *failingSessionLookupStore) Get(string) (beads.Bead, error) {
 	return beads.Bead{}, s.err
 }
@@ -47,13 +42,6 @@ func (s *countingSessionLookupStore) Get(string) (beads.Bead, error) {
 func (s *countingSessionLookupStore) List(beads.ListQuery) ([]beads.Bead, error) {
 	s.listCalls++
 	return nil, nil
-}
-
-func (p *falseNegativeWorkerHandleProvider) IsRunning(name string) bool {
-	if p.falseNames[name] {
-		return false
-	}
-	return p.Fake.IsRunning(name)
 }
 
 func TestWorkerHandleForSessionWithConfigUsesResolvedProviderOnFirstStart(t *testing.T) {
