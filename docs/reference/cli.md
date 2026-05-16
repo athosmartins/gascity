@@ -1251,7 +1251,7 @@ gc help [command]
 
 Checks for available work using the agent's work_query config.
 
-Without --inject: prints raw output, exits 0 if work exists, 1 if empty.
+Without --inject: prints normalized ready-only output, exits 0 if work exists, 1 if empty.
 With --inject: silent legacy Stop-hook compatibility; skips the work query and always exits 0.
 
 		The agent is determined from $GC_AGENT or a positional argument.
@@ -2782,6 +2782,7 @@ gc start
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-n`, `--dry-run` | bool |  | preview what agents would start without starting them |
+| `--no-auto-restart` | bool |  | detect supervisor binary/pack drift but do not auto-restart; exits non-zero on drift |
 
 ## gc status
 
