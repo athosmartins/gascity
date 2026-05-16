@@ -806,6 +806,10 @@
           "assignee": {
             "type": "string"
           },
+          "closed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"

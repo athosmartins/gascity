@@ -2975,12 +2975,6 @@ func TestBdStoreApplyGraphPlanInheritsNoHistoryDefault(t *testing.T) {
 	if got := result.IDs["root"]; got != "bd-1" {
 		t.Fatalf("result ID = %q, want bd-1", got)
 	}
-	if !capturedPlan.NoHistory {
-		t.Fatalf("capturedPlan.NoHistory = false, want true")
-	}
-	if capturedPlan.Ephemeral {
-		t.Fatalf("capturedPlan.Ephemeral = true, want false")
-	}
 	args := strings.Join(gotArgs, " ")
 	if !strings.Contains(args, "--no-history") {
 		t.Fatalf("args = %q, want --no-history", args)

@@ -2866,8 +2866,9 @@ func TestOpenControlStoreAtForCityPreservesFileAndExecProviderStores(t *testing.
 		if err != nil {
 			t.Fatalf("openControlStoreAtForCity(file): %v", err)
 		}
-		if _, ok := store.(*beads.FileStore); !ok {
-			t.Fatalf("control store = %T, want *beads.FileStore for file provider", store)
+		baseStore, _, _ := unwrapBeadPolicyStore(store)
+		if _, ok := baseStore.(*beads.FileStore); !ok {
+			t.Fatalf("control store = %T wrapping %T, want *beads.FileStore for file provider", store, baseStore)
 		}
 	})
 

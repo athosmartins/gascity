@@ -910,12 +910,39 @@
       ],
       "description": "AgentPatch modifies an existing agent identified by (Dir, Name)."
     },
+    "BeadPolicyConfig": {
+      "properties": {
+        "storage": {
+          "type": "string",
+          "enum": [
+            "history",
+            "no_history",
+            "ephemeral"
+          ],
+          "description": "Storage selects the intended persistence tier: \"history\", \"no_history\",\nor \"ephemeral\". Creation paths apply this incrementally as they opt in."
+        },
+        "delete_after_close": {
+          "type": "string",
+          "description": "DeleteAfterClose deletes matching GC-owned beads after they have been\nclosed for this duration. Empty means the policy is not GC-managed."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "BeadPolicyConfig holds storage and retention defaults for a named bead use."
+    },
     "BeadsConfig": {
       "properties": {
         "provider": {
           "type": "string",
           "description": "Provider selects the bead store backend: \"bd\" (default), \"file\",\nor \"exec:\u003cscript\u003e\" for a user-supplied script.",
           "default": "bd"
+        },
+        "policies": {
+          "additionalProperties": {
+            "$ref": "#/$defs/BeadPolicyConfig"
+          },
+          "type": "object",
+          "description": "Policies defines per-bead-use storage and garbage-collection defaults.\nPolicy names are interpreted by higher-level systems; unknown names are\npreserved so packs can stage future policy classes without breaking load."
         }
       },
       "additionalProperties": false,

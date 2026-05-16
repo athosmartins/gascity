@@ -740,7 +740,7 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, st
 	}
 	tracking, err := store.Create(beads.Bead{
 		Title:     "order:" + scoped,
-		Labels:    []string{"order-run:" + scoped, labelOrderTracking},
+		Labels:    orderTrackingLabels(scoped),
 		Ephemeral: true,
 	})
 	if err != nil {

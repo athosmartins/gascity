@@ -16,10 +16,14 @@ type GraphApplyStore interface {
 // Keys are caller-defined stable identifiers (for example recipe step IDs).
 type GraphApplyPlan struct {
 	CommitMessage string           `json:"commit_message,omitempty"`
-	Ephemeral     bool             `json:"ephemeral,omitempty"`
-	NoHistory     bool             `json:"no_history,omitempty"`
 	Nodes         []GraphApplyNode `json:"nodes"`
 	Edges         []GraphApplyEdge `json:"edges,omitempty"`
+	// Ephemeral applies Beads' --ephemeral graph-create storage mode to every
+	// node. It is transported as a bd CLI flag, not as part of the graph JSON.
+	Ephemeral bool `json:"-"`
+	// NoHistory applies Beads' --no-history graph-create storage mode to every
+	// node. It is transported as a bd CLI flag, not as part of the graph JSON.
+	NoHistory bool `json:"-"`
 }
 
 // EphemeralGraphApplyStore reports whether a GraphApplyStore can create an

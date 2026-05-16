@@ -142,7 +142,6 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 
 	plan := &beads.GraphApplyPlan{
 		CommitMessage: fmt.Sprintf("gc: instantiate %s", recipe.Name),
-		Ephemeral:     true,
 		Nodes:         make([]beads.GraphApplyNode, 0, len(recipe.Steps)),
 		Edges:         make([]beads.GraphApplyEdge, 0, len(recipe.Deps)),
 	}
@@ -175,6 +174,7 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 				}
 				node.Metadata["idempotency_key"] = opts.IdempotencyKey
 			}
+			labelWispGraphNode(&node, step)
 		} else {
 			// graph.v2 workflows and their retry/Ralph attempt sub-recipes
 			// use step beads as independently routable actionable work, not
@@ -320,7 +320,6 @@ func buildFragmentApplyPlan(store beads.Store, recipe *formula.FragmentRecipe, o
 
 	plan := &beads.GraphApplyPlan{
 		CommitMessage: fmt.Sprintf("gc: instantiate fragment into %s", opts.RootID),
-		Ephemeral:     true,
 		Nodes:         make([]beads.GraphApplyNode, 0, len(recipe.Steps)),
 		Edges:         make([]beads.GraphApplyEdge, 0, len(recipe.Deps)+len(opts.ExternalDeps)),
 	}
@@ -421,6 +420,13 @@ func recipeStepToGraphNode(step formula.RecipeStep, vars map[string]string, prio
 		Labels:      slices.Clone(b.Labels),
 		Metadata:    maps.Clone(b.Metadata),
 	}, nil
+}
+
+func labelWispGraphNode(node *beads.GraphApplyNode, step formula.RecipeStep) {
+	if step.Metadata["gc.kind"] != "wisp" {
+		return
+	}
+	node.Labels = appendLabelOnce(node.Labels, WispLabel)
 }
 
 func setNodeParentRef(nodes []beads.GraphApplyNode, stepID, parentKey, parentID string) {

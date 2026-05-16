@@ -501,6 +501,7 @@ type AsyncAcceptedResponse struct {
 // Bead defines model for Bead.
 type Bead struct {
 	Assignee     *string            `json:"assignee,omitempty"`
+	ClosedAt     *time.Time         `json:"closed_at,omitempty"`
 	CreatedAt    time.Time          `json:"created_at"`
 	Dependencies *[]Dep             `json:"dependencies,omitempty"`
 	Description  *string            `json:"description,omitempty"`

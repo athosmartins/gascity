@@ -206,6 +206,50 @@ func TestCreate_ephemeralRoundTripsThroughConformanceScript(t *testing.T) {
 	}
 }
 
+func TestCreate_noHistoryRoundTripsThroughConformanceScript(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available")
+	}
+	scriptPath, err := filepath.Abs(filepath.Join("testdata", "conformance.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewStore(scriptPath)
+	s.SetEnv(storeTargetEnv(t.TempDir()))
+
+	created, err := s.Create(beads.Bead{
+		Title:     "session bead",
+		Type:      "session",
+		Labels:    []string{"gc:session"},
+		NoHistory: true,
+	})
+	if err != nil {
+		t.Fatalf("Create(no-history): %v", err)
+	}
+	if !created.NoHistory {
+		t.Fatalf("created.NoHistory = false, want true")
+	}
+	if created.Ephemeral {
+		t.Fatalf("created.Ephemeral = true, want false")
+	}
+	got, err := s.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get(no-history): %v", err)
+	}
+	if !got.NoHistory || got.Ephemeral {
+		t.Fatalf("Get(%s) = %+v, want no_history without ephemeral", created.ID, got)
+	}
+
+	listed, err := s.ListByLabel("gc:session", 0)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != created.ID || !listed[0].NoHistory {
+		t.Fatalf("ListByLabel = %+v, want no-history session", listed)
+	}
+}
+
 func TestCreate_metadataReachesScript(t *testing.T) {
 	dir := t.TempDir()
 	outFile := filepath.Join(dir, "stdin.json")

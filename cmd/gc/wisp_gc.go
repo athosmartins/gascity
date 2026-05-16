@@ -6,17 +6,20 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
-// wispGC performs mechanical garbage collection of closed molecules that
-// have exceeded their TTL. Follows the nil-guard tracker pattern used by
-// crashTracker and idleTracker: nil means disabled.
+// wispGC performs mechanical garbage collection of closed GC-owned beads that
+// have exceeded their retention policy. Follows the nil-guard tracker pattern
+// used by crashTracker and idleTracker: nil means disabled.
 type wispGC interface {
 	// shouldRun returns true if enough time has elapsed since the last run.
 	shouldRun(now time.Time) bool
 
-	// runGC lists closed molecules, deletes those older than TTL, and returns
-	// the count of purged entries. Errors from individual deletes are
+	// runGC lists closed policy-owned beads, deletes those past retention, and
+	// returns the count of purged entries. Errors from individual deletes are
 	// best-effort and surfaced without stopping the purge; the returned error
 	// also covers list failures.
 	runGC(store beads.Store, now time.Time) (int, error)
@@ -25,19 +28,155 @@ type wispGC interface {
 // memoryWispGC is the production implementation of wispGC.
 type memoryWispGC struct {
 	interval time.Duration
-	ttl      time.Duration
+	policies []beadGCPolicy
 	lastRun  time.Time
 }
 
-// newWispGC creates a wisp GC tracker. Returns nil if disabled (interval or
-// TTL is zero). Callers nil-guard before use.
+type beadGCPolicy struct {
+	name     string
+	ttl      time.Duration
+	queries  []beads.ListQuery
+	deleteFn func(beads.Store, string) error
+}
+
+const (
+	beadPolicyWisp          = "wisp"
+	beadPolicyOrderTracking = "order_tracking"
+	beadPolicySession       = "session"
+	beadPolicyWait          = "wait"
+	beadPolicyNudge         = "nudge"
+)
+
+// newWispGC creates a legacy-compatible wisp GC tracker. Returns nil if
+// disabled (interval or TTL is zero). Callers nil-guard before use.
 func newWispGC(interval, ttl time.Duration) wispGC {
 	if interval <= 0 || ttl <= 0 {
 		return nil
 	}
+	return newWispGCWithPolicies(interval, legacyWispGCPolicies(ttl))
+}
+
+func newWispGCFromConfig(cfg *config.City) wispGC {
+	if cfg == nil {
+		return nil
+	}
+	interval := cfg.Daemon.WispGCIntervalDuration()
+	if interval <= 0 {
+		return nil
+	}
+	policies := configuredWispGCPolicies(cfg.Daemon.WispTTLDuration(), cfg.Beads.Policies)
+	return newWispGCWithPolicies(interval, policies)
+}
+
+func newWispGCWithPolicies(interval time.Duration, policies []beadGCPolicy) wispGC {
+	if interval <= 0 || len(policies) == 0 {
+		return nil
+	}
 	return &memoryWispGC{
 		interval: interval,
-		ttl:      ttl,
+		policies: policies,
+	}
+}
+
+func legacyWispGCPolicies(ttl time.Duration) []beadGCPolicy {
+	return []beadGCPolicy{
+		{
+			name: beadPolicyWisp,
+			ttl:  ttl,
+			queries: []beads.ListQuery{
+				{
+					Status:   "closed",
+					Label:    molecule.WispLabel,
+					TierMode: beads.TierBoth,
+				},
+				{
+					Status:   "closed",
+					Type:     "molecule",
+					TierMode: beads.TierBoth,
+				},
+			},
+			deleteFn: deleteExpiredBeadClosure,
+		},
+		{
+			name: beadPolicyOrderTracking,
+			ttl:  ttl,
+			queries: []beads.ListQuery{
+				{
+					Status:   "closed",
+					Label:    labelOrderTracking,
+					TierMode: beads.TierBoth,
+				},
+				{
+					Status:   "closed",
+					Label:    legacyLabelOrderTracking,
+					TierMode: beads.TierBoth,
+				},
+			},
+			deleteFn: deleteWorkflowBead,
+		},
+	}
+}
+
+func configuredWispGCPolicies(defaultTTL time.Duration, overrides map[string]config.BeadPolicyConfig) []beadGCPolicy {
+	specs := []beadGCPolicy{
+		legacyWispGCPolicies(defaultTTL)[0],
+		legacyWispGCPolicies(defaultTTL)[1],
+		{
+			name: beadPolicySession,
+			queries: []beads.ListQuery{
+				{
+					Status:   "closed",
+					Type:     session.BeadType,
+					Label:    session.LabelSession,
+					TierMode: beads.TierBoth,
+				},
+			},
+			deleteFn: deleteWorkflowBead,
+		},
+		{
+			name: beadPolicyWait,
+			queries: []beads.ListQuery{
+				{
+					Status:   "closed",
+					Label:    session.WaitBeadLabel,
+					TierMode: beads.TierBoth,
+				},
+			},
+			deleteFn: deleteWorkflowBead,
+		},
+		{
+			name: beadPolicyNudge,
+			queries: []beads.ListQuery{
+				{
+					Status:   "closed",
+					Label:    nudgeBeadLabel,
+					TierMode: beads.TierBoth,
+				},
+			},
+			deleteFn: deleteWorkflowBead,
+		},
+	}
+	policies := make([]beadGCPolicy, 0, len(specs))
+	for _, spec := range specs {
+		ttl := effectiveBeadGCPolicyTTL(spec.name, defaultTTL, overrides)
+		if ttl <= 0 {
+			continue
+		}
+		spec.ttl = ttl
+		policies = append(policies, spec)
+	}
+	return policies
+}
+
+func effectiveBeadGCPolicyTTL(name string, defaultTTL time.Duration, overrides map[string]config.BeadPolicyConfig) time.Duration {
+	if policy, ok := overrides[name]; ok && policy.DeleteAfterClose != "" {
+		return policy.DeleteAfterCloseDuration()
+	}
+	switch name {
+	case beadPolicyWisp, beadPolicyOrderTracking:
+		return defaultTTL
+	default:
+		return 0
 	}
 }
 
@@ -48,33 +187,35 @@ func (m *memoryWispGC) shouldRun(now time.Time) bool {
 func (m *memoryWispGC) runGC(store beads.Store, now time.Time) (int, error) {
 	m.lastRun = now
 	if store == nil {
-		return 0, fmt.Errorf("listing closed molecules: bead store unavailable")
+		return 0, fmt.Errorf("listing closed GC policy beads: bead store unavailable")
 	}
 
-	entries, err := closedWispGCEntries(store)
-	if err != nil {
-		return 0, err
+	purged := 0
+	var runErr error
+	for _, policy := range m.policies {
+		cutoff := now.Add(-policy.ttl)
+		entries, err := policy.list(store, cutoff)
+		if err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("listing closed %s beads: %w", policy.name, err))
+			continue
+		}
+		policyPurged, deleteErr := purgeExpiredBeads(store, entries, cutoff, policy.deleteFn)
+		purged += policyPurged
+		runErr = errors.Join(runErr, deleteErr)
 	}
 
-	cutoff := now.Add(-m.ttl)
-	purged, deleteErr := purgeExpiredBeadClosures(store, entries, cutoff)
-
-	trackEntries, trackErr := store.List(beads.ListQuery{Status: "closed", Label: labelOrderTracking, TierMode: beads.TierBoth})
-	if trackErr == nil {
-		trackPurged, trackDeleteErr := purgeExpiredBeadRoots(store, trackEntries, cutoff)
-		purged += trackPurged
-		deleteErr = errors.Join(deleteErr, trackDeleteErr)
-	} else {
-		deleteErr = errors.Join(deleteErr, fmt.Errorf("listing closed order-tracking beads: %w", trackErr))
-	}
-
-	return purged, deleteErr
+	return purged, runErr
 }
 
-func closedWispGCEntries(store beads.Store) ([]beads.Bead, error) {
+func (p beadGCPolicy) list(store beads.Store, cutoff time.Time) ([]beads.Bead, error) {
 	entries := make([]beads.Bead, 0)
 	seen := make(map[string]struct{})
-	appendUnique := func(items []beads.Bead) {
+	for _, query := range p.queries {
+		query.ClosedBefore = cutoff
+		items, err := store.List(query)
+		if err != nil {
+			return nil, err
+		}
 		for _, item := range items {
 			if item.ID == "" {
 				continue
@@ -86,32 +227,14 @@ func closedWispGCEntries(store beads.Store) ([]beads.Bead, error) {
 			entries = append(entries, item)
 		}
 	}
-	molecules, err := store.List(beads.ListQuery{Status: "closed", Type: "molecule"})
-	if err != nil {
-		return nil, fmt.Errorf("listing closed molecule roots: %w", err)
-	}
-	appendUnique(molecules)
-	wisps, err := store.List(beads.ListQuery{Status: "closed", Metadata: map[string]string{"gc.kind": "wisp"}})
-	if err != nil {
-		return nil, fmt.Errorf("listing closed wisp roots: %w", err)
-	}
-	appendUnique(wisps)
 	return entries, nil
-}
-
-func purgeExpiredBeadClosures(store beads.Store, entries []beads.Bead, cutoff time.Time) (int, error) {
-	return purgeExpiredBeads(store, entries, cutoff, deleteExpiredBeadClosure)
-}
-
-func purgeExpiredBeadRoots(store beads.Store, entries []beads.Bead, cutoff time.Time) (int, error) {
-	return purgeExpiredBeads(store, entries, cutoff, deleteWorkflowBead)
 }
 
 func purgeExpiredBeads(store beads.Store, entries []beads.Bead, cutoff time.Time, deleteFn func(beads.Store, string) error) (int, error) {
 	purged := 0
 	var deleteErr error
 	for _, entry := range entries {
-		if entry.CreatedAt.IsZero() || !entry.CreatedAt.Before(cutoff) {
+		if entry.ClosedAt.IsZero() || !entry.ClosedAt.Before(cutoff) {
 			continue
 		}
 		if err := deleteFn(store, entry.ID); err != nil {
