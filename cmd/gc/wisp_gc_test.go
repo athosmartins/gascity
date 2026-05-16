@@ -8,6 +8,9 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 func TestWispGC_NilSafe(t *testing.T) {
@@ -51,7 +54,7 @@ func TestWispGC_PurgesExpiredMolecules(t *testing.T) {
 	now := time.Now()
 	store := newGCStore([]beads.Bead{
 		makeGCBead("mol-1", now.Add(-2*time.Hour), "closed", "molecule"),
-		makeGCBeadWithMetadata("wisp-1", now.Add(-2*time.Hour), "closed", "task", map[string]string{"gc.kind": "wisp"}),
+		makeGCBeadWithLabels("labeled-wisp-1", now.Add(-2*time.Hour), "closed", "task", molecule.WispLabel),
 		makeGCBead("mol-2", now.Add(-30*time.Minute), "closed", "molecule"),
 		makeGCBead("mol-3", now.Add(-3*time.Hour), "closed", "molecule"),
 	})
@@ -64,7 +67,7 @@ func TestWispGC_PurgesExpiredMolecules(t *testing.T) {
 	if purged != 3 {
 		t.Fatalf("purged = %d, want 3", purged)
 	}
-	assertDeletedIDs(t, store.deletedIDs, "mol-1", "wisp-1", "mol-3")
+	assertDeletedIDs(t, store.deletedIDs, "labeled-wisp-1", "mol-1", "mol-3")
 }
 
 func TestWispGC_NothingExpired(t *testing.T) {
@@ -83,6 +86,75 @@ func TestWispGC_NothingExpired(t *testing.T) {
 	}
 	if len(store.deletedIDs) != 0 {
 		t.Fatalf("deleted = %v, want none", store.deletedIDs)
+	}
+}
+
+func TestWispGC_UsesClosedAtNotCreatedAt(t *testing.T) {
+	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	store := newGCStore([]beads.Bead{
+		{
+			ID:        "created-old-closed-new",
+			Status:    "closed",
+			Type:      "molecule",
+			CreatedAt: now.Add(-48 * time.Hour),
+			ClosedAt:  now.Add(-10 * time.Minute),
+		},
+		{
+			ID:        "created-new-closed-old",
+			Status:    "closed",
+			Type:      "molecule",
+			CreatedAt: now.Add(-10 * time.Minute),
+			ClosedAt:  now.Add(-48 * time.Hour),
+		},
+	})
+
+	wg := newWispGC(5*time.Minute, time.Hour)
+	purged, err := wg.runGC(store, now)
+	if err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("purged = %d, want 1", purged)
+	}
+	assertDeletedIDs(t, store.deletedIDs, "created-new-closed-old")
+	if _, err := store.Get("created-old-closed-new"); err != nil {
+		t.Fatalf("newly closed old bead was deleted: %v", err)
+	}
+}
+
+func TestWispGC_ConfiguredPoliciesDeleteAllowlistedSessionWaitAndNudgeBeads(t *testing.T) {
+	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	store := newGCStore([]beads.Bead{
+		makeClosedGCBeadWithLabels("session-old", now.Add(-48*time.Hour), "session", session.LabelSession),
+		makeClosedGCBeadWithLabels("wait-old", now.Add(-48*time.Hour), session.WaitBeadType, session.WaitBeadLabel),
+		makeClosedGCBeadWithLabels("nudge-old", now.Add(-48*time.Hour), "chore", nudgeBeadLabel),
+		makeClosedGCBeadWithLabels("session-new", now.Add(-10*time.Minute), "session", session.LabelSession),
+		makeClosedGCBeadWithLabels("user-old", now.Add(-48*time.Hour), "task", "user-label"),
+	})
+	wg := newWispGCFromConfig(&config.City{
+		Daemon: config.DaemonConfig{WispGCInterval: "5m"},
+		Beads: config.BeadsConfig{Policies: map[string]config.BeadPolicyConfig{
+			"session": {DeleteAfterClose: "24h"},
+			"wait":    {DeleteAfterClose: "24h"},
+			"nudge":   {DeleteAfterClose: "24h"},
+		}},
+	})
+	if wg == nil {
+		t.Fatal("newWispGCFromConfig returned nil")
+	}
+
+	purged, err := wg.runGC(store, now)
+	if err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	if purged != 3 {
+		t.Fatalf("purged = %d, want 3", purged)
+	}
+	assertDeletedIDs(t, store.deletedIDs, "nudge-old", "session-old", "wait-old")
+	for _, id := range []string{"session-new", "user-old"} {
+		if _, err := store.Get(id); err != nil {
+			t.Fatalf("%s was incorrectly deleted: %v", id, err)
+		}
 	}
 }
 
@@ -373,7 +445,8 @@ func TestWispGC_PurgesLegacyIssuesTierTrackingBeads(t *testing.T) {
 			Status:    "closed",
 			Type:      "task",
 			CreatedAt: now.Add(-3 * time.Hour),
-			Labels:    []string{labelOrderTracking},
+			ClosedAt:  now.Add(-3 * time.Hour),
+			Labels:    []string{legacyLabelOrderTracking},
 		},
 	})
 
@@ -451,6 +524,43 @@ func TestWispGC_ListErrorFailsRun(t *testing.T) {
 	}
 }
 
+func TestWispGC_QueriesUseClosedBeforeAndIndexedOwnershipLabels(t *testing.T) {
+	now := time.Now()
+	store := newGCStore(nil)
+
+	wg := newWispGC(5*time.Minute, time.Hour)
+	if _, err := wg.runGC(store, now); err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+
+	wantCutoff := now.Add(-time.Hour)
+	seen := map[string]bool{}
+	for _, query := range store.listQueries {
+		if !query.ClosedBefore.Equal(wantCutoff) {
+			t.Fatalf("ClosedBefore = %s, want %s in query %+v", query.ClosedBefore, wantCutoff, query)
+		}
+		if len(query.Metadata) != 0 {
+			t.Fatalf("query used metadata filter on hot GC path: %+v", query)
+		}
+		switch {
+		case query.Label != "":
+			seen["label:"+query.Label] = true
+		case query.Type != "":
+			seen["type:"+query.Type] = true
+		}
+	}
+	for _, key := range []string{
+		"label:" + molecule.WispLabel,
+		"label:" + labelOrderTracking,
+		"label:" + legacyLabelOrderTracking,
+		"type:molecule",
+	} {
+		if !seen[key] {
+			t.Fatalf("missing GC query %s; got %+v", key, store.listQueries)
+		}
+	}
+}
+
 type gcQueryKey struct {
 	Status   string
 	Type     string
@@ -461,6 +571,7 @@ type gcQueryKey struct {
 type gcTestStore struct {
 	*beads.MemStore
 	listErrors   map[gcQueryKey]error
+	listQueries  []beads.ListQuery
 	deleteErrors map[string]error
 	deletedIDs   []string
 }
@@ -474,6 +585,7 @@ func newGCStore(existing []beads.Bead) *gcTestStore {
 }
 
 func (s *gcTestStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	s.listQueries = append(s.listQueries, query)
 	if err := s.listErrors[gcQueryKey{Status: query.Status, Type: query.Type, Label: query.Label, Metadata: metadataQueryKey(query.Metadata)}]; err != nil {
 		return nil, err
 	}
@@ -511,15 +623,36 @@ func makeGCBeadWithLabels(id string, createdAt time.Time, status, beadType strin
 		Status:    status,
 		Type:      beadType,
 		CreatedAt: createdAt,
+		ClosedAt:  closedAtForStatus(status, createdAt),
 		Labels:    labels,
 		Ephemeral: ephemeral,
 	}
 }
 
-func makeGCBeadWithMetadata(id string, createdAt time.Time, status, beadType string, metadata map[string]string) beads.Bead {
-	bead := makeGCBead(id, createdAt, status, beadType)
-	bead.Metadata = metadata
-	return bead
+func makeClosedGCBeadWithLabels(id string, closedAt time.Time, beadType string, labels ...string) beads.Bead {
+	ephemeral := false
+	for _, l := range labels {
+		if l == labelOrderTracking {
+			ephemeral = true
+			break
+		}
+	}
+	return beads.Bead{
+		ID:        id,
+		Status:    "closed",
+		Type:      beadType,
+		CreatedAt: closedAt.Add(-time.Hour),
+		ClosedAt:  closedAt,
+		Labels:    labels,
+		Ephemeral: ephemeral,
+	}
+}
+
+func closedAtForStatus(status string, createdAt time.Time) time.Time {
+	if status != "closed" {
+		return time.Time{}
+	}
+	return createdAt
 }
 
 func metadataQueryKey(metadata map[string]string) string {

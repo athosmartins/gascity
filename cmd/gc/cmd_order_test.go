@@ -1550,9 +1550,9 @@ title = "Do work"
 	if code != 0 {
 		t.Fatalf("doOrderRun = %d, want 0; stderr: %s", code, stderr.String())
 	}
-	all, err := store.ListOpen()
+	all, err := store.List(beads.ListQuery{AllowScan: true, TierMode: beads.TierBoth})
 	if err != nil {
-		t.Fatalf("store.ListOpen(): %v", err)
+		t.Fatalf("store.List(): %v", err)
 	}
 
 	foundWorker := false

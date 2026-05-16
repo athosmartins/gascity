@@ -1601,8 +1601,9 @@ prefix = "fe"
 	if err != nil {
 		t.Fatalf("openStoreAtForCity(rig): %v", err)
 	}
-	if _, ok := store.(*beads.BdStore); !ok {
-		t.Fatalf("openStoreAtForCity(rig) returned %T, want *beads.BdStore", store)
+	baseStore, _, _ := unwrapBeadPolicyStore(store)
+	if _, ok := baseStore.(*beads.BdStore); !ok {
+		t.Fatalf("openStoreAtForCity(rig) returned %T wrapping %T, want *beads.BdStore", store, baseStore)
 	}
 }
 
@@ -1633,8 +1634,9 @@ prefix = "fe"
 	if err != nil {
 		t.Fatalf("openStoreAtForCity(rig): %v", err)
 	}
-	if _, ok := store.(*beads.FileStore); !ok {
-		t.Fatalf("openStoreAtForCity(rig) returned %T, want *beads.FileStore", store)
+	baseStore, _, _ := unwrapBeadPolicyStore(store)
+	if _, ok := baseStore.(*beads.FileStore); !ok {
+		t.Fatalf("openStoreAtForCity(rig) returned %T wrapping %T, want *beads.FileStore", store, baseStore)
 	}
 }
 
@@ -1899,9 +1901,10 @@ exit 0
 	if err != nil {
 		t.Fatalf("openStoreAtForCity: %v", err)
 	}
-	bdStore, ok := store.(*beads.BdStore)
+	baseStore, _, _ := unwrapBeadPolicyStore(store)
+	bdStore, ok := baseStore.(*beads.BdStore)
 	if !ok {
-		t.Fatalf("openStoreAtForCity returned %T, want *beads.BdStore", store)
+		t.Fatalf("openStoreAtForCity returned %T wrapping %T, want *beads.BdStore", store, baseStore)
 	}
 	if err := bdStore.Init("myrig", "", ""); err != nil {
 		t.Fatalf("bd store init: %v", err)

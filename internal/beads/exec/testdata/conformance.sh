@@ -85,6 +85,11 @@ create)
 	ref=$(echo "$input" | jq -r '.ref // ""')
 	description=$(echo "$input" | jq -r '.description // ""')
 	ephemeral=$(echo "$input" | jq -r '.ephemeral // false')
+	no_history=$(echo "$input" | jq -r '.no_history // false')
+	if [[ "$ephemeral" == "true" && "$no_history" == "true" ]]; then
+		echo "ephemeral and no_history are mutually exclusive" >&2
+		exit 1
+	fi
 	created_at=$(now)
 
 	# Build labels array from input, including metadata as meta: labels.
@@ -113,6 +118,7 @@ create)
 		--arg description "$description" \
 		--argjson labels "$labels" \
 		--argjson ephemeral "$ephemeral" \
+		--argjson no_history "$no_history" \
 		'{
         id: $id,
         title: $title,
@@ -126,7 +132,8 @@ create)
         needs: $needs,
         description: $description,
         labels: $labels,
-        ephemeral: $ephemeral
+        ephemeral: $ephemeral,
+        no_history: $no_history
       }' >"$STATE_ROOT/$id.json"
 
 	# Output the created bead (normalized: meta: labels → .metadata map).

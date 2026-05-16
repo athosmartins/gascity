@@ -21,8 +21,8 @@ const (
 	SortCreatedDesc SortOrder = "created_desc"
 )
 
-// TierMode selects which storage tier(s) a List query reads from.
-// The zero value is TierIssues.
+// TierMode selects which storage tier(s) a List query reads from. The zero
+// value is TierIssues.
 //
 // TierIssues is the permanent tier and filters out Ephemeral rows when a store
 // returns them to the caller. TierBoth is a logical union; implementations may
@@ -31,9 +31,9 @@ const (
 type TierMode int
 
 const (
-	// TierIssues reads only the permanent (issues) tier. Default.
+	// TierIssues reads only the permanent issues tier. Default.
 	TierIssues TierMode = iota
-	// TierWisps reads only the ephemeral (wisps) tier.
+	// TierWisps reads only the ephemeral wisps tier.
 	TierWisps
 	// TierBoth unions the issues and wisps tiers, deduping by ID and
 	// preserving the query's sort.
@@ -69,6 +69,7 @@ type ListQuery struct {
 	// Legacy beads with zero UpdatedAt fall back to CreatedAt. Purge callers
 	// using CachingStore must also set Live: true to avoid stale cached timestamps.
 	UpdatedBefore time.Time
+	ClosedBefore  time.Time
 	Limit         int
 	IncludeClosed bool
 	AllowScan     bool
@@ -110,7 +111,8 @@ func (q ListQuery) HasFilter() bool {
 		q.ParentID != "" ||
 		len(q.Metadata) > 0 ||
 		!q.CreatedBefore.IsZero() ||
-		!q.UpdatedBefore.IsZero()
+		!q.UpdatedBefore.IsZero() ||
+		!q.ClosedBefore.IsZero()
 }
 
 // IncludesClosed reports whether the query may return closed beads.
@@ -158,6 +160,9 @@ func (q ListQuery) Matches(b Bead) bool {
 		return false
 	}
 	if !q.UpdatedBefore.IsZero() && !beadUpdatedReferenceTime(b).Before(q.UpdatedBefore) {
+		return false
+	}
+	if !q.ClosedBefore.IsZero() && (b.ClosedAt.IsZero() || !b.ClosedAt.Before(q.ClosedBefore)) {
 		return false
 	}
 	return true

@@ -1156,6 +1156,7 @@ func openStoreAtForCity(storePath, cityPath string) (beads.Store, error) {
 	if runtimeCityPath == "" {
 		runtimeCityPath = cityForStoreDir(storePath)
 	}
+	cfg, _ := loadCityConfig(runtimeCityPath, io.Discard)
 	scopeRoot := resolveStoreScopeRoot(runtimeCityPath, storePath)
 	provider := rawBeadsProviderForScope(scopeRoot, runtimeCityPath)
 	if strings.HasPrefix(provider, "exec:") {
@@ -1185,17 +1186,23 @@ func openStoreAtForCity(storePath, cityPath string) (beads.Store, error) {
 		}
 		store := beadsexec.NewStore(strings.TrimPrefix(provider, "exec:"))
 		store.SetEnv(env)
-		return store, nil
+		return wrapStoreWithBeadPolicies(store, cfg), nil
 	}
+	var store beads.Store
+	var err error
 	switch provider {
 	case "file":
-		return openCompatibleFileStore(scopeRoot, runtimeCityPath)
+		store, err = openCompatibleFileStore(scopeRoot, runtimeCityPath)
 	default: // "bd" or unrecognized → use bd
 		if _, err := exec.LookPath("bd"); err != nil {
 			return nil, fmt.Errorf("bd not found in PATH (install beads or set GC_BEADS=file)")
 		}
-		return openBdStoreAt(scopeRoot, runtimeCityPath)
+		store = openBdStoreAt(scopeRoot, runtimeCityPath)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return wrapStoreWithBeadPolicies(store, cfg), nil
 }
 
 // resolveStoreScopeRoot resolves a store's scope root under cityPath.
@@ -1216,13 +1223,13 @@ func resolveStoreScopeRoot(cityPath, storePath string) string {
 	return filepath.Clean(scopeRoot)
 }
 
-func openBdStoreAt(storePath, cityPath string) (beads.Store, error) {
+func openBdStoreAt(storePath, cityPath string) beads.Store {
 	if filepath.Clean(storePath) == filepath.Clean(cityPath) {
-		return bdStoreForCity(storePath, cityPath), nil
+		return bdStoreForCity(storePath, cityPath)
 	}
 	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		cfg = nil
 	}
-	return bdStoreForRig(storePath, cityPath, cfg), nil
+	return bdStoreForRig(storePath, cityPath, cfg)
 }

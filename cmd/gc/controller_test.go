@@ -1802,10 +1802,6 @@ func readSessionCircuitResetSocketReply(t *testing.T, conn net.Conn) sessionCirc
 }
 
 func TestControllerReloadInvalidConfig(t *testing.T) {
-	old := debounceDelay
-	debounceDelay = 5 * time.Millisecond
-	t.Cleanup(func() { debounceDelay = old })
-
 	dir := shortSocketTempDir(t, "gc-reload-invalid-")
 	tomlPath := writeCityTOML(t, dir, "test", "mayor")
 	disableManagedDoltRecoveryForTest(t)
@@ -1816,60 +1812,30 @@ func TestControllerReloadInvalidConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	sp := runtime.NewFake()
-	var reconcileCount atomic.Int32
-	buildFn := func(c *config.City, _ runtime.Provider, _ beads.Store) DesiredStateResult {
-		reconcileCount.Add(1)
-		ds := make(map[string]TemplateParams)
-		for _, a := range c.Agents {
-			ds[a.Name] = TemplateParams{
-				SessionName:  a.Name,
-				TemplateName: a.Name,
-				Command:      "echo hello",
-			}
-		}
-		return DesiredStateResult{State: ds}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var stdout, stderr bytes.Buffer
-
-	done := make(chan struct{})
-	go func() {
-		controllerLoop(ctx, 20*time.Millisecond, cfg, "test", tomlPath, nil,
-			buildFn, sp, nil, nil, nil, nil, nil, events.Discard, nil, nil, nil, nil, &stdout, &stderr)
-		close(done)
-	}()
-
-	// Wait for initial reconcile.
-	for reconcileCount.Load() < 1 {
-		time.Sleep(5 * time.Millisecond)
+	cr := &CityRuntime{
+		cityPath:  dir,
+		cityName:  "test",
+		tomlPath:  tomlPath,
+		cfg:       cfg,
+		logPrefix: "gc start",
+		stdout:    &stdout,
+		stderr:    &stderr,
 	}
 
 	// Write invalid TOML.
 	if err := os.WriteFile(tomlPath, []byte("[[[ bad toml"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	lastProviderName := cfg.Session.Provider
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, dir, nil, reloadSourceWatch)
 
-	deadline := time.After(3 * time.Second)
-	for !strings.Contains(stderr.String(), "config reload") {
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for invalid config reload; reconciles=%d stdout=%q stderr=%q",
-				reconcileCount.Load(), stdout.String(), stderr.String())
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
+	if reply.Outcome != reloadOutcomeFailed {
+		t.Fatalf("reload outcome = %q, want %q; reply=%+v", reply.Outcome, reloadOutcomeFailed, reply)
 	}
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for controllerLoop to exit")
+	if reply.Error == "" {
+		t.Fatal("reload error empty, want parse error")
 	}
-
 	if !strings.Contains(stderr.String(), "config reload") {
 		t.Errorf("expected config reload error in stderr, got: %s", stderr.String())
 	}
