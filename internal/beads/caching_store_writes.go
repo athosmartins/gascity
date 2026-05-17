@@ -291,9 +291,74 @@ func (c *CachingStore) SetMetadataBatch(id string, kvs map[string]string) error 
 	return nil
 }
 
-// Tx executes fn sequentially against the CachingStore.
-func (c *CachingStore) Tx(_ string, fn func(Tx) error) error {
-	return runSequentialTx(c, fn)
+type trackingTx struct {
+	inner   Tx
+	touched []string
+}
+
+func (t *trackingTx) Update(id string, opts UpdateOpts) error {
+	if err := t.inner.Update(id, opts); err != nil {
+		return err
+	}
+	t.touch(id)
+	return nil
+}
+
+func (t *trackingTx) SetMetadataBatch(id string, kvs map[string]string) error {
+	if err := t.inner.SetMetadataBatch(id, kvs); err != nil {
+		return err
+	}
+	t.touch(id)
+	return nil
+}
+
+func (t *trackingTx) Close(id string) error {
+	if err := t.inner.Close(id); err != nil {
+		return err
+	}
+	t.touch(id)
+	return nil
+}
+
+func (t *trackingTx) touch(id string) {
+	if id == "" {
+		return
+	}
+	t.touched = append(t.touched, id)
+}
+
+// Tx delegates to the backing transaction and evicts touched cache entries
+// after a successful commit.
+func (c *CachingStore) Tx(commitMsg string, fn func(Tx) error) error {
+	if fn == nil {
+		return runSequentialTx(c, fn)
+	}
+	tracker := &trackingTx{}
+	if err := c.backing.Tx(commitMsg, func(inner Tx) error {
+		if inner == nil {
+			return errors.New("beads tx: nil inner transaction")
+		}
+		tracker.inner = inner
+		return fn(tracker)
+	}); err != nil {
+		return err
+	}
+	if len(tracker.touched) == 0 {
+		return nil
+	}
+
+	c.mu.Lock()
+	c.noteLocalMutationLocked(tracker.touched...)
+	for _, id := range tracker.touched {
+		delete(c.beads, id)
+		delete(c.deps, id)
+		delete(c.dirty, id)
+		delete(c.deletedSeq, id)
+	}
+	c.markFreshLocked(time.Now())
+	c.updateStatsLocked()
+	c.mu.Unlock()
+	return nil
 }
 
 // updateMatchesCached returns true when every non-nil field in opts already

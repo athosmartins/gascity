@@ -2,6 +2,7 @@ package beads
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -34,6 +35,197 @@ func (c *countingBackingStore) Update(id string, opts UpdateOpts) error {
 func (c *countingBackingStore) Close(id string) error {
 	c.closeCalls++
 	return c.Store.Close(id)
+}
+
+type txObservingBackingStore struct {
+	Store
+	txCalls   int
+	commitMsg string
+	afterFn   error
+	onTxStart func()
+}
+
+func (s *txObservingBackingStore) Tx(commitMsg string, fn func(Tx) error) error {
+	s.txCalls++
+	s.commitMsg = commitMsg
+	if s.onTxStart != nil {
+		s.onTxStart()
+	}
+	if err := fn(s.Store); err != nil {
+		return err
+	}
+	return s.afterFn
+}
+
+func TestCachingStoreTxInvalidatesTouchedCacheEntriesAfterCommit(t *testing.T) {
+	backing := &txObservingBackingStore{Store: NewMemStore()}
+	blocker, err := backing.Create(Bead{Title: "blocker"})
+	if err != nil {
+		t.Fatalf("Create blocker: %v", err)
+	}
+	first, err := backing.Create(Bead{Title: "first", Metadata: map[string]string{"phase": "old"}})
+	if err != nil {
+		t.Fatalf("Create first: %v", err)
+	}
+	second, err := backing.Create(Bead{Title: "second"})
+	if err != nil {
+		t.Fatalf("Create second: %v", err)
+	}
+	if err := backing.DepAdd(first.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	cache.mu.Lock()
+	cache.dirty[first.ID] = struct{}{}
+	cache.deletedSeq[first.ID] = 1
+	cache.mu.Unlock()
+
+	newTitle := "second in tx"
+	if err := cache.Tx("cache tx", func(tx Tx) error {
+		if err := tx.SetMetadataBatch(first.ID, map[string]string{"phase": "tx"}); err != nil {
+			return err
+		}
+		return tx.Update(second.ID, UpdateOpts{Title: &newTitle})
+	}); err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+
+	if backing.txCalls != 1 {
+		t.Fatalf("backing Tx calls = %d, want 1", backing.txCalls)
+	}
+	if backing.commitMsg != "cache tx" {
+		t.Fatalf("commit message = %q, want cache tx", backing.commitMsg)
+	}
+
+	cache.mu.RLock()
+	_, firstCached := cache.beads[first.ID]
+	_, firstDepsCached := cache.deps[first.ID]
+	_, firstDirty := cache.dirty[first.ID]
+	_, firstDeleted := cache.deletedSeq[first.ID]
+	_, firstMutated := cache.beadSeq[first.ID]
+	firstLocalAt := cache.localBeadAt[first.ID]
+	_, secondCached := cache.beads[second.ID]
+	_, secondDepsCached := cache.deps[second.ID]
+	_, blockerStillCached := cache.beads[blocker.ID]
+	cache.mu.RUnlock()
+
+	if firstCached || firstDepsCached || firstDirty || firstDeleted {
+		t.Fatalf("first cache entries after Tx: bead=%v deps=%v dirty=%v deleted=%v, want all evicted", firstCached, firstDepsCached, firstDirty, firstDeleted)
+	}
+	if secondCached || secondDepsCached {
+		t.Fatalf("second cache entries after Tx: bead=%v deps=%v, want evicted", secondCached, secondDepsCached)
+	}
+	if !firstMutated || firstLocalAt.IsZero() {
+		t.Fatalf("local mutation markers: mutated=%v localAt=%v, want marked for stale event protection", firstMutated, firstLocalAt)
+	}
+	if !blockerStillCached {
+		t.Fatal("untouched blocker bead was evicted")
+	}
+
+	gotFirst, err := cache.Get(first.ID)
+	if err != nil {
+		t.Fatalf("Get first: %v", err)
+	}
+	if gotFirst.Metadata["phase"] != "tx" {
+		t.Fatalf("first metadata phase = %q, want tx", gotFirst.Metadata["phase"])
+	}
+	gotSecond, err := cache.Get(second.ID)
+	if err != nil {
+		t.Fatalf("Get second: %v", err)
+	}
+	if gotSecond.Title != newTitle {
+		t.Fatalf("second title = %q, want %q", gotSecond.Title, newTitle)
+	}
+}
+
+func TestCachingStoreTxLeavesCacheUnchangedOnBackingError(t *testing.T) {
+	wantErr := errors.New("commit failed")
+	backing := &txObservingBackingStore{Store: NewMemStore(), afterFn: wantErr}
+	blocker, err := backing.Create(Bead{Title: "blocker"})
+	if err != nil {
+		t.Fatalf("Create blocker: %v", err)
+	}
+	bead, err := backing.Create(Bead{Title: "cached", Metadata: map[string]string{"phase": "old"}})
+	if err != nil {
+		t.Fatalf("Create bead: %v", err)
+	}
+	if err := backing.DepAdd(bead.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	newTitle := "changed in failed tx"
+	err = cache.Tx("failed tx", func(tx Tx) error {
+		if err := tx.Update(bead.ID, UpdateOpts{Title: &newTitle}); err != nil {
+			return err
+		}
+		return tx.SetMetadataBatch(bead.ID, map[string]string{"phase": "tx"})
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Tx error = %v, want %v", err, wantErr)
+	}
+
+	cache.mu.RLock()
+	cached, cachedOK := cache.beads[bead.ID]
+	deps, depsOK := cache.deps[bead.ID]
+	cache.mu.RUnlock()
+	if !cachedOK {
+		t.Fatal("cached bead was evicted after failed Tx")
+	}
+	if cached.Title != "cached" || cached.Metadata["phase"] != "old" {
+		t.Fatalf("cached bead after failed Tx = %+v, want original cached state", cached)
+	}
+	if !depsOK || len(deps) != 1 || deps[0].DependsOnID != blocker.ID {
+		t.Fatalf("cached deps after failed Tx = %+v, want original dependency", deps)
+	}
+}
+
+func TestCachingStoreTxZeroTouchLeavesCacheAndRunsWithoutMutex(t *testing.T) {
+	backing := &txObservingBackingStore{Store: NewMemStore()}
+	bead, err := backing.Create(Bead{Title: "cached"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+	backing.onTxStart = func() {
+		if !cache.mu.TryLock() {
+			t.Fatal("backing Tx started while cache mutex was held")
+		}
+		cache.mu.Unlock()
+	}
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	cache.mu.RLock()
+	startSeq := cache.mutationSeq
+	cache.mu.RUnlock()
+
+	if err := cache.Tx("noop tx", func(Tx) error { return nil }); err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+
+	if backing.txCalls != 1 {
+		t.Fatalf("backing Tx calls = %d, want 1", backing.txCalls)
+	}
+	cache.mu.RLock()
+	_, cached := cache.beads[bead.ID]
+	_, depsCached := cache.deps[bead.ID]
+	endSeq := cache.mutationSeq
+	cache.mu.RUnlock()
+	if !cached || !depsCached {
+		t.Fatalf("zero-touch Tx evicted cache entries: bead=%v deps=%v", cached, depsCached)
+	}
+	if endSeq != startSeq {
+		t.Fatalf("mutationSeq after zero-touch Tx = %d, want %d", endSeq, startSeq)
+	}
 }
 
 // TestCachingStoreSetMetadataSkipsBackingWhenCachedValueMatches verifies that
