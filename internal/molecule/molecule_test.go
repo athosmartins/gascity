@@ -263,6 +263,8 @@ type graphApplySpyStore struct {
 	plan   *beads.GraphApplyPlan
 	result *beads.GraphApplyResult
 	err    error
+	errs   []error
+	calls  int
 }
 
 func priorityPtr(v int) *int {
@@ -271,6 +273,14 @@ func priorityPtr(v int) *int {
 
 func (s *graphApplySpyStore) ApplyGraphPlan(_ context.Context, plan *beads.GraphApplyPlan) (*beads.GraphApplyResult, error) {
 	s.plan = plan
+	s.calls++
+	if len(s.errs) > 0 {
+		err := s.errs[0]
+		s.errs = s.errs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -411,6 +421,47 @@ func TestInstantiateUsesGraphApplyStoreWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestInstantiateRetriesTransientGraphApplyBeforeFallback(t *testing.T) {
+	store := &graphApplySpyStore{
+		MemStore: beads.NewMemStore(),
+		errs: []error{
+			fmt.Errorf("bd create --graph: exit status 1: [mysql] packets.go:58 read tcp 127.0.0.1:41442->127.0.0.1:50546: i/o timeout: graph create: adding edge bd-1->bd-2: failed to check for dependency cycle: invalid connection"),
+			nil,
+		},
+	}
+	prev := IsGraphApplyEnabled()
+	SetGraphApplyEnabled(true)
+	t.Cleanup(func() { SetGraphApplyEnabled(prev) })
+	recipe := &formula.Recipe{
+		Name: "wf",
+		Steps: []formula.RecipeStep{
+			{ID: "wf", Title: "Workflow", Type: "task", IsRoot: true, Metadata: map[string]string{"gc.kind": "workflow"}},
+			{ID: "wf.step", Title: "Work", Type: "task"},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "wf.step", DependsOnID: "wf", Type: "parent-child"},
+		},
+	}
+
+	result, err := Instantiate(context.Background(), store, recipe, Options{})
+	if err != nil {
+		t.Fatalf("Instantiate: %v", err)
+	}
+	if store.calls != 2 {
+		t.Fatalf("ApplyGraphPlan calls = %d, want 2", store.calls)
+	}
+	if result.RootID != "bd-1" {
+		t.Fatalf("RootID = %q, want graph apply ID bd-1", result.RootID)
+	}
+	beads, err := store.ListOpen()
+	if err != nil {
+		t.Fatalf("ListOpen: %v", err)
+	}
+	if len(beads) != 0 {
+		t.Fatalf("fallback created %d beads after retry succeeded", len(beads))
+	}
+}
+
 func TestInstantiateFallsBackWhenGraphApplyDoltConnectionTimesOut(t *testing.T) {
 	store := &graphApplySpyStore{
 		MemStore: beads.NewMemStore(),
@@ -436,6 +487,9 @@ func TestInstantiateFallsBackWhenGraphApplyDoltConnectionTimesOut(t *testing.T) 
 	}
 	if store.plan == nil {
 		t.Fatal("ApplyGraphPlan was not attempted")
+	}
+	if store.calls != 2 {
+		t.Fatalf("ApplyGraphPlan calls = %d, want 2", store.calls)
 	}
 	if result.Created != 2 {
 		t.Fatalf("Created = %d, want 2", result.Created)
@@ -470,6 +524,9 @@ func TestInstantiateDoesNotFallbackForNonTransientGraphApplyError(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "missing IDs") {
 		t.Fatalf("error = %v, want graph apply validation detail", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("ApplyGraphPlan calls = %d, want 1", store.calls)
 	}
 	beads, listErr := store.ListOpen()
 	if listErr != nil {
