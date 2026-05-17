@@ -102,6 +102,10 @@ func (c *OrphanSessionsCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
+func (c *OrderFiringCurrentCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan.
 func (c *PackCacheCheck) WarmupEligible() bool { return false }
 
 // WarmupEligible returns false; this check is not part of the
