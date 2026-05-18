@@ -118,14 +118,20 @@ func (s *blockingPoolCreateStore) Create(bead beads.Bead) (beads.Bead, error) {
 
 type demandListCountingStore struct {
 	beads.Store
-	liveInProgressLists int
-	liveOpenMolecules   int
-	livePoolDemand      int
+	liveInProgressIssueLists int
+	liveInProgressWispLists  int
+	liveOpenMolecules        int
+	livePoolDemand           int
 }
 
 func (s *demandListCountingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	if query.Live && query.Status == "in_progress" {
-		s.liveInProgressLists++
+		switch query.TierMode {
+		case beads.TierWisps:
+			s.liveInProgressWispLists++
+		default:
+			s.liveInProgressIssueLists++
+		}
 	}
 	if query.Live && query.Status == "open" && query.Type == "molecule" {
 		s.liveOpenMolecules++
@@ -138,8 +144,9 @@ func (s *demandListCountingStore) List(query beads.ListQuery) ([]beads.Bead, err
 
 type demandRefreshFailStore struct {
 	beads.Store
-	failNextGet         bool
-	liveInProgressLists int
+	failNextGet              bool
+	liveInProgressIssueLists int
+	liveInProgressWispLists  int
 }
 
 func (s *demandRefreshFailStore) Get(id string) (beads.Bead, error) {
@@ -152,7 +159,12 @@ func (s *demandRefreshFailStore) Get(id string) (beads.Bead, error) {
 
 func (s *demandRefreshFailStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	if query.Live && query.Status == "in_progress" {
-		s.liveInProgressLists++
+		switch query.TierMode {
+		case beads.TierWisps:
+			s.liveInProgressWispLists++
+		default:
+			s.liveInProgressIssueLists++
+		}
 	}
 	return s.Store.List(query)
 }
@@ -191,7 +203,7 @@ func (s *partialAssignedWorkStore) List(query beads.ListQuery) ([]beads.Bead, er
 	if err != nil {
 		return nil, err
 	}
-	if s.partialInProgress && query.Status == "in_progress" && query.Live {
+	if s.partialInProgress && query.Status == "in_progress" {
 		return rows, &beads.PartialResultError{Op: "bd list", Err: errors.New("skipped corrupt in-progress bead")}
 	}
 	return rows, nil
@@ -236,6 +248,36 @@ func TestCollectAssignedWorkBeads_IncludesReadyOpenAssignedHandoff(t *testing.T)
 	}
 	if got[0].Assignee != "repo/refinery" || got[0].Status != "open" {
 		t.Fatalf("assigned handoff bead = assignee %q status %q, want repo/refinery open", got[0].Assignee, got[0].Status)
+	}
+}
+
+func TestCollectAssignedWorkBeadsIncludesAssignedInProgressWisp(t *testing.T) {
+	store := beads.NewMemStore()
+	wisp, err := store.Create(beads.Bead{
+		Title:     "active workflow step",
+		Type:      "task",
+		Status:    "in_progress",
+		Assignee:  "worker-session",
+		Ephemeral: true,
+		Metadata: map[string]string{
+			"gc.routed_to": "worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create wisp work: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(wisp.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark wisp in progress: %v", err)
+	}
+
+	got, partial := collectAssignedWorkBeads(&config.City{}, store)
+
+	if partial {
+		t.Fatal("collectAssignedWorkBeads reported partial results")
+	}
+	if len(got) != 1 || got[0].ID != wisp.ID {
+		t.Fatalf("collectAssignedWorkBeads returned %#v, want in-progress wisp %s", got, wisp.ID)
 	}
 }
 
@@ -291,12 +333,15 @@ func TestCollectAssignedWorkBeadsUsesCachedInProgressReadModel(t *testing.T) {
 	if len(got) != 1 || got[0].ID != work.ID {
 		t.Fatalf("collectAssignedWorkBeads returned %#v, want [%s]", got, work.ID)
 	}
-	if backing.liveInProgressLists != 0 {
-		t.Fatalf("live in_progress list calls = %d, want cached demand read", backing.liveInProgressLists)
+	if backing.liveInProgressIssueLists != 0 {
+		t.Fatalf("live issue in_progress list calls = %d, want cached demand read", backing.liveInProgressIssueLists)
+	}
+	if backing.liveInProgressWispLists != 0 {
+		t.Fatalf("live wisp in_progress list calls = %d, want cached demand read", backing.liveInProgressWispLists)
 	}
 }
 
-func TestCollectAssignedWorkBeadsFallsBackLiveWhenCachedInProgressDirty(t *testing.T) {
+func TestCollectAssignedWorkBeadsReprimesWhenCachedInProgressDirty(t *testing.T) {
 	backing := &demandRefreshFailStore{Store: beads.NewMemStore()}
 	work, err := backing.Create(beads.Bead{
 		Title: "handoff becomes active",
@@ -319,13 +364,16 @@ func TestCollectAssignedWorkBeadsFallsBackLiveWhenCachedInProgressDirty(t *testi
 
 	got, partial := collectAssignedWorkBeads(&config.City{}, cache)
 	if partial {
-		t.Fatal("collectAssignedWorkBeads reported partial with successful live fallback")
+		t.Fatal("collectAssignedWorkBeads reported partial with successful cache reprime")
 	}
 	if len(got) != 1 || got[0].ID != work.ID || got[0].Status != "in_progress" || got[0].Assignee != "repo/refinery" {
-		t.Fatalf("collectAssignedWorkBeads returned %#v, want live in-progress %s", got, work.ID)
+		t.Fatalf("collectAssignedWorkBeads returned %#v, want reprime in-progress %s", got, work.ID)
 	}
-	if backing.liveInProgressLists != 1 {
-		t.Fatalf("live in_progress list calls = %d, want dirty cache fallback", backing.liveInProgressLists)
+	if backing.liveInProgressIssueLists != 0 {
+		t.Fatalf("live issue in_progress list calls = %d, want shared cache reprime", backing.liveInProgressIssueLists)
+	}
+	if backing.liveInProgressWispLists != 0 {
+		t.Fatalf("live wisp in_progress list calls = %d, want shared cache reprime", backing.liveInProgressWispLists)
 	}
 }
 
@@ -828,7 +876,7 @@ func TestDefaultScaleCheckCountsHonorsCachedWriteThroughDependencies(t *testing.
 	}
 }
 
-func TestDefaultScaleCheckCountsFallsBackWhenCachedEventDepsUnknown(t *testing.T) {
+func TestDefaultScaleCheckCountsMarksPartialWhenCachedEventDepsUnknown(t *testing.T) {
 	backing := &readyStaticStore{
 		Store: beads.NewMemStore(),
 		ready: []beads.Bead{{
@@ -842,8 +890,8 @@ func TestDefaultScaleCheckCountsFallsBackWhenCachedEventDepsUnknown(t *testing.T
 		}},
 	}
 	cache := beads.NewCachingStoreForTest(backing, nil)
-	if err := cache.PrimeActive(); err != nil {
-		t.Fatalf("PrimeActive: %v", err)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
 	}
 	cache.ApplyEvent("bead.created", []byte(`{"id":"gc-blocked","status":"open","metadata":{"gc.routed_to":"gascity/workflows.codex-max"}}`))
 
@@ -852,14 +900,14 @@ func TestDefaultScaleCheckCountsFallsBackWhenCachedEventDepsUnknown(t *testing.T
 		storeKey: "rig:gascity",
 		store:    cache,
 	}})
-	if len(errs) != 0 {
-		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	if len(errs) != 1 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v, want cache-unavailable partial", errs)
 	}
-	if got := counts["gascity/workflows.codex-max"]; got != 1 {
-		t.Fatalf("defaultScaleCheckCounts = %d, want live ready fallback count only", got)
+	if got := counts["gascity/workflows.codex-max"]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want no live fallback count", got)
 	}
-	if backing.readyCalls != 1 {
-		t.Fatalf("backing Ready calls = %d, want one live ready fallback", backing.readyCalls)
+	if backing.readyCalls != 0 {
+		t.Fatalf("backing Ready calls = %d, want no live ready fallback", backing.readyCalls)
 	}
 }
 

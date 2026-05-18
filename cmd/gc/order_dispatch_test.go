@@ -4103,7 +4103,8 @@ func TestSweepOrphanedOrderTracking_RetryOnTransientError(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	// Fail the first 2 ListByLabel calls, succeed on the 3rd.
+	// Fail the first 2 ListByLabel calls, succeed on the 3rd. The successful
+	// sweep also scans the legacy tracking label.
 	fs := &countFailStore{Store: inner, failCount: 2}
 	closed, err := sweepOrphanedOrderTrackingRetry(fs, 3, time.Millisecond)
 	if err != nil {
@@ -4112,8 +4113,8 @@ func TestSweepOrphanedOrderTracking_RetryOnTransientError(t *testing.T) {
 	if closed != 1 {
 		t.Fatalf("closed = %d, want 1", closed)
 	}
-	if fs.calls != 3 {
-		t.Fatalf("ListByLabel calls = %d, want 3", fs.calls)
+	if fs.calls != 4 {
+		t.Fatalf("ListByLabel calls = %d, want 4", fs.calls)
 	}
 }
 
@@ -4165,8 +4166,8 @@ func TestSweepOrphanedOrderTracking_RetryOnPartialClose(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("n = %d, want 3 (accumulated across retries)", n)
 	}
-	if fs.listCalls != 3 {
-		t.Fatalf("ListByLabel calls = %d, want 3 (retry on partial close)", fs.listCalls)
+	if fs.listCalls != 6 {
+		t.Fatalf("ListByLabel calls = %d, want 6 (current and legacy label scans per retry)", fs.listCalls)
 	}
 }
 

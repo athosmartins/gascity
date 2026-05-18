@@ -279,3 +279,49 @@ func TestSessionAssignmentIdentifiersForConfigConfiguredNamedSessionFallbackIsCo
 		})
 	}
 }
+
+func TestSessionHasOpenAssignedWorkIncludesReachableAssignedWisp(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "riga")
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "riga", Path: rigPath}},
+		Agents: []config.Agent{{
+			Name: "worker",
+			Dir:  "riga",
+		}},
+	}
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	session := beads.Bead{
+		ID:     "session-1",
+		Type:   sessionBeadType,
+		Status: "open",
+		Metadata: map[string]string{
+			"template":     "riga/worker",
+			"session_name": "worker-session",
+		},
+	}
+	wisp, err := rigStore.Create(beads.Bead{
+		ID:        "rig-wisp-work",
+		Title:     "active workflow step",
+		Type:      "task",
+		Status:    "in_progress",
+		Assignee:  session.Metadata["session_name"],
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create rig wisp work: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := rigStore.Update(wisp.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark rig wisp in progress: %v", err)
+	}
+
+	has, err := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, cityStore, map[string]beads.Store{"riga": rigStore}, session)
+	if err != nil {
+		t.Fatalf("sessionHasOpenAssignedWorkForReachableStore: %v", err)
+	}
+	if !has {
+		t.Fatal("reachable assigned wisp work should count before closing a session")
+	}
+}
