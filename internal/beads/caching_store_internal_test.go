@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -169,6 +171,288 @@ func TestCachingStoreListLiveBypassesCache(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].ID != bead.ID {
 		t.Fatalf("List(in_progress, Live) = %+v, want %s from backing store", got, bead.ID)
+	}
+}
+
+func TestCachingStoreHandlesCachedReadsShareFullPrime(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	bead, err := mem.Create(Bead{Title: "cached work"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	backing := &blockingPrimeListStore{
+		Store:   mem,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+	handles := cache.Handles()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		rows, err := handles.Cached.List(ListQuery{Status: "open"})
+		if err == nil && (len(rows) != 1 || rows[0].ID != bead.ID) {
+			err = fmt.Errorf("cached List rows = %#v, want %s", rows, bead.ID)
+		}
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		rows, err := handles.Cached.Ready()
+		if err == nil && (len(rows) != 1 || rows[0].ID != bead.ID) {
+			err = fmt.Errorf("cached Ready rows = %#v, want %s", rows, bead.ID)
+		}
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		if _, err := handles.Cached.DepList(bead.ID, "down"); err != nil {
+			errs <- err
+			return
+		}
+		errs <- nil
+	}()
+
+	select {
+	case <-backing.started:
+	case <-time.After(time.Second):
+		t.Fatal("cached reads did not start shared full prime")
+	}
+	time.Sleep(25 * time.Millisecond)
+	if got := backing.primeListCalls.Load(); got != 1 {
+		t.Fatalf("prime list calls while cached reads blocked = %d, want 1", got)
+	}
+
+	close(backing.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := backing.primeListCalls.Load(); got != 1 {
+		t.Fatalf("total prime list calls = %d, want 1", got)
+	}
+}
+
+func TestCachingStoreHandlesCachedReadsWaitForFullPrimeAfterPrimeActive(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	bead, err := mem.Create(Bead{Title: "cached work"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	backing := &blockingPrimeListStore{
+		Store:   mem,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		rows, err := cache.Handles().Cached.List(ListQuery{Status: "open"})
+		if err == nil && (len(rows) != 1 || rows[0].ID != bead.ID) {
+			err = fmt.Errorf("cached List rows = %#v, want %s", rows, bead.ID)
+		}
+		done <- err
+	}()
+
+	select {
+	case <-backing.started:
+	case err := <-done:
+		t.Fatalf("cached read returned before full prime: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("cached read did not start full prime after active prime")
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("cached read finished while full prime was blocked: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(backing.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := backing.primeListCalls.Load(); got != 1 {
+		t.Fatalf("total prime list calls = %d, want 1", got)
+	}
+}
+
+func TestCachingStoreHandlesReadLogicalStoreWithoutTierFlags(t *testing.T) {
+	t.Parallel()
+
+	backing := NewMemStore()
+	issue, err := backing.Create(Bead{Title: "issue work"})
+	if err != nil {
+		t.Fatalf("Create issue: %v", err)
+	}
+	wisp, err := backing.Create(Bead{Title: "wisp work", Ephemeral: true})
+	if err != nil {
+		t.Fatalf("Create wisp: %v", err)
+	}
+	cache := NewCachingStoreForTest(backing, nil)
+
+	cachedRows, err := cache.Handles().Cached.List(ListQuery{Status: "open"})
+	if err != nil {
+		t.Fatalf("Cached.List: %v", err)
+	}
+	assertHasBeadIDs(t, cachedRows, issue.ID, wisp.ID)
+
+	inProgress := "in_progress"
+	if err := backing.Update(wisp.ID, UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("Update backing wisp: %v", err)
+	}
+	liveRows, err := cache.Handles().Live.List(ListQuery{Status: "in_progress"})
+	if err != nil {
+		t.Fatalf("Live.List: %v", err)
+	}
+	assertHasBeadIDs(t, liveRows, wisp.ID)
+}
+
+func TestHandlesForPlainStoreReadsLogicalBothTiers(t *testing.T) {
+	t.Parallel()
+
+	store := NewMemStore()
+	issue, err := store.Create(Bead{Title: "issue work"})
+	if err != nil {
+		t.Fatalf("Create issue: %v", err)
+	}
+	wisp, err := store.Create(Bead{Title: "wisp work", Ephemeral: true})
+	if err != nil {
+		t.Fatalf("Create wisp: %v", err)
+	}
+
+	cachedRows, err := HandlesFor(store).Cached.List(ListQuery{Status: "open"})
+	if err != nil {
+		t.Fatalf("Cached.List: %v", err)
+	}
+	assertHasBeadIDs(t, cachedRows, issue.ID, wisp.ID)
+
+	liveRows, err := HandlesFor(store).Live.List(ListQuery{Status: "open"})
+	if err != nil {
+		t.Fatalf("Live.List: %v", err)
+	}
+	assertHasBeadIDs(t, liveRows, issue.ID, wisp.ID)
+}
+
+func TestCachingStoreListWispsUsesCacheByDefault(t *testing.T) {
+	t.Parallel()
+
+	backing := NewMemStore()
+	wisp, err := backing.Create(Bead{
+		Title:     "wisp work",
+		Assignee:  "worker",
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create wisp: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	status := "in_progress"
+	if err := backing.Update(wisp.ID, UpdateOpts{Status: &status}); err != nil {
+		t.Fatalf("Update backing: %v", err)
+	}
+
+	got, err := cache.List(ListQuery{Status: "open", Assignee: "worker", TierMode: TierWisps})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != wisp.ID {
+		t.Fatalf("List(open wisp) = %+v, want cached %s", got, wisp.ID)
+	}
+}
+
+type blockingPrimeListStore struct {
+	Store
+	started        chan struct{}
+	release        chan struct{}
+	startedOnce    sync.Once
+	primeListCalls atomic.Int64
+}
+
+func (s *blockingPrimeListStore) List(query ListQuery) ([]Bead, error) {
+	if query.AllowScan && query.SkipLabels {
+		s.primeListCalls.Add(1)
+		s.startedOnce.Do(func() { close(s.started) })
+		<-s.release
+	}
+	return s.Store.List(query)
+}
+
+func assertHasBeadIDs(t *testing.T, rows []Bead, want ...string) {
+	t.Helper()
+	got := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		got[row.ID] = true
+	}
+	for _, id := range want {
+		if !got[id] {
+			t.Fatalf("rows ids = %v rows=%#v, missing %s", got, rows, id)
+		}
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows ids = %v rows=%#v, want exactly %v", got, rows, want)
+	}
+}
+
+func TestCachingStoreListBothTiersUsesCachedWispsByDefault(t *testing.T) {
+	t.Parallel()
+
+	backing := NewMemStore()
+	issue, err := backing.Create(Bead{
+		Title:    "issue work",
+		Assignee: "worker",
+	})
+	if err != nil {
+		t.Fatalf("Create issue: %v", err)
+	}
+	wisp, err := backing.Create(Bead{
+		Title:     "wisp work",
+		Assignee:  "worker",
+		Ephemeral: true,
+	})
+	if err != nil {
+		t.Fatalf("Create wisp: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	status := "in_progress"
+	if err := backing.Update(wisp.ID, UpdateOpts{Status: &status}); err != nil {
+		t.Fatalf("Update backing: %v", err)
+	}
+
+	got, err := cache.List(ListQuery{Status: "open", Assignee: "worker", TierMode: TierBoth})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, bead := range got {
+		ids[bead.ID] = true
+	}
+	if !ids[issue.ID] || !ids[wisp.ID] || len(got) != 2 {
+		t.Fatalf("List(open both tiers) ids = %v rows=%+v, want cached issue %s and wisp %s", ids, got, issue.ID, wisp.ID)
 	}
 }
 
@@ -1670,7 +1954,7 @@ func TestCachingStoreCloseAllMarksRefreshFailuresDirty(t *testing.T) {
 	}
 }
 
-func TestCachingStoreCachedListReturnsSnapshotWithDirtyEntries(t *testing.T) {
+func TestCachingStoreCachedListReflectsWriteThroughRefreshFailure(t *testing.T) {
 	t.Parallel()
 
 	backing := &refreshFailingStore{Store: NewMemStore()}
@@ -1691,24 +1975,26 @@ func TestCachingStoreCachedListReturnsSnapshotWithDirtyEntries(t *testing.T) {
 
 	rows, ok := cache.CachedList(ListQuery{Status: "open"})
 	if !ok {
-		t.Fatal("CachedList returned ok=false for dirty cache, want snapshot")
+		t.Fatal("CachedList returned ok=false after write-through update")
 	}
 	if len(rows) != 1 || rows[0].ID != bead.ID {
-		t.Fatalf("CachedList = %#v, want dirty snapshot row %s", rows, bead.ID)
+		t.Fatalf("CachedList = %#v, want row %s", rows, bead.ID)
 	}
-	if rows[0].Title == title {
-		t.Fatalf("CachedList returned refreshed title %q; test setup did not create a dirty stale snapshot", rows[0].Title)
+	if rows[0].Title != title {
+		t.Fatalf("CachedList title = %q, want write-through title %q", rows[0].Title, title)
 	}
 }
 
-func TestCachingStoreCachedListRefusesNonIssuesTierQueries(t *testing.T) {
+func TestCachingStoreCachedListSupportsActiveTierQueries(t *testing.T) {
 	t.Parallel()
 
 	backing := NewMemStore()
-	if _, err := backing.Create(Bead{Title: "plain", Labels: []string{"k"}}); err != nil {
+	plain, err := backing.Create(Bead{Title: "plain", Labels: []string{"k"}})
+	if err != nil {
 		t.Fatalf("Create plain: %v", err)
 	}
-	if _, err := backing.Create(Bead{Title: "wisp", Labels: []string{"k"}, Ephemeral: true}); err != nil {
+	wisp, err := backing.Create(Bead{Title: "wisp", Labels: []string{"k"}, Ephemeral: true})
+	if err != nil {
 		t.Fatalf("Create wisp: %v", err)
 	}
 	cache := NewCachingStoreForTest(backing, nil)
@@ -1716,10 +2002,23 @@ func TestCachingStoreCachedListRefusesNonIssuesTierQueries(t *testing.T) {
 		t.Fatalf("Prime: %v", err)
 	}
 
-	for _, tier := range []TierMode{TierWisps, TierBoth} {
-		if rows, ok := cache.CachedList(ListQuery{Label: "k", TierMode: tier}); ok {
-			t.Fatalf("CachedList tier %v ok=true rows=%#v, want ok=false", tier, rows)
-		}
+	wisps, ok := cache.CachedList(ListQuery{Label: "k", TierMode: TierWisps})
+	if !ok {
+		t.Fatal("CachedList wisps ok=false, want cached result")
+	}
+	if len(wisps) != 1 || wisps[0].ID != wisp.ID {
+		t.Fatalf("CachedList wisps = %#v, want %s", wisps, wisp.ID)
+	}
+	both, ok := cache.CachedList(ListQuery{Label: "k", TierMode: TierBoth})
+	if !ok {
+		t.Fatal("CachedList both ok=false, want cached result")
+	}
+	ids := map[string]bool{}
+	for _, row := range both {
+		ids[row.ID] = true
+	}
+	if len(both) != 2 || !ids[plain.ID] || !ids[wisp.ID] {
+		t.Fatalf("CachedList both ids = %v rows=%#v, want %s and %s", ids, both, plain.ID, wisp.ID)
 	}
 }
 

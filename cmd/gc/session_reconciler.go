@@ -2648,19 +2648,45 @@ func sessionHasOpenAssignedWorkInStoreByIdentifiers(store beads.Store, identifie
 				continue
 			}
 			seen[key] = struct{}{}
-			items, err := store.List(beads.ListQuery{Assignee: assignee, Status: status, Live: true})
-			if err != nil {
-				return false, err
+			if has, err := sessionHasOpenAssignedWorkForTier(store, assignee, status, beads.TierIssues, true); err != nil || has {
+				return has, err
 			}
-			for _, item := range items {
-				if sessionpkg.IsSessionBeadOrRepairable(item) {
-					continue
-				}
-				return true, nil
+			if has, err := sessionHasOpenAssignedWispWork(store, assignee, status); err != nil || has {
+				return has, err
 			}
 		}
 	}
 	return false, nil
+}
+
+func sessionHasOpenAssignedWispWork(store beads.Store, assignee, status string) (bool, error) {
+	query := beads.ListQuery{Assignee: assignee, Status: status, TierMode: beads.TierWisps}
+	if cache, ok := store.(interface {
+		CachedList(beads.ListQuery) ([]beads.Bead, bool)
+	}); ok {
+		if items, ok := cache.CachedList(query); ok {
+			return hasNonSessionAssignedWork(items), nil
+		}
+	}
+	return sessionHasOpenAssignedWorkForTier(store, assignee, status, beads.TierWisps, true)
+}
+
+func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status string, tierMode beads.TierMode, live bool) (bool, error) {
+	items, err := store.List(beads.ListQuery{Assignee: assignee, Status: status, Live: live, TierMode: tierMode})
+	if err != nil {
+		return false, err
+	}
+	return hasNonSessionAssignedWork(items), nil
+}
+
+func hasNonSessionAssignedWork(items []beads.Bead) bool {
+	for _, item := range items {
+		if sessionpkg.IsSessionBeadOrRepairable(item) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // namedSessionActivityThreshold is the maximum age of the last reliable

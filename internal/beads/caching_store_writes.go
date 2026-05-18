@@ -52,6 +52,20 @@ func (c *CachingStore) Update(id string, opts UpdateOpts) error {
 	fresh, err := c.backing.Get(id)
 	if err != nil {
 		c.mu.Lock()
+		c.noteLocalMutationLocked(id)
+		if current, ok := c.beads[id]; ok {
+			fresh = applyUpdateOptsToBead(current, opts)
+			c.beads[id] = cloneBead(fresh)
+			c.deps[id] = depsFromBeadFields(fresh)
+			delete(c.dirty, id)
+			delete(c.deletedSeq, id)
+			c.markFreshLocked(time.Now())
+			c.updateStatsLocked()
+			c.mu.Unlock()
+			c.recordProblem("refresh bead after update", fmt.Errorf("%s: %w", id, err))
+			c.notifyChange("bead.updated", fresh)
+			return nil
+		}
 		c.dirty[id] = struct{}{}
 		c.mu.Unlock()
 		c.recordProblem("refresh bead after update", fmt.Errorf("%s: %w", id, err))

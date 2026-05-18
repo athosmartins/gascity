@@ -168,7 +168,7 @@ func ListLiveRoots(store beads.Store, sourceBeadID, sourceStoreRef, rootStoreRef
 	if store == nil || sourceBeadID == "" {
 		return nil, nil
 	}
-	roots, err := store.List(beads.ListQuery{
+	roots, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		Metadata: map[string]string{
 			"gc.source_bead_id": sourceBeadID,
 		},
