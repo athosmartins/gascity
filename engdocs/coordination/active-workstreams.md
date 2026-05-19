@@ -1,6 +1,6 @@
 # Active Workstream Coordination
 
-Last updated: 2026-05-18 22:18 PT by Mabel
+Last updated: 2026-05-18 22:15 PT by Mabel
 
 This is a temporary cross-agent coordination channel, not product documentation.
 Do not merge this file into public docs unless we explicitly promote it.
@@ -57,6 +57,9 @@ needed owner in `Reason`.
   fan-out worktrees. Mabel re-ran the targeted readiness matrix on the old
   machine at this checkpoint and found no validation blockers. Draft PR #2351
   is open for visibility but is not queued for review.
+- `green`: Registry/gc pack design PR #2119 is closed as superseded by #2351.
+  Landed #2129 remains the explicit `[[exports]]` design source; #2351 does
+  not implement `[[exports]]`.
 - `green`: Jasmine's JSON work has a final machine-move checkpoint; the new
   machine does not need old JSON fan-out worktrees.
 - `yellow`: Mabel's coordination state is portable through this branch, but the
@@ -122,9 +125,10 @@ Mabel, resume Gas City pack/package coordination from:
 - file: engdocs/coordination/active-workstreams.md
 
 Please read the coordination file, refresh live PR/branch state for #2126,
-#2318, #2119, #2129, Jasmine's JSON rollup, Cleo's registry/gc pack workstream,
-and Grace's gc4gc handoff, then tell me where we are and what is safe to do
-next on this machine.
+#2318, #2129, #2349, #2351, Cleo's registry/gc pack workstream, Penelope's
+reuse/customization notes if available, and Grace's gc4gc handoff, then tell me
+where we are and what is safe to do next on this machine. Treat #2119 as
+closed/superseded by #2351.
 ```
 
 ## Communication Mechanism
@@ -178,6 +182,37 @@ They remain open as provenance until #2349 lands.
 
 Current JSON source of truth is this workstream section plus
 `codex/json-rollup`, not any individual JSON PR.
+
+### PRs In Play
+
+- #2349, <https://github.com/gastownhall/gascity/pull/2349>: active JSON
+  rollup PR, open, labeled `status/reviewing`.
+- Feeder PRs #2222, #2250, #2256, #2257, #2258, #2259, #2265, #2266, #2267,
+  #2270, #2271, #2273, #2274, #2287, #2288, #2291, and #2317: superseded by
+  #2349, removed from `status/reviewing`, left open only as provenance until
+  #2349 lands.
+
+### Immediate Next Step
+
+Track #2349 through review/merge. Do not close feeder PRs until #2349 merges.
+
+### Victory Checklist
+
+- #2349 remains required-CI green and merges.
+- Superseded feeder PRs are closed/abandoned with a short pointer to #2349.
+- Latest `main` is smoke-tested against gc4gc for the JSON commands Jasmine
+  already validated.
+- Coordination handoff marks JSON rollout landed.
+- Any remaining command gaps become ordinary follow-up issues, not blockers for
+  the rollout train.
+
+### Explicit Non-Goals / Deferred Work
+
+- Do not revive individual JSON feeder PRs unless #2349 fails and we explicitly
+  change strategy.
+- Do not introduce `--format json`.
+- Do not require every command to support structured failure JSON before this
+  train lands; failure JSON is staged command-by-command.
 
 Included provenance PRs already incorporated into `codex/json-rollup`:
 
@@ -412,6 +447,36 @@ the moved PackV2 migration page from public docs navigation, points
 engineering/historical references at `engdocs/design/packv2`, and validates
 locally with docsync plus focused config/logutil/cmd tests.
 
+### PRs In Play
+
+- #2126, <https://github.com/gastownhall/gascity/pull/2126>: active
+  PackV1/PackV2 deprecation enforcement PR.
+- #2318, <https://github.com/gastownhall/gascity/pull/2318>: related
+  docs/source reconciliation PR; separate from #2126 because it fixes source of
+  truth and public-doc placement rather than runtime behavior.
+
+### Immediate Next Step
+
+Track #2126 through review/merge. Keep #2318 moving independently as the docs
+source-of-truth cleanup.
+
+### Victory Checklist
+
+- #2126 merges with the agreed hard-error/warning/remediation behavior.
+- Legacy pre-PackV2 constructs are no longer normalized as current authoring
+  guidance by writers, generated docs, or in-repo content.
+- Remediation messages remain actionable for hard-failed constructs.
+- `gc import migrate` is not removed or replaced until doctor / `doctor --fix`
+  parity exists for the existing migrate corpus.
+- Any deferred doctor/remediation parity gaps are tracked explicitly.
+
+### Explicit Non-Goals / Deferred Work
+
+- Do not fold registry/gc pack implementation into #2126.
+- Do not make #2126 implement the registry surface, JSON rollout, or explicit
+  `[[exports]]`.
+- Do not remove `gc import migrate` in this train.
+
 ### Attention Needed
 
 Needs Mabel: no
@@ -461,6 +526,68 @@ registry/gc pack beyond the compatibility invariants listed below.
 
 ### Workstream
 
+PackV2 Docs / Source Reconciliation
+
+### Current Branch / PR
+
+Branch: `codex/packv2-doc-source-reconcile`
+
+PR: #2318, <https://github.com/gastownhall/gascity/pull/2318>
+
+Base: `main`
+
+Owner: Mabel
+
+### Latest State
+
+#2318 is the active docs/source reconciliation PR. It moves obsolete or
+transitional PackV2 material out of public docs and into engineering docs, so
+future agents and users do not treat old design notes as current product
+guidance.
+
+### PRs In Play
+
+- #2318: open, non-draft, labeled `status/reviewing`, currently the source of
+  truth for PackV2 docs/source reconciliation.
+
+### Immediate Next Step
+
+Track #2318 through review/merge. Keep it separate from #2126 and #2349.
+
+### Victory Checklist
+
+- #2318 merges.
+- Public docs no longer expose stale PackV2 design/rollout notes as current
+  product guidance.
+- Engineering PackV2 historical/design material lives under
+  `engdocs/design/packv2` with clear status.
+- Generated config/schema references and fatal/troubleshooting links point at
+  current public docs or engineering docs intentionally.
+- Docsync and focused config/logutil/cmd validation remain green.
+
+### Explicit Non-Goals / Deferred Work
+
+- #2318 does not implement deprecation enforcement; that is #2126.
+- #2318 does not implement JSON behavior; that is #2349.
+- #2318 does not implement registry/gc pack; that is #2351.
+- #2318 does not implement explicit `[[exports]]`; #2129 is landed design for
+  future implementation.
+
+### Cross-Workstream Dependencies
+
+- #2126 should remain the behavior source for deprecation enforcement.
+- #2351 should reference current docs/design paths after #2318 lands.
+- Pack reuse/customization docs should avoid using moved engineering notes as
+  user-facing guidance.
+
+### Last Updated
+
+2026-05-18 22:15 PT by Mabel
+
+## Workstream Handoff
+
+### Workstream
+
 Registry-gc-pack
 
 ### Current Branch / PR
@@ -504,6 +631,47 @@ operations still come first inside that workstream.
 
 The registry/gc pack source of truth is now
 `gastownhall/gascity:codex/pack-registry-workstream`.
+
+### PRs In Play
+
+- #2351, <https://github.com/gastownhall/gascity/pull/2351>: draft registry/gc
+  pack implementation PR and current source of truth.
+- #2119, <https://github.com/gastownhall/gascity/pull/2119>: closed as
+  superseded by #2351.
+- #2129, <https://github.com/gastownhall/gascity/pull/2129>: merged explicit
+  `[[exports]]` design note; related design input, not implemented by #2351.
+- #2318, <https://github.com/gastownhall/gascity/pull/2318>: related PackV2
+  docs/source reconciliation PR.
+
+### Immediate Next Step
+
+Decide when to move #2351 from draft/review-train staging into active review.
+Until then, keep it visible but unqueued.
+
+### Victory Checklist
+
+- #2351 is converted out of draft when the review queue is ready.
+- #2351 CI and review are green, then #2351 merges.
+- Registry/gc pack validation matrix passes at final review checkpoint.
+- JSON/schema behavior remains compatible with #2349 and does not invent
+  command-specific schema conventions.
+- Legacy `gc import`, legacy `gc pack fetch/list`, and current PackV2 import
+  fields `source`, `version`, `export`, `transitive`, and `shadow` do not
+  regress.
+- `gc import migrate` is not removed, replaced, or redirected to a new `gc pack`
+  command until doctor / `doctor --fix` parity exists.
+- A follow-up issue exists for explicit `[[exports]]` implementation from
+  #2129.
+
+### Explicit Non-Goals / Deferred Work
+
+- #2351 does not implement #2129 explicit `[[exports]]`.
+- #2351 does not replace `gc import migrate`.
+- Dependency `gc pack show`, `gc pack outdated`, and canonical dependency
+  `gc pack list` are deferred; existing `gc pack list` remains the legacy
+  `[packs]` status command.
+- Do not fold PackV2 deprecation enforcement into #2351 except for explicit
+  compatibility checkpoints.
 
 Mabel refreshed live state on 2026-05-18 PT:
 
@@ -663,7 +831,7 @@ Run from `/Users/dbox/repos/gc-pr2119` on `codex/pack-registry-workstream`:
 
 ```sh
 go test ./internal/packsource ./internal/packregistry ./internal/packman ./internal/config
-go test ./cmd/gc -run 'TestPackRegistry|TestPackRegistryJSON|TestPackAdd|TestPackSync|TestPackCommandTree|TestDoImport|TestImport|TestImportStateDoctor|TestDoDoctor|TestJSONSchema|TestJSONUnsupported|TestJSONExecutionFailure|TestSyncLock|TestCheckInstalled'
+go test ./cmd/gc -run 'TestPackRegistry|TestPackRegistryJSON|TestPackAdd|TestPackSync|TestPackCheck|TestPackCommandTree|TestDoImport|TestImport|TestImportStateDoctor|TestDoDoctor|TestJSONSchema|TestJSONUnsupported|TestJSONExecutionFailure|TestSyncLock|TestCheckInstalled'
 make check-docs
 git diff --check
 ```
@@ -672,7 +840,7 @@ These targeted gates passed on the old machine at `a64fb1ba`. Mabel re-ran the
 same matrix on 2026-05-18 PT and all four commands passed again:
 
 - `go test ./internal/packsource ./internal/packregistry ./internal/packman ./internal/config`
-- `go test ./cmd/gc -run 'TestPackRegistry|TestPackRegistryJSON|TestPackAdd|TestPackSync|TestPackCommandTree|TestDoImport|TestImport|TestImportStateDoctor|TestDoDoctor|TestJSONSchema|TestJSONUnsupported|TestJSONExecutionFailure|TestSyncLock|TestCheckInstalled'`
+- `go test ./cmd/gc -run 'TestPackRegistry|TestPackRegistryJSON|TestPackAdd|TestPackSync|TestPackCheck|TestPackCommandTree|TestDoImport|TestImport|TestImportStateDoctor|TestDoDoctor|TestJSONSchema|TestJSONUnsupported|TestJSONExecutionFailure|TestSyncLock|TestCheckInstalled'`
 - `make check-docs`
 - `git diff --check`
 
@@ -747,7 +915,7 @@ They should not be needed unless the pushed branch is lost.
 git status --short --branch --untracked-files=all
 git log --oneline -5 --decorate
 go test ./internal/packsource ./internal/packregistry ./internal/packman ./internal/config
-go test ./cmd/gc -run 'TestPackRegistry|TestPackRegistryJSON|TestPackAdd|TestPackSync|TestPackCommandTree|TestDoImport|TestImport|TestImportStateDoctor|TestDoDoctor|TestJSONSchema|TestJSONUnsupported|TestJSONExecutionFailure|TestSyncLock|TestCheckInstalled'
+go test ./cmd/gc -run 'TestPackRegistry|TestPackRegistryJSON|TestPackAdd|TestPackSync|TestPackCheck|TestPackCommandTree|TestDoImport|TestImport|TestImportStateDoctor|TestDoDoctor|TestJSONSchema|TestJSONUnsupported|TestJSONExecutionFailure|TestSyncLock|TestCheckInstalled'
 make check-docs
 git diff --check
 ```
@@ -795,7 +963,9 @@ Pack Reuse / Customization Design
 
 Branch: managed by Penelope on another machine
 
-PR: feeds into #2119 / #2129 as appropriate
+PR: no active PR in this coordination branch. Related sources are #2129
+(merged explicit `[[exports]]` design), #2351 (registry/gc pack implementation,
+does not implement `[[exports]]`), and future guide/implementation PRs.
 
 Base: not tracked in this coordination file
 
@@ -816,8 +986,37 @@ Needs D. Box: no
 Urgency: green
 
 Reason: Penelope is intentionally staying on a separate machine; only update
-this coordination file if her guide decisions affect #2119, #2129, registry/gc
+this coordination file if her guide decisions affect #2129, #2351, registry/gc
 pack CLI wording, or import/export semantics.
+
+### PRs In Play
+
+- #2129: merged explicit `[[exports]]` design note and current source for that
+  future direction.
+- #2351: current registry/gc pack implementation PR; related but does not
+  implement explicit `[[exports]]`.
+- Future PR needed for user-facing pack reuse/customization guide and any
+  explicit `[[exports]]` implementation.
+
+### Immediate Next Step
+
+Penelope continues the guide/design work on the separate machine and surfaces
+any decisions that change #2351 wording or future import/export semantics.
+
+### Victory Checklist
+
+- User-facing pack reuse/customization guide exists and is aligned with shipped
+  behavior.
+- Explicit `[[exports]]` implementation follow-up exists and references #2129.
+- Guide examples do not imply unimplemented behavior in #2351.
+- Any terminology changes are reflected in registry/gc pack docs before #2351
+  exits draft.
+
+### Explicit Non-Goals / Deferred Work
+
+- Do not implement explicit `[[exports]]` in #2351.
+- Do not make Penelope's guide block #2349, #2318, or #2351 unless it exposes a
+  real product contract mismatch.
 
 ### Interface Contracts Other Agents Must Honor
 
@@ -828,7 +1027,7 @@ pack CLI wording, or import/export semantics.
 ### Blockers / Cross-Workstream Risks
 
 - `yellow`: Reuse/customization guide may update terminology or examples used
-  by #2119 and future registry docs.
+  by #2351 and future registry docs.
 
 ### Needed From Other Agents
 
@@ -837,7 +1036,7 @@ pack CLI wording, or import/export semantics.
 
 ### Last Updated
 
-2026-05-18 12:10 PT by Mabel
+2026-05-18 22:15 PT by Mabel
 
 ## Workstream Handoff
 
@@ -943,6 +1142,35 @@ Known unpromoted work:
   canary against PR #2119, but it is not promoted into stable gc4gc yet.
 - Do not treat `pack-design-drift-check` as stable consumer surface until it
   goes through promotion and validation.
+
+### PRs In Play
+
+- No product PR expected for stable gc4gc itself.
+- `donbox/gc4gc:master` is the stable consumer source.
+- `donbox/gc4gc:codex/gc4gc-producer-dev` is the producer/dev source.
+- `donbox/gc4gc:codex/gc4gc-producer-snapshot-20260518` is archaeology only.
+
+### Immediate Next Step
+
+Use stable gc4gc only when it helps current review/audit work. Do not promote
+producer/dev features without a canary, validation, and consumer-side
+verification.
+
+### Victory Checklist
+
+- New machine can clone stable gc4gc and the patched Gas City runtime.
+- Stable `gc-json.sh sling --json --dry-run --no-convoy --stdin
+  json-auditor-1` returns successful dry-run JSON from the gc4gc checkout.
+- Mabel/Codex can consume stable run artifacts without Grace mediating.
+- Any producer changes are promoted through the documented
+  producer/consumer process.
+- Product gaps discovered through gc4gc are filed or tied to existing issues.
+
+### Explicit Non-Goals / Deferred Work
+
+- Do not make gc4gc a second cockpit or human-facing replacement for Codex.
+- Do not rely on `.gc/` or `.runtime/` as durable migrated Git state.
+- Do not promote formula-driven JSON audit fanout until canaries make it boring.
 
 ### Interface Contracts Other Agents Must Honor
 
