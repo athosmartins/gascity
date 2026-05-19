@@ -1,6 +1,6 @@
 # Active Workstream Coordination
 
-Last updated: 2026-05-18 17:40 PT by Mabel
+Last updated: 2026-05-18 18:55 PT by Cleo
 
 This is a temporary cross-agent coordination channel, not product documentation.
 Do not merge this file into public docs unless we explicitly promote it.
@@ -47,11 +47,14 @@ needed owner in `Reason`.
 - `green`: gc4gc / Operational Substrate is portable through
   `https://github.com/donbox/gc4gc`; stable and producer/dev branches are
   published separately.
-- `green`: Cleo's dirty registry work has been pushed to a preservation /
-  workstream branch; no meaningful registry local-only state is expected.
-- `yellow`: before retiring the old machine, Jasmine and Cleo should each
-  publish one final "ready for machine move" checkpoint after any current local
-  edits are pushed or explicitly marked disposable.
+- `green`: Registry-gc-pack is final machine-move ready at
+  `donbox/gascityworkplace:codex/pack-registry-workstream` commit `a64fb1ba`.
+  Cleo verified that meaningful registry/gc pack work is pushed, old feeder
+  branches are superseded or disposable, and the new machine does not need old
+  fan-out worktrees.
+- `yellow`: before retiring the old machine, Jasmine should publish one final
+  "ready for machine move" checkpoint after any current local edits are pushed
+  or explicitly marked disposable.
 - `yellow`: Mabel's coordination state is portable through this branch, but the
   new machine should bootstrap from this file before resuming pack work.
 
@@ -76,7 +79,7 @@ Known portable workstreams:
   most intended first-rollup work through pushed commit `d3014963`; it is not
   yet final machine-move ready.
 - Registry/gc pack: `donbox/gascityworkplace:codex/pack-registry-workstream`
-  exists at Cleo's pushed checkpoint.
+  is final machine-move ready at pushed checkpoint `a64fb1ba`.
 - gc4gc: `donbox/gc4gc:master`, `donbox/gc4gc:codex/gc4gc-producer-dev`, and
   `donbox/gc4gc:codex/gc4gc-producer-snapshot-20260518` exist.
 - Pack deprecation: #2126 is the source of truth for the deprecation train.
@@ -88,8 +91,6 @@ Remaining move-readiness asks:
 - Jasmine: finish JSON rollup boundary/validation and publish a final
   machine-move checkpoint that names incorporated, excluded, disposable, and
   abandoned old JSON branches/PRs.
-- Cleo: confirm no meaningful registry/gc pack work is local-only after her
-  next checkpoint.
 - Grace: no blocking ask; gc4gc is portable.
 - Penelope: intentionally separate on another machine.
 
@@ -479,12 +480,19 @@ Current implementation worktree:
 - State: clean and pushed after registry hardening, first `gc pack`
   dependency-command bridge, docs/reference update, and doctor guard for
   durable `registry:` selectors.
+- Machine-move readiness: ready.
 
-Older local branches are not current:
+Older local branches have been inspected and are not required by the new
+machine:
 
-- `codex/pack-registry-1a-core`
-- `codex/pack-registry-mainline`
-- `codex/pack-registry-latest-main`
+- `codex/pack-registry-1a-core`: superseded. Its unique commits are the old
+  PR #2119 design-doc commits plus old JSON-platform branch commits. The
+  workstream contains the newer design docs and uses the merged/current JSON
+  baseline instead.
+- `codex/pack-registry-mainline`: disposable for active registry/gc pack work.
+  It has no unique commits relative to the workstream.
+- `codex/pack-registry-latest-main`: disposable for active registry/gc pack
+  work. It has no unique commits relative to the workstream.
 
 ### Latest State
 
@@ -497,6 +505,18 @@ The registry/gc pack source of truth is now
 
 Dirty/unpushed work has been migrated and pushed. No meaningful local-only
 registry work should remain on the old machine.
+
+Final machine-move checkpoint:
+
+- `codex/pack-registry-workstream` contains all meaningful current registry/gc
+  pack work Cleo intends to keep.
+- All meaningful local-only registry/gc pack work is pushed to
+  `donbox/gascityworkplace:codex/pack-registry-workstream`.
+- Feeder branches are either superseded or disposable as listed above.
+- The new machine does not need old fan-out worktrees to continue the
+  workstream.
+- The old `/Users/dbox/repos/gc-pr2119` worktree should be kept only until the
+  new machine validates checkpoint `a64fb1ba`.
 
 Completed inside the workstream since the preservation checkpoint:
 
@@ -644,7 +664,7 @@ Additional required gates:
 
 ### Last Updated
 
-2026-05-18 18:35 PT by Cleo
+2026-05-18 18:55 PT by Cleo
 
 ## New Machine Bootstrap
 
@@ -709,6 +729,9 @@ git diff --check
   `codex/pack-registry-1a-core`,
   `codex/pack-registry-mainline`, and
   `codex/pack-registry-latest-main` are obsolete for active work.
+- `/Users/dbox/repos/gc/.claude/worktrees/elated-mclaren` is not part of the
+  registry/gc pack workstream. Its owner should decide deletion, but the new
+  registry/gc pack machine does not need it.
 
 ### Old-Machine Worktrees Not Safe To Delete Yet
 
