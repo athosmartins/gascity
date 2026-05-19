@@ -1,6 +1,6 @@
 # Active Workstream Coordination
 
-Last updated: 2026-05-19 PT by Mabel
+Last updated: 2026-05-19 UTC by Cleo after #2351 CI-green checkpoint
 
 This is a temporary cross-agent coordination channel, not product documentation.
 Do not merge this file into public docs unless we explicitly promote it.
@@ -51,16 +51,12 @@ needed owner in `Reason`.
   `https://github.com/donbox/gc4gc`; stable and producer/dev branches are
   published separately. Grace bootstrapped the stable consumer setup on the
   new machine and the handoff smoke passed.
-- `green`: Registry-gc-pack is final machine-move ready at
-  `gastownhall/gascity:codex/pack-registry-workstream` commit `f82f3c4e`.
-  Cleo verified that meaningful registry/gc pack work is pushed, old feeder
-  branches are superseded or disposable, and the new machine does not need old
-  fan-out worktrees. Mabel re-ran the targeted readiness matrix on the old
-  machine at this checkpoint and found no validation blockers. Draft PR #2351
-  is open for visibility but is not queued for review.
-- `yellow`: Cleo resumed #2351 on the new machine at
-  `/Users/dbox/repos/gc/gc-pr2119`. First local cleanup slice is unpushed but
-  passing targeted validation; #2351 remains draft/not queued.
+- `green`: Registry-gc-pack is current on the new machine at
+  `gastownhall/gascity:codex/pack-registry-workstream` commit `642d4c2b`.
+  Cleo pushed the first cleanup/default-registry slice and refreshed live PR
+  #2351 state on 2026-05-19 UTC: required CI, preflight, integration, cmd/gc
+  shards, and CodeQL are green. Draft PR #2351 remains open for visibility but
+  is not queued for review.
 - `green`: Registry/gc pack design PR #2119 is closed as superseded by #2351.
   Landed #2129 remains the explicit `[[exports]]` design source; #2351 does
   not implement `[[exports]]`.
@@ -668,8 +664,8 @@ Current implementation worktree:
 - Worktree: `/Users/dbox/repos/gc/gc-pr2119`
 - Current branch: `codex/pack-registry-workstream`
 - Pushed branch: `gastownhall/gascity:codex/pack-registry-workstream`
-- Current checkpoint commit: `f82f3c4e`
-- State: local unpushed cleanup slice in progress on the new machine.
+- Current checkpoint commit: `642d4c2b`
+- State: pushed; live PR #2351 CI is green; PR remains draft/not queued.
 - Machine-move readiness: complete.
 
 Older local branches have been inspected and are not required by the new
@@ -693,8 +689,9 @@ operations still come first inside that workstream.
 The registry/gc pack source of truth is now
 `gastownhall/gascity:codex/pack-registry-workstream`.
 
-Cleo resumed #2351 on the new machine from checkpoint `f82f3c4e`. PR #2351
-remains draft and not queued. Stable gc4gc is verified as safe to consume from
+Cleo resumed #2351 on the new machine from checkpoint `f82f3c4e`, completed the
+first cleanup/default-registry slice, and pushed checkpoint `642d4c2b`. PR
+#2351 remains draft and not queued. Stable gc4gc is verified as safe to consume from
 `/Users/dbox/repos/gc/gc4gc` on `master` at
 `8d992e5336e20aaa70577ce58b368c72592a73cd`, with runtime
 `/Users/dbox/repos/gc/gascity-agent-runtime` on
@@ -706,19 +703,14 @@ work: `codex/gc4gc-runtime-main-2313-json` at
 `0ae2ba20`. Treat this as the dogfood/review runtime, distinct from the
 previous stable-consumer bootstrap runtime above.
 
-Live #2351 failures at `f82f3c4e`:
+Live #2351 state at `642d4c2b`:
 
-- Preflight / static checks: lint failures in registry/source plus adjacent
-  pack/gchome/cmd nits.
-- Integration / packages-core-1-of-4: missing `testenv_import_test.go` in
-  `internal/gchome`, `internal/packregistry`, and `internal/packsource`.
-- cmd/gc process shard 9:
-  `TestScanAllOrdersRemoteImportedFlatPackOrders` fails because the test seeded
-  `HOME/.gc` cache while `testenv` uses `GC_HOME`.
-- Integration / packages-cmd-gc-3-of-6 remains failing in remote CI logs; Cleo
-  fixed the reproduced targeted order test locally.
+- Required CI, preflight, integration, cmd/gc process shards, CodeQL, and
+  dashboard checks are green.
+- Merge state is blocked only by draft/review sequencing.
+- Branch is clean and pushed to `origin/codex/pack-registry-workstream`.
 
-First cleanup slice is local-only and not pushed:
+First cleanup/default-registry slice is pushed:
 
 - Generated canonical `testenv_import_test.go` files for `internal/gchome`,
   `internal/packregistry`, and `internal/packsource`.
@@ -726,12 +718,24 @@ First cleanup slice is local-only and not pushed:
   `internal/gchome`, `internal/packman`, and adjacent `cmd/gc` nits.
 - Fixed `TestScanAllOrdersRemoteImportedFlatPackOrders` to seed
   `config.GlobalRepoCachePath(gchome.Default(), source, commit)`.
+- Seeded a default `main` registry config for fresh homes when
+  `$GC_HOME/registries.toml` is absent, pointing at
+  `https://raw.githubusercontent.com/gastownhall/gascity-packs/main/registry.toml`.
+  This does not refresh during init and preserves any existing registry config.
+- Added scope-contract tests proving registry selectors are command-time only:
+  `gc pack add main:lighthouse` persists a concrete `source`, not the registry
+  handle, and city/standalone pack roots write to the expected `pack.toml`.
+- Updated import-state doctor remediation copy to direct repair through
+  `gc pack sync`, while preserving legacy `gc import` compatibility.
 
 Local verification passing:
 
 - `go test ./internal/packsource ./internal/packregistry ./internal/packman ./internal/config ./internal/gchome ./internal/testenv`
 - `make lint-full`
-- `go test ./cmd/gc -run TestScanAllOrdersRemoteImportedFlatPackOrders -count=1`
+- Focused `cmd/gc` registry/import/doctor/scope matrix including
+  `TestScanAllOrdersRemoteImportedFlatPackOrders`,
+  `TestPackRegistryJSON`, `TestPackScopeContracts`,
+  `TestImportStateDoctorCheck`, and init default-registry tests.
 - `git diff --check`
 
 ### PRs In Play
@@ -747,9 +751,11 @@ Local verification passing:
 
 - Mabel and D. Box decide when to move #2351 from draft/review-train staging
   into active review.
-- Cleo finishes the first local cleanup slice, then pushes only after the
-  required CI-failure fixes are coherent.
-- Cleo keeps #2351 stable unless coordinating a product-surface change.
+- Cleo keeps #2351 stable unless coordinating a product-surface change; next
+  implementation work should start from the CI-green `642d4c2b` checkpoint.
+- Cleo/Penelope coordinate through the unlisted pack reuse handoff gist before
+  touching user-facing import/registry shape:
+  <https://gist.github.com/donbox/e3b14792a004fd71be9d1048fea6f10c>.
 - Before #2351 exits draft, Mabel refreshes JSON compatibility against #2349
   and deprecation compatibility against #2126.
 
@@ -789,12 +795,14 @@ Nice follow-up:
 
 - Sequencing decision: when to move #2351 from draft into active review.
 - Review capacity is the practical blocker; #2349 and #2318 are already active.
-- Current branch blockers are required CI failures reproduced above; Cleo has
-  a local unpushed slice addressing the first set.
+- There are no current branch CI blockers at `642d4c2b`.
 - Future explicit `[[exports]]` implementation needs an issue/owner before the
   registry/gc pack workstream is called fully closed.
 - Coordinate with Jasmine/Mabel if #2349 changes JSON/failure-schema
   conventions before #2351 exits draft.
+- Penelope handoff gist guidance is product-shaping: red findings pause the
+  affected implementation area; yellow findings require review before touching
+  that area; green findings are checkpoint context.
 
 Mabel refreshed live state on 2026-05-18 PT:
 
@@ -853,12 +861,12 @@ Needs Mabel: yes
 
 Needs D. Box: no
 
-Urgency: yellow
+Urgency: green
 
 Reason: Draft PR #2351 is open for visibility but not queued. Mabel should
 monitor sequencing and decide when to convert it to ready-for-review after the
-current JSON/deprecation trains move. Cleo has local unpushed CI cleanup in
-progress on the new machine.
+current JSON/deprecation trains move. Cleo's first cleanup/default-registry
+slice is pushed and CI-green.
 
 ### Interface Contracts Other Agents Must Honor
 
@@ -872,6 +880,8 @@ progress on the new machine.
 - Registry handles such as `main:lighthouse` are command-time selectors only.
 - Durable `pack.toml` imports must store concrete `source` plus optional
   `version`, not `registry:<registry>:<pack>`.
+- Do not add public PackV2 import TOML fields for `ref`, `path`, `commit`, or
+  `hash`; exact resolution/integrity may live in lock/cache internals instead.
 - Lock/cache internals may preserve registry/ref/commit/hash metadata.
 - Preserve `gc import` compatibility and legacy `gc pack fetch/list`
   compatibility.
@@ -912,9 +922,9 @@ File ownership boundaries for Cleo's workstream:
   constraints beyond preserving `gc import migrate` until doctor parity,
   preserving legacy `gc pack fetch/list`, preserving current PackV2 import
   fields, and coordinating before compatibility behavior changes.
-- Cleo: continue the local cleanup slice from `f82f3c4e`; draft PR #2351 is
-  open. Coordinate before pushing additional product-surface changes so the
-  draft remains reviewable.
+- Cleo: continue from CI-green checkpoint `642d4c2b`; draft PR #2351 is open.
+  Coordinate before pushing additional product-surface changes so the draft
+  remains reviewable.
 
 ### JSON Assumptions
 
@@ -972,12 +982,28 @@ same matrix on 2026-05-18 PT and all four commands passed again:
 Cleo re-ran the matrix after the final product-surface pass at `f82f3c4e`; all
 four commands passed again.
 
-Cleo's first new-machine cleanup slice is local-only and currently passes:
+Cleo's first new-machine cleanup/default-registry slice is pushed at
+`642d4c2b` and currently passes locally:
 
 - `go test ./internal/packsource ./internal/packregistry ./internal/packman ./internal/config ./internal/gchome ./internal/testenv`
 - `make lint-full`
-- `go test ./cmd/gc -run TestScanAllOrdersRemoteImportedFlatPackOrders -count=1`
+- Focused `cmd/gc` registry/import/doctor/scope matrix including
+  `TestScanAllOrdersRemoteImportedFlatPackOrders`,
+  `TestPackRegistryJSON`, `TestPackScopeContracts`,
+  `TestImportStateDoctorCheck`, and init default-registry tests.
 - `git diff --check`
+
+Live GitHub CI for PR #2351 at `642d4c2b` is green as of 2026-05-19 UTC:
+
+- `CI / required`
+- `CI / preflight`
+- `CI / integration`
+- `Preflight / static checks`
+- `Preflight / generated artifacts`
+- all package integration shards
+- all `cmd/gc process` shards
+- all REST integration shards
+- CodeQL
 
 A broader `go test ./cmd/gc -count=1` attempt was previously stopped after
 running long with no additional output; use the targeted matrix above plus
@@ -994,7 +1020,7 @@ Additional required gates:
 
 ### Last Updated
 
-2026-05-19 PT by Mabel from Cleo's new-machine resume report
+2026-05-19 UTC by Cleo after `642d4c2b` CI-green checkpoint
 
 ## New Machine Bootstrap
 
