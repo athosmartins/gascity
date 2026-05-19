@@ -1302,6 +1302,20 @@ func passthroughEnv() map[string]string {
 		}
 		m[key] = val
 	}
+	// Propagate OTel env vars so agent subprocesses emit telemetry.
+	for k, v := range telemetry.OTELEnvMap() {
+		m[k] = v
+	}
+	// Always clear Claude nesting-detection vars so agents don't refuse to
+	// start when gc is run from inside a Claude Code session. Set
+	// unconditionally so the fingerprint is stable regardless of whether
+	// the supervisor or a user shell created the session bead.
+	m["CLAUDECODE"] = ""
+	m["CLAUDE_CODE_ENTRYPOINT"] = ""
+	// Managed Codex sessions must not inherit the caller's thread binding or
+	// session mode from the parent process.
+	m["CODEX_THREAD_ID"] = ""
+	m["CODEX_CI"] = ""
 	return m
 }
 
