@@ -19,8 +19,8 @@ jobs:
     timeout-minutes: 60
     env:
       ANTHROPIC_BASE_URL: https://ollama.com
-      ANTHROPIC_API_KEY: ""
-      ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      ANTHROPIC_AUTH_TOKEN: ollama
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
       ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_HAIKU_MODEL }}
       ANTHROPIC_DEFAULT_SONNET_MODEL: ${{ vars.GC_WORKER_INFERENCE_CLAUDE_OLLAMA_SONNET_MODEL }}
@@ -40,6 +40,8 @@ jobs:
       - name: Validate Ollama Claude configuration
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
+          test -n "$ANTHROPIC_API_KEY" || { echo "ANTHROPIC_API_KEY resolved empty" >&2; exit 1; }
+          test "$ANTHROPIC_AUTH_TOKEN" = "ollama" || { echo "ANTHROPIC_AUTH_TOKEN must be the Ollama Claude Code sentinel value" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_HAIKU_MODEL" || { echo "ANTHROPIC_DEFAULT_HAIKU_MODEL resolved empty" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_SONNET_MODEL" || { echo "ANTHROPIC_DEFAULT_SONNET_MODEL resolved empty" >&2; exit 1; }
           test -n "$ANTHROPIC_DEFAULT_OPUS_MODEL" || { echo "ANTHROPIC_DEFAULT_OPUS_MODEL resolved empty" >&2; exit 1; }
