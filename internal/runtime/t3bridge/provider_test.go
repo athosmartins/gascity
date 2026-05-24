@@ -512,6 +512,23 @@ func TestSetMetaGetMetaRemoveMeta_UsesNativeStateStore(t *testing.T) {
 	}
 }
 
+func TestMetaFilePath_SanitizesNameAndKey(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("GC_T3BRIDGE_STATE_DIR", stateDir)
+
+	path := metaFilePath("../crew/name", "../../GC/DRAIN")
+	rel, err := filepath.Rel(stateDir, path)
+	if err != nil {
+		t.Fatalf("rel meta path: %v", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		t.Fatalf("meta path escaped state dir: %q", path)
+	}
+	if got, want := filepath.Base(path), ".._crew_name.meta..._.._GC_DRAIN"; got != want {
+		t.Fatalf("meta filename = %q, want %q", got, want)
+	}
+}
+
 func TestCopyTo_UsesThreadWorkDir(t *testing.T) {
 	workDir := t.TempDir()
 	srcDir := t.TempDir()
@@ -551,6 +568,47 @@ func TestCopyTo_UsesThreadWorkDir(t *testing.T) {
 	}
 	if string(data) != "hello" {
 		t.Fatalf("copied file = %q, want hello", string(data))
+	}
+}
+
+func TestCopyTo_RejectsRelDstEscapingWorkDir(t *testing.T) {
+	parent := t.TempDir()
+	workDir := filepath.Join(parent, "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+	srcFile := filepath.Join(parent, "note.txt")
+	if err := os.WriteFile(srcFile, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write src file: %v", err)
+	}
+
+	server := newT3BridgeTestServer(t, map[string]interface{}{
+		"threads": []interface{}{
+			map[string]interface{}{
+				"id":        "thread-1",
+				"projectId": "project-1",
+				"customMetadata": map[string]interface{}{
+					"gc.agent":          "t3code/crew",
+					"gc.sessionName":    "t3code--crew",
+					"gc.startupWorkDir": workDir,
+				},
+			},
+		},
+	})
+	defer server.Close()
+	t.Setenv("T3_BEARER_TOKEN", "test-bearer")
+	t.Setenv("T3_WS_URL", server.wsURL())
+
+	p := &Provider{
+		watchers:     make(map[string]context.CancelFunc),
+		recentStarts: make(map[string]time.Time),
+	}
+
+	if err := p.CopyTo("t3code--crew", srcFile, "../outside.txt"); err != nil {
+		t.Fatalf("CopyTo: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "outside.txt")); !os.IsNotExist(err) {
+		t.Fatalf("outside file stat err = %v, want not exist", err)
 	}
 }
 
