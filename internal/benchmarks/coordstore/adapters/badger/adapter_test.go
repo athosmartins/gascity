@@ -89,3 +89,51 @@ func TestAdapterCorrectnessRecoveryAndStats(t *testing.T) {
 		t.Fatalf("deps mismatch after reopen: %#v", deps)
 	}
 }
+
+func TestAdapterStatsIncludeGCEventTelemetry(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	adapter := badger.New()
+	if err := adapter.Open(ctx, coordstore.Config{DataDir: dir}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer adapter.Close() //nolint:errcheck
+
+	expired, err := adapter.Create(ctx, coordstore.Record{
+		ID:        "expired",
+		Title:     "expired wisp",
+		Status:    "open",
+		Type:      "message",
+		Ephemeral: true,
+		ExpiresAt: time.Now().Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatalf("Create expired: %v", err)
+	}
+	if _, err := adapter.Get(ctx, expired.ID); err != nil {
+		t.Fatalf("Get expired before purge: %v", err)
+	}
+
+	if _, err := adapter.PurgeExpired(ctx); err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	stats := adapter.Stats(ctx)
+	for _, key := range []string{
+		"badger_gc_events",
+		"badger_gc_last_started_unix_nano",
+		"badger_gc_last_duration_nanos",
+		"badger_gc_last_freed_bytes",
+		"badger_gc_total_freed_bytes",
+	} {
+		if _, ok := stats[key]; !ok {
+			t.Fatalf("Stats missing %s: %#v", key, stats)
+		}
+	}
+	if stats["badger_gc_events"] < 1 {
+		t.Fatalf("badger_gc_events = %d, want >= 1", stats["badger_gc_events"])
+	}
+	if stats["badger_gc_last_started_unix_nano"] <= 0 {
+		t.Fatalf("badger_gc_last_started_unix_nano = %d", stats["badger_gc_last_started_unix_nano"])
+	}
+}
