@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/benchmarks/coordstore"
 	"github.com/gastownhall/gascity/internal/benchmarks/coordstore/adapters/authorcore"
+	"github.com/gastownhall/gascity/internal/benchmarks/coordstore/adapters/badger"
 	"github.com/gastownhall/gascity/internal/benchmarks/coordstore/adapters/boltdb"
 	"github.com/gastownhall/gascity/internal/benchmarks/coordstore/adapters/couchdb"
 	"github.com/gastownhall/gascity/internal/benchmarks/coordstore/adapters/dolt"
@@ -42,6 +43,10 @@ func buildRegisteredAdapters() []adapterFactory {
 			newFn: func() coordstore.StoreAdapter { return boltdb.New() },
 		},
 		{
+			name:  "badger",
+			newFn: func() coordstore.StoreAdapter { return badger.New() },
+		},
+		{
 			name:  "authorcore",
 			newFn: func() coordstore.StoreAdapter { return authorcore.New() },
 		},
@@ -68,6 +73,7 @@ func buildRegisteredAdapters() []adapterFactory {
 			newFn: func() coordstore.StoreAdapter { return dolt.New(dsn) },
 		})
 	}
+	adapters = appendSQLiteCGOAdapter(adapters)
 	return adapters
 }
 

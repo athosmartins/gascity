@@ -19,7 +19,8 @@ func TestSQLiteCGOAdapterBuildTagAndImportBoundary(t *testing.T) {
 	if len(lines) == 0 || lines[0] != "//go:build cgo && sqlite_cgo" {
 		t.Fatalf("sqlite-cgo adapter first line = %q, want //go:build cgo && sqlite_cgo", lines[0])
 	}
-	if !strings.Contains(text, `"github.com/mattn/go-sqlite3"`) {
+	mattnImport := "github.com/" + "mattn/go-sqlite3"
+	if !strings.Contains(text, `"`+mattnImport+`"`) {
 		t.Fatalf("sqlite-cgo adapter must import mattn/go-sqlite3 behind its build tag")
 	}
 
@@ -40,7 +41,7 @@ func TestSQLiteCGOAdapterBuildTagAndImportBoundary(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if strings.Contains(string(data), "github.com/mattn/go-sqlite3") {
+		if strings.Contains(string(data), mattnImport) {
 			t.Fatalf("mattn/go-sqlite3 import leaked outside sqlite-cgo build tag: %s", path)
 		}
 		return nil
