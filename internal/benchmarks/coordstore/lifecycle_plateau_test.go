@@ -10,38 +10,41 @@ import (
 	"github.com/gastownhall/gascity/internal/benchmarks/coordstore/adapters/authorcore"
 )
 
-// TestLifecycleWorkloadPlateaus is the ga-w08fz regression guard. With the
-// lifecycle ops (Complete/Archive/PurgeExpired) the working set PLATEAUS near
-// the seeded steady-state size under heavy create load; with them disabled
-// (the legacy net-create-only workload) the set grows without bound. A soak run
-// against an in-memory backend would otherwise just benchmark each backend's
-// compression of an ever-growing dataset rather than real steady-state work.
-func TestLifecycleWorkloadPlateaus(t *testing.T) {
+// TestSteadyStateWorkloadPlateausWisps is the ga-w08fz / ga-sftyt regression
+// guard. The steady-state design keeps wisp deletes ≈ wisp creates, so the
+// ephemeral population PLATEAUS; with the lifecycle ops disabled (the legacy
+// net-create-only workload) the ephemeral population grows without bound. A
+// soak against an in-memory backend would otherwise just benchmark each
+// backend's compression of an ever-growing dataset rather than real
+// steady-state coordination work.
+//
+// Note: per the design, the MAIN tier is intentionally NOT fully plateaued
+// (CloseRate ≪ create rate; tasks are long-lived) — only wisps plateau. So this
+// asserts the ephemeral population, which is the high-churn tier the invariant
+// targets.
+func TestSteadyStateWorkloadPlateausWisps(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timed workload; skipped in -short")
 	}
 
 	base := coordstore.WorkloadConfig{
-		Name:            "plateau-test",
-		MainOpenCount:   50,
+		Name:            "steady-test",
+		MainOpenCount:   200,
 		MainClosedCount: 100,
-		WispOpenCount:   50,
-		// Heavy create pressure so net-create-only growth is unmistakable.
-		MailPollRate:  10,
-		PointReadRate: 10,
-		CreateRate:    100,
-		UpdateRate:    5,
-		Duration:      2 * time.Second,
-		Concurrency:   8,
+		WispOpenCount:   200, // > 100 so the lifecycle floor guard lets deletes run
+		// Heavy, create-dominant load so net-create-only growth is unmistakable.
+		MailPollRate: 10,
+		CreateRate:   200, // ≈ half land in the ephemeral tier
+		Duration:     3 * time.Second,
+		Concurrency:  8,
 	}
 
-	run := func(lifecycle bool) int64 {
+	run := func(lifecycle bool) (trackerWisps, storeWisps int64) {
 		wl := base
 		if lifecycle {
-			// Balance the create rate (≈50/s main + ≈50/s wisp).
-			wl.CompleteRate = 50
-			wl.ArchiveRate = 50
-			wl.PurgeRate = 5
+			wl.WispDeleteRate = 100 // ≈ wisp create rate → ephemeral plateau
+			wl.CloseRate = 5        // main closes (main still grows, by design)
+			wl.PurgeExpiredRate = 1 // TTL sweeps
 		}
 		ctx := context.Background()
 		a := authorcore.New()
@@ -52,34 +55,38 @@ func TestLifecycleWorkloadPlateaus(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seed: %v", err)
 		}
-		if _, err := coordstore.NewRunner(a, wl, seed).Run(ctx, io.Discard); err != nil {
+		runner := coordstore.NewRunner(a, wl, seed)
+		if _, err := runner.Run(ctx, io.Discard); err != nil {
 			t.Fatalf("run: %v", err)
 		}
-		stats := a.Stats(ctx)
-		return stats["main_records"] + stats["ephemeral_records"]
+		snap := runner.SeedSnapshot()
+		return int64(len(snap.WispOpenIDs)), a.Stats(ctx)["ephemeral_records"]
 	}
 
-	const seededTotal = 50 + 100 + 50 // open main + closed main + open wisp
+	const seededWisps = 200
 
-	withLifecycle := run(true)
-	createOnly := run(false)
-	t.Logf("seeded=%d  lifecycle-ON total=%d  create-only total=%d",
-		seededTotal, withLifecycle, createOnly)
+	onTracker, onStore := run(true)
+	offTracker, offStore := run(false)
+	t.Logf("seeded wisps=%d | lifecycle-ON tracker=%d store=%d | create-only tracker=%d store=%d",
+		seededWisps, onTracker, onStore, offTracker, offStore)
 
-	// Plateau: lifecycle keeps the working set bounded near the seeded size.
-	if withLifecycle > seededTotal*3 {
-		t.Errorf("lifecycle workload did not plateau: total=%d, want <= %d (seeded %d)",
-			withLifecycle, seededTotal*3, seededTotal)
+	// Plateau: with balanced deletes the ephemeral population stays near seed.
+	if onStore > seededWisps*3 {
+		t.Errorf("ephemeral population did not plateau with lifecycle: store=%d, want <= %d (seeded %d)",
+			onStore, seededWisps*3, seededWisps)
 	}
-	// Sanity: the create-only workload must visibly grow, else the test is not
-	// generating enough create pressure to be a meaningful contrast.
-	if createOnly < seededTotal*4 {
-		t.Errorf("create-only workload did not grow enough to be meaningful: total=%d (seeded %d)",
-			createOnly, seededTotal)
+	// Doesn't drain to zero (the floor guard + create refill hold it up).
+	if onTracker < 50 {
+		t.Errorf("ephemeral tracker drained too far: tracker=%d (seeded %d)", onTracker, seededWisps)
 	}
-	// The whole point: lifecycle is dramatically smaller than create-only.
-	if withLifecycle*2 >= createOnly {
-		t.Errorf("lifecycle total (%d) not meaningfully smaller than create-only (%d)",
-			withLifecycle, createOnly)
+	// Sanity: the create-only workload must visibly grow the ephemeral tier.
+	if offStore < seededWisps*4 {
+		t.Errorf("create-only workload did not grow ephemeral tier enough to be meaningful: store=%d (seeded %d)",
+			offStore, seededWisps)
+	}
+	// The whole point: lifecycle keeps the ephemeral tier far smaller.
+	if onStore*2 >= offStore {
+		t.Errorf("lifecycle ephemeral (%d) not meaningfully smaller than create-only (%d)",
+			onStore, offStore)
 	}
 }

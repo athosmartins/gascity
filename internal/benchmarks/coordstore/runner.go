@@ -167,6 +167,21 @@ func (r *Runner) HistogramSnapshot() map[string]*OperationResult {
 	return out
 }
 
+// SeedSnapshot returns a read-only copy of the runner's live seed population.
+// Slices are cloned so callers (tests) can inspect post-run population sizes
+// without racing the workload goroutines. Exposed for steady-state population
+// assertions (design ga-sftyt NFR-3); the mutable r.seed is never exported.
+func (r *Runner) SeedSnapshot() SeedResult {
+	r.seedMu.RLock()
+	defer r.seedMu.RUnlock()
+	return SeedResult{
+		MainOpenIDs:   append([]string(nil), r.seed.MainOpenIDs...),
+		MainClosedIDs: append([]string(nil), r.seed.MainClosedIDs...),
+		WispOpenIDs:   append([]string(nil), r.seed.WispOpenIDs...),
+		DepEdges:      append([]Dep(nil), r.seed.DepEdges...),
+	}
+}
+
 // opTag identifies which operation a goroutine will execute.
 type opTag int
 
@@ -181,9 +196,9 @@ const (
 	opReady
 	opDepOp
 	opRecentScan
-	opComplete
-	opArchive
-	opPurge
+	opClose
+	opDeleteWisp
+	opPurgeExpired
 )
 
 // buildSchedule creates a weighted list of operations proportional to their
@@ -207,9 +222,9 @@ func (r *Runner) buildSchedule() []opTag {
 		{opReady, wl.ReadyRate, len(r.seed.MainOpenIDs) > 0},
 		{opDepOp, wl.DepOpRate, len(r.seed.MainOpenIDs) >= 2},
 		{opRecentScan, wl.RecentScanRate, true},
-		{opComplete, wl.CompleteRate, len(r.seed.MainOpenIDs) > 0},
-		{opArchive, wl.ArchiveRate, len(r.seed.WispOpenIDs) > 0},
-		{opPurge, wl.PurgeRate, true},
+		{opClose, wl.CloseRate, wl.CloseRate > 0 && len(r.seed.MainOpenIDs) > 100},
+		{opDeleteWisp, wl.WispDeleteRate, wl.WispDeleteRate > 0 && len(r.seed.WispOpenIDs) > 100},
+		{opPurgeExpired, wl.PurgeExpiredRate, wl.PurgeExpiredRate > 0},
 	}
 
 	var schedule []opTag
@@ -390,68 +405,67 @@ func (r *Runner) execOp(ctx context.Context, op opTag, rng *rand.Rand) error {
 		_, err := a.RecentScan(ctx, 50)
 		return r.recordOpErr("RecentScan", err)
 
-	case opComplete:
-		// Lifecycle: complete a main-tier task once the open pool exceeds its
-		// steady-state target. The record is closed (Update) and held in the
-		// retention pool; when that pool exceeds MainClosedCount the excess closed
-		// record is deleted, so total main records plateau (ga-w08fz). The ID is
-		// removed from the open pool under the lock so no other goroutine retires
-		// it, then the adapter is called without the lock held.
+	case opClose:
+		// Lifecycle (design ga-sftyt): close an open main-tier task (Update ->
+		// closed) and pop it from the open pool. Closed IDs are tracked (capped at
+		// 50k so the tracker itself stays bounded) for future retention ops; the
+		// record stays resident, modeling long-lived closed tasks. A floor guard
+		// keeps the open pool from draining below 100. The ID is removed under the
+		// lock so no other goroutine closes it; the adapter is called unlocked.
 		r.seedMu.Lock()
-		if len(seed.MainOpenIDs) <= r.wl.MainOpenCount {
-			r.seedMu.Unlock()
-			return nil // at/below steady state — nothing to trim
-		}
-		i := rng.IntN(len(seed.MainOpenIDs))
-		id := seed.MainOpenIDs[i]
-		seed.MainOpenIDs[i] = seed.MainOpenIDs[len(seed.MainOpenIDs)-1]
-		seed.MainOpenIDs = seed.MainOpenIDs[:len(seed.MainOpenIDs)-1]
-		seed.MainClosedIDs = append(seed.MainClosedIDs, id)
-		var toPurge string
-		if r.wl.MainClosedCount > 0 && len(seed.MainClosedIDs) > r.wl.MainClosedCount {
-			j := rng.IntN(len(seed.MainClosedIDs))
-			toPurge = seed.MainClosedIDs[j]
-			seed.MainClosedIDs[j] = seed.MainClosedIDs[len(seed.MainClosedIDs)-1]
-			seed.MainClosedIDs = seed.MainClosedIDs[:len(seed.MainClosedIDs)-1]
-		}
-		r.seedMu.Unlock()
-
-		if err := a.Update(ctx, id, Update{Status: "closed"}); err != nil && !IsNotFound(err) {
-			return err
-		}
-		if toPurge != "" {
-			if err := a.Delete(ctx, toPurge); err != nil && !IsNotFound(err) {
-				return err
-			}
-		}
-		return nil
-
-	case opArchive:
-		// Lifecycle: complete an ephemeral (mail/order) wisp once the open wisp
-		// pool exceeds its steady-state target — close then delete (eager
-		// archive-delete, mirroring production mail-wisp retirement). Plateaus the
-		// ephemeral working set (ga-w08fz).
-		r.seedMu.Lock()
-		if len(seed.WispOpenIDs) <= r.wl.WispOpenCount {
+		if len(seed.MainOpenIDs) <= 100 {
 			r.seedMu.Unlock()
 			return nil
 		}
-		i := rng.IntN(len(seed.WispOpenIDs))
-		id := seed.WispOpenIDs[i]
-		seed.WispOpenIDs[i] = seed.WispOpenIDs[len(seed.WispOpenIDs)-1]
-		seed.WispOpenIDs = seed.WispOpenIDs[:len(seed.WispOpenIDs)-1]
+		idx := rng.IntN(len(seed.MainOpenIDs))
+		id := seed.MainOpenIDs[idx]
+		last := len(seed.MainOpenIDs) - 1
+		seed.MainOpenIDs[idx] = seed.MainOpenIDs[last]
+		seed.MainOpenIDs = seed.MainOpenIDs[:last]
 		r.seedMu.Unlock()
 
-		if err := a.Update(ctx, id, Update{Status: "closed"}); err != nil && !IsNotFound(err) {
-			return err
+		if err := a.Update(ctx, id, Update{Status: "closed"}); err != nil {
+			if IsNotFound(err) {
+				return nil // raced with a concurrent close
+			}
+			return r.recordOpErr("Close", err)
 		}
-		if err := a.Delete(ctx, id); err != nil && !IsNotFound(err) {
-			return err
+		r.seedMu.Lock()
+		if len(seed.MainClosedIDs) < 50000 {
+			seed.MainClosedIDs = append(seed.MainClosedIDs, id)
+		}
+		r.seedMu.Unlock()
+		return nil
+
+	case opDeleteWisp:
+		// Lifecycle (design ga-sftyt): delete an open ephemeral record (mail
+		// archival / order cancellation) and pop it from the open pool. Wisp
+		// deletes ≈ wisp creates so the ephemeral population plateaus. Floor guard
+		// keeps the pool from draining below 100.
+		r.seedMu.Lock()
+		if len(seed.WispOpenIDs) <= 100 {
+			r.seedMu.Unlock()
+			return nil
+		}
+		idx := rng.IntN(len(seed.WispOpenIDs))
+		id := seed.WispOpenIDs[idx]
+		last := len(seed.WispOpenIDs) - 1
+		seed.WispOpenIDs[idx] = seed.WispOpenIDs[last]
+		seed.WispOpenIDs = seed.WispOpenIDs[:last]
+		r.seedMu.Unlock()
+
+		if err := a.Delete(ctx, id); err != nil {
+			if IsNotFound(err) {
+				return nil // raced with PurgeExpired or another goroutine
+			}
+			return r.recordOpErr("DeleteWisp", err)
 		}
 		return nil
 
-	case opPurge:
-		// Lifecycle: explicit TTL sweep of expired order-tracking wisps (FR-12).
+	case opPurgeExpired:
+		// Lifecycle (design ga-sftyt): TTL sweep of expired order-tracking wisps.
+		// Removes records by their already-past ExpiresAt; it must NOT touch the
+		// seed trackers, which hold live IDs only.
 		_, err := a.PurgeExpired(ctx)
 		return r.recordOpErr("PurgeExpired", err)
 	}
@@ -505,11 +519,11 @@ func opName(op opTag) string {
 		return "DepAdd"
 	case opRecentScan:
 		return "RecentScan"
-	case opComplete:
-		return "Complete"
-	case opArchive:
-		return "Archive"
-	case opPurge:
+	case opClose:
+		return "Close"
+	case opDeleteWisp:
+		return "DeleteWisp"
+	case opPurgeExpired:
 		return "PurgeExpired"
 	}
 	return "unknown"
