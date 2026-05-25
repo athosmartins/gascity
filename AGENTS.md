@@ -342,10 +342,13 @@ bd close <id>         # Complete work
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd dolt push
    git push
    git status  # MUST show "up to date with origin"
    ```
+
+   **NOTE:** gascity Beads Dolt is LOCAL-ONLY (operator directive 2026-05-22).
+   Do NOT run `bd dolt push`; Git push is the only remote sync step.
+   `.beads/issues.jsonl` is the passive export and syncs via Git.
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
