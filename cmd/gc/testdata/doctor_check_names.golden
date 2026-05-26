@@ -11,6 +11,7 @@ v2-scripts-layout
 v2-workspace-name
 v2-prompt-template-suffix
 expanded-config-load
+builtin-pack-registry
 implicit-import-cache
 deprecated-attachment-fields
 dolt-topology

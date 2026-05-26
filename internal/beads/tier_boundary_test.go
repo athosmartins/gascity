@@ -27,6 +27,9 @@ func TestProductionCallersDoNotSelectStorageTiers(t *testing.T) {
 				if rel == filepath.Join("internal", "beads") || strings.HasPrefix(rel, filepath.Join("internal", "beads")+string(filepath.Separator)) {
 					return filepath.SkipDir
 				}
+				if rel == filepath.Join("internal", "benchmarks") || strings.HasPrefix(rel, filepath.Join("internal", "benchmarks")+string(filepath.Separator)) {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {

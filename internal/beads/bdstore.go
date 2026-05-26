@@ -1528,9 +1528,6 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 		limit = 0
 	}
 	args := []string{"list", "--json"}
-	if canUseMinimalBdListJSON(query) {
-		args = append(args, "--json-minimal")
-	}
 	if query.Label != "" {
 		args = append(args, "--label="+query.Label)
 	}
@@ -1594,16 +1591,12 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	return filtered, nil
 }
 
-func canUseMinimalBdListJSON(query ListQuery) bool {
-	return query.SkipLabels && query.ParentID == ""
-}
-
 // listEphemeral reads only the wisps tier. bd list reads both durable issues
 // and wisp-backed no-history/ephemeral rows, then applyListQuery narrows the
 // result to TierWisps. This avoids bd query's expensive query engine on
 // reconciler hot paths while preserving the wisp-tier contract.
 func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
-	args := []string{"list", "--json", "--json-minimal", "--wisp-tier"}
+	args := []string{"list", "--json", "--include-ephemeral"}
 	if query.Label != "" {
 		args = append(args, "--label="+query.Label)
 	}

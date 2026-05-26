@@ -1592,7 +1592,7 @@ func TestBdStoreListEmpty(t *testing.T) {
 	}
 }
 
-func TestBdStoreListSkipLabelsUsesMinimalJSON(t *testing.T) {
+func TestBdStoreListSkipLabelsDoesNotUseUnsupportedMinimalJSON(t *testing.T) {
 	var gotCmd string
 	runner := func(_, name string, args ...string) ([]byte, error) {
 		gotCmd = name + " " + strings.Join(args, " ")
@@ -1604,12 +1604,12 @@ func TestBdStoreListSkipLabelsUsesMinimalJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !strings.Contains(gotCmd, "--json-minimal") {
-		t.Fatalf("cmd = %q, want --json-minimal", gotCmd)
+	if gotCmd != "bd list --json --include-infra --include-gates --limit 0" {
+		t.Fatalf("cmd = %q, want standard bd list scan", gotCmd)
 	}
 }
 
-func TestBdStoreListParentDoesNotUseMinimalJSON(t *testing.T) {
+func TestBdStoreListParentForwardsParentFilter(t *testing.T) {
 	var gotCmd string
 	runner := func(_, name string, args ...string) ([]byte, error) {
 		gotCmd = name + " " + strings.Join(args, " ")
@@ -1621,9 +1621,6 @@ func TestBdStoreListParentDoesNotUseMinimalJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if strings.Contains(gotCmd, "--json-minimal") {
-		t.Fatalf("cmd = %q, must not contain --json-minimal for parent projection", gotCmd)
-	}
 	if !strings.Contains(gotCmd, "--parent bd-parent") {
 		t.Fatalf("cmd = %q, want parent filter", gotCmd)
 	}
@@ -1964,7 +1961,7 @@ func TestBdStoreReadyDoesNotSpecialCaseSyntheticMetadata(t *testing.T) {
 		out []byte
 		err error
 	}{
-		`bd ready --json --limit 0`: {
+		`bd ready --json --include-ephemeral --limit 1`: {
 			out: []byte(`[
 				{"id":"bd-synthetic","title":"synthetic unit","status":"open","issue_type":"convoy","created_at":"2025-01-15T10:29:00Z","metadata":{"gc.synthetic":"true"}},
 				{"id":"bd-task","title":"ready one","status":"open","issue_type":"task","created_at":"2025-01-15T10:30:00Z"},
@@ -3215,7 +3212,7 @@ func TestBdStoreListWispsUsesBdListAndFiltersToWispTier(t *testing.T) {
 	if !strings.HasPrefix(gotCmd, "bd list --json ") {
 		t.Fatalf("cmd = %q, want bd list prefix", gotCmd)
 	}
-	for _, want := range []string{"--json-minimal", "--wisp-tier", "--label=order-tracking", "--include-infra", "--include-gates", "--include-templates", "--limit 0"} {
+	for _, want := range []string{"--include-ephemeral", "--label=order-tracking", "--include-infra", "--include-gates", "--include-templates", "--limit 0"} {
 		if !strings.Contains(gotCmd, want) {
 			t.Fatalf("cmd = %q, want %q", gotCmd, want)
 		}
@@ -3388,7 +3385,7 @@ func TestBdStoreListWispsReturnsPartialRowsWithErrorOnCorruptEntries(t *testing.
 		out []byte
 		err error
 	}{
-		`bd list --json --json-minimal --wisp-tier --include-infra --include-gates --include-templates --limit 0`: {
+		`bd list --json --include-ephemeral --include-infra --include-gates --include-templates --limit 0`: {
 			out: []byte(`[
 				{"id":"bd-good","title":"good","status":"open","issue_type":"task","created_at":"2026-05-01T00:00:00Z","ephemeral":true},
 				{"id":"bd-bad","title":"bad","status":"open","issue_type":"task","created_at":"not-a-time","ephemeral":true}

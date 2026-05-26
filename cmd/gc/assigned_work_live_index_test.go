@@ -27,7 +27,7 @@ func TestBuildAssignedWorkLiveIndexUsesMinimalLiveQueries(t *testing.T) {
 			t.Fatalf("List query TierMode = %v, want TierBoth", query.TierMode)
 		}
 		if !query.SkipLabels {
-			t.Fatalf("List query SkipLabels = false, want true to use bd --json-minimal")
+			t.Fatalf("List query SkipLabels = false, want true for lightweight live probes")
 		}
 	}
 
@@ -70,7 +70,7 @@ func TestSessionHasOpenAssignedWorkInStoreUsesBoundedMinimalLiveProbe(t *testing
 		t.Fatalf("List query TierMode = %v, want TierBoth", query.TierMode)
 	}
 	if !query.SkipLabels {
-		t.Fatalf("List query SkipLabels = false, want true to use bd --json-minimal")
+		t.Fatalf("List query SkipLabels = false, want true for lightweight live probe")
 	}
 	if query.Limit != 1 {
 		t.Fatalf("List query Limit = %d, want 1", query.Limit)
