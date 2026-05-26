@@ -371,6 +371,7 @@ func (c *CachingStore) runReconciliation() {
 		c.syncFailures = 0
 		c.depsComplete = nextDepsComplete
 		c.primePartialErr = nil
+		c.externalDirty = false
 		if c.state == cacheDegraded {
 			c.state = cacheLive
 		}
@@ -466,6 +467,7 @@ func (c *CachingStore) runReconciliation() {
 	c.deletedSeq = make(map[string]uint64)
 	c.syncFailures = 0
 	c.primePartialErr = nil
+	c.externalDirty = false
 	if c.state == cacheDegraded {
 		c.state = cacheLive
 	}

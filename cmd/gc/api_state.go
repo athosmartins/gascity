@@ -295,6 +295,24 @@ func (cs *controllerState) applyBeadEventToStores(evt events.Event) {
 	}
 }
 
+func (cs *controllerState) markExternalBeadStoreMutation() {
+	cs.mu.RLock()
+	stores := make([]beads.Store, 0, len(cs.beadStores)+1)
+	for _, store := range cs.beadStores {
+		stores = append(stores, store)
+	}
+	if cs.cityBeadStore != nil {
+		stores = append(stores, cs.cityBeadStore)
+	}
+	cs.mu.RUnlock()
+
+	for _, store := range stores {
+		if cached, ok := store.(*beads.CachingStore); ok {
+			cached.MarkExternalMutation()
+		}
+	}
+}
+
 func (cs *controllerState) beadEventStoresLocked(evt events.Event) []beads.Store {
 	if id := beadEventID(evt); id != "" && cs.cfg != nil {
 		if store, known := cs.beadEventConfiguredStoreLocked(id); known {

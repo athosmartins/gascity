@@ -37,7 +37,7 @@ func (c *CachingStore) List(query ListQuery) ([]Bead, error) {
 	state := c.state
 	if state == cacheLive || state == cachePartial {
 		primePartialErr := c.primePartialErr
-		if len(c.dirty) > 0 {
+		if c.externalDirty || len(c.dirty) > 0 {
 			c.mu.RUnlock()
 			return c.backing.List(liveListQuery(query))
 		}
@@ -117,7 +117,7 @@ func (c *CachingStore) CachedList(query ListQuery) ([]Bead, bool) {
 	if c.state != cacheLive && c.state != cachePartial {
 		return nil, false
 	}
-	if c.primePartialErr != nil {
+	if c.externalDirty || c.primePartialErr != nil {
 		return nil, false
 	}
 	cached := make([]Bead, 0, len(c.beads))
@@ -338,7 +338,7 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	}
 	c.mu.RLock()
 	if c.state == cacheLive && c.depsComplete {
-		if len(c.dirty) > 0 {
+		if c.externalDirty || len(c.dirty) > 0 {
 			c.mu.RUnlock()
 			return c.backing.Ready(query...)
 		}
@@ -395,7 +395,7 @@ func (c *CachingStore) CachedReady() ([]Bead, bool) {
 	if c.state != cacheLive && c.state != cachePartial {
 		return nil, false
 	}
-	if c.primePartialErr != nil || len(c.dirty) > 0 {
+	if c.externalDirty || c.primePartialErr != nil || len(c.dirty) > 0 {
 		return nil, false
 	}
 

@@ -34,6 +34,7 @@ type CachingStore struct {
 	deps            map[string][]Dep
 	depsComplete    bool
 	dirty           map[string]struct{}
+	externalDirty   bool
 	beadSeq         map[string]uint64
 	localBeadAt     map[string]time.Time
 	deletedSeq      map[string]uint64
@@ -473,6 +474,7 @@ func (c *CachingStore) Prime(_ context.Context) error {
 	c.syncFailures = 0
 	c.stats.SyncFailures = 0
 	c.primePartialErr = partialErr
+	c.externalDirty = false
 	c.markFreshLocked(now)
 	c.updateStatsLocked()
 	return nil
@@ -534,6 +536,19 @@ func (c *CachingStore) IsLive() bool {
 
 // Backing returns the underlying store.
 func (c *CachingStore) Backing() Store { return c.backing }
+
+// MarkExternalMutation marks the cache non-authoritative for active read
+// models after an out-of-process writer reports that it changed the store.
+// The cached snapshot remains available for direct Get hits; controller
+// demand reads fall back to the backing store until reconciliation refreshes
+// the complete cache.
+func (c *CachingStore) MarkExternalMutation() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == cacheLive || c.state == cachePartial {
+		c.externalDirty = true
+	}
+}
 
 func (c *CachingStore) markFreshLocked(now time.Time) {
 	c.lastFreshAt = now

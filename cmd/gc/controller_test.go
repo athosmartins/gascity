@@ -244,7 +244,7 @@ func TestControllerSocketFallbackUsesShortPathForLongCityPath(t *testing.T) {
 	pokeCh := make(chan struct{}, 1)
 	controlDispatcherCh := make(chan struct{}, 1)
 	configDirty := &atomic.Bool{}
-	lis, err := startControllerSocket(cityPath, cancel, nil, configDirty, nil, convergenceReqCh, pokeCh, controlDispatcherCh)
+	lis, err := startControllerSocket(cityPath, cancel, nil, configDirty, nil, convergenceReqCh, pokeCh, controlDispatcherCh, nil)
 	if err != nil {
 		t.Fatalf("startControllerSocket: %v", err)
 	}
@@ -1300,7 +1300,7 @@ func TestHandleControllerConnControlDispatcher(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		handleControllerConn(server, cityPath, func() {}, nil, nil, nil, convergenceReqCh, pokeCh, controlDispatcherCh)
+		handleControllerConn(server, cityPath, func() {}, nil, nil, nil, convergenceReqCh, pokeCh, controlDispatcherCh, nil)
 		close(done)
 	}()
 
@@ -1326,6 +1326,58 @@ func TestHandleControllerConnControlDispatcher(t *testing.T) {
 	case <-pokeCh:
 		t.Fatal("generic poke channel should remain untouched")
 	default:
+	}
+
+	client.Close() //nolint:errcheck
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleControllerConn did not exit")
+	}
+}
+
+func TestHandleControllerConnPokeRunsExternalMutationHook(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close() //nolint:errcheck
+
+	convergenceReqCh := make(chan convergenceRequest, 1)
+	pokeCh := make(chan struct{}, 1)
+	controlDispatcherCh := make(chan struct{}, 1)
+	called := make(chan struct{}, 1)
+	cityPath := t.TempDir()
+
+	done := make(chan struct{})
+	go func() {
+		handleControllerConn(server, cityPath, func() {}, nil, nil, nil, convergenceReqCh, pokeCh, controlDispatcherCh, func() {
+			select {
+			case called <- struct{}{}:
+			default:
+			}
+		})
+		close(done)
+	}()
+
+	if _, err := client.Write([]byte("poke\n")); err != nil {
+		t.Fatalf("write command: %v", err)
+	}
+	buf := make([]byte, 16)
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatalf("read ack: %v", err)
+	}
+	if got := string(buf[:n]); got != "ok\n" {
+		t.Fatalf("ack = %q, want %q", got, "ok\n")
+	}
+
+	select {
+	case <-called:
+	default:
+		t.Fatal("external mutation hook was not called")
+	}
+	select {
+	case <-pokeCh:
+	default:
+		t.Fatal("poke channel was not signaled")
 	}
 
 	client.Close() //nolint:errcheck

@@ -325,6 +325,40 @@ func TestCollectAssignedWorkBeadsFallsBackLiveWhenCachedInProgressDirty(t *testi
 	}
 }
 
+func TestCollectAssignedWorkBeadsFallsBackAfterExternalStoreMutation(t *testing.T) {
+	backing := beads.NewMemStore()
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+	work, err := backing.Create(beads.Bead{
+		Title:    "external handoff",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "repo/refinery",
+	})
+	if err != nil {
+		t.Fatalf("create external assigned bead: %v", err)
+	}
+
+	got, partial := collectAssignedWorkBeads(&config.City{}, cache)
+	if partial {
+		t.Fatal("collectAssignedWorkBeads before invalidation reported partial")
+	}
+	if len(got) != 0 {
+		t.Fatalf("collectAssignedWorkBeads before invalidation returned %#v, want stale cache empty", got)
+	}
+
+	cache.MarkExternalMutation()
+	got, partial = collectAssignedWorkBeads(&config.City{}, cache)
+	if partial {
+		t.Fatal("collectAssignedWorkBeads after invalidation reported partial with successful live fallback")
+	}
+	if len(got) != 1 || got[0].ID != work.ID {
+		t.Fatalf("collectAssignedWorkBeads after invalidation returned %#v, want [%s]", got, work.ID)
+	}
+}
+
 func TestCollectAssignedWorkBeads_ExcludesBlockedOpenAssignedHandoff(t *testing.T) {
 	store := beads.NewMemStore()
 	blocker, err := store.Create(beads.Bead{
@@ -384,6 +418,47 @@ func TestDefaultScaleCheckCountsUsesCachedReadyReadModel(t *testing.T) {
 	}
 	if backing.readyCalls != 0 {
 		t.Fatalf("backing Ready calls = %d, want cached demand read", backing.readyCalls)
+	}
+}
+
+func TestDefaultScaleCheckCountsFallsBackAfterExternalStoreMutation(t *testing.T) {
+	const template = "gascity/workflows.codex-min"
+	backing := beads.NewMemStore()
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+	if _, err := backing.Create(beads.Bead{
+		Title:  "external routed work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+		},
+	}); err != nil {
+		t.Fatalf("create external routed bead: %v", err)
+	}
+
+	target := defaultScaleCheckTarget{
+		template: template,
+		storeKey: "rig:gascity",
+		store:    cache,
+	}
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{target})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts before invalidation errs = %v", errs)
+	}
+	if got := counts[template]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts before invalidation = %d, want stale cache count 0", got)
+	}
+
+	cache.MarkExternalMutation()
+	counts, _, errs = defaultScaleCheckCounts([]defaultScaleCheckTarget{target})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts after invalidation errs = %v", errs)
+	}
+	if got := counts[template]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts after invalidation = %d, want live fallback count 1", got)
 	}
 }
 
