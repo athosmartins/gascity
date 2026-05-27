@@ -13,6 +13,7 @@ v2-prompt-template-suffix
 expanded-config-load
 implicit-import-cache
 deprecated-attachment-fields
+coord-store-backend
 dolt-topology
 dolt-drift
 config-valid

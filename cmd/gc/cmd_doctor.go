@@ -94,6 +94,9 @@ func doctorSkipsDoltChecks(cityPath string) bool {
 		return !cityUsesBdStoreContract(cityPath)
 	}
 	resolveRigPaths(cityPath, cfg.Rigs)
+	if bboltActive, err := cityUsesBboltBackend(cityPath, cfg); err == nil && bboltActive {
+		return true
+	}
 	return !workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs)
 }
 
@@ -116,6 +119,11 @@ func workspaceNeedsCityDoltCheck(cityPath string, cfg *config.City) bool {
 func managedDoltOpsCheckSkip(cityPath string, cfg *config.City, cfgErr error) bool {
 	if gcDoltSkip() {
 		return true
+	}
+	if cfgErr == nil && cfg != nil {
+		if bboltActive, err := cityUsesBboltBackend(cityPath, cfg); err == nil && bboltActive {
+			return true
+		}
 	}
 	return !doctor.ManagedLocalDoltChecksApplicableForConfig(cityPath, cfg, cfgErr)
 }
@@ -183,9 +191,12 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 
 	// Config-dependent checks run only when city.toml loaded cleanly. If it
 	// fails, the core config check above reports the parse error.
+	cityUsesBbolt := false
 	if cfgErr == nil && cfg != nil {
 		resolveRigPaths(cityPath, cfg.Rigs)
-		if workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs) {
+		cityUsesBbolt, _ = cityUsesBboltBackend(cityPath, cfg)
+		register(newCoordStoreBackendCheck(cityPath, cfg))
+		if !cityUsesBbolt && workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs) {
 			register(newDoltTopologyCheck(cityPath, cfg))
 			register(newDoltDriftCheck(cityPath, cfg))
 		}
@@ -351,7 +362,11 @@ func doDoctor(fix, verbose, jsonOut, explainPostgresAuth bool, stdout, stderr io
 		resolveRigPaths(cityPath, cfg.Rigs)
 	}
 	controllerRunning := doctor.IsControllerRunning(cityPath)
-	skipCityDoltCheck := gcDoltSkip() || (!scopeUsesManagedBdStoreContract(cityPath, cityPath) && !workspaceNeedsCityDoltCheck(cityPath, cfg))
+	cityUsesBbolt := false
+	if cfgErr == nil && cfg != nil {
+		cityUsesBbolt, _ = cityUsesBboltBackend(cityPath, cfg)
+	}
+	skipCityDoltCheck := gcDoltSkip() || cityUsesBbolt || (!scopeUsesManagedBdStoreContract(cityPath, cityPath) && !workspaceNeedsCityDoltCheck(cityPath, cfg))
 	skipManagedDoltCheck := managedDoltOpsCheckSkip(cityPath, cfg, cfgErr)
 	for _, check := range buildDoctorChecks(cityPath, cfg, cfgErr, buildDoctorChecksOpts{
 		Stderr:               stderr,
