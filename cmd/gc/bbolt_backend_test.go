@@ -76,6 +76,37 @@ func TestStartBeadsLifecycleBboltCreatesStoreAndSkipsManagedDolt(t *testing.T) {
 	}
 }
 
+func TestBboltBackendSkipsLowLevelManagedDoltLifecycle(t *testing.T) {
+	cityDir := writeBboltBackendTestCity(t, "bbolt", "")
+
+	if err := ensureBeadsProvider(cityDir); err != nil {
+		t.Fatalf("ensureBeadsProvider: %v", err)
+	}
+	deferred, err := initDirIfReady(cityDir, cityDir, "gc")
+	if err != nil {
+		t.Fatalf("initDirIfReady: %v", err)
+	}
+	if deferred {
+		t.Fatal("initDirIfReady deferred managed Dolt init, want immediate bbolt no-op")
+	}
+	if err := initBeadsForDir(cityDir, cityDir, "gc", ""); err != nil {
+		t.Fatalf("initBeadsForDir: %v", err)
+	}
+	if err := healthBeadsProvider(cityDir); err != nil {
+		t.Fatalf("healthBeadsProvider: %v", err)
+	}
+	if err := shutdownBeadsProvider(cityDir); err != nil {
+		t.Fatalf("shutdownBeadsProvider: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(cityDir, ".beads")); !os.IsNotExist(err) {
+		t.Fatalf("managed Dolt .beads directory should not be created, stat err = %v", err)
+	}
+	if _, err := os.Stat(gcBeadsBdScriptPath(cityDir)); !os.IsNotExist(err) {
+		t.Fatalf("managed bd script should not be materialized, stat err = %v", err)
+	}
+}
+
 func TestStartBeadsLifecycleRejectsUnknownBeadsBackend(t *testing.T) {
 	cityDir := writeBboltBackendTestCity(t, "boltdb", "")
 	cfg, err := loadCityConfig(cityDir, &bytes.Buffer{})
