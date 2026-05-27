@@ -1157,6 +1157,18 @@ func openStoreAtForCity(storePath, cityPath string) (beads.Store, error) {
 		runtimeCityPath = cityForStoreDir(storePath)
 	}
 	scopeRoot := resolveStoreScopeRoot(runtimeCityPath, storePath)
+	if samePath(scopeRoot, runtimeCityPath) {
+		cfg, err := loadCityConfig(runtimeCityPath, io.Discard)
+		if err == nil {
+			bboltActive, err := cityUsesBboltBackend(runtimeCityPath, cfg)
+			if err != nil {
+				return nil, fmt.Errorf("bead store: %w", err)
+			}
+			if bboltActive {
+				return openBboltCityStore(runtimeCityPath, config.EffectiveHQPrefix(cfg))
+			}
+		}
+	}
 	provider := rawBeadsProviderForScope(scopeRoot, runtimeCityPath)
 	if strings.HasPrefix(provider, "exec:") {
 		target, err := resolveConfiguredExecStoreTarget(runtimeCityPath, scopeRoot)

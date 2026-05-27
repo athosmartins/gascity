@@ -467,6 +467,7 @@ name = "test-city"
 
 [beads]
 provider = "file"
+backend = "bbolt"
 
 [[agent]]
 name = "mayor"
@@ -477,6 +478,9 @@ name = "mayor"
 	}
 	if cfg.Beads.Provider != "file" {
 		t.Errorf("Beads.Provider = %q, want %q", cfg.Beads.Provider, "file")
+	}
+	if cfg.Beads.Backend != "bbolt" {
+		t.Errorf("Beads.Backend = %q, want %q", cfg.Beads.Backend, "bbolt")
 	}
 }
 
@@ -494,6 +498,9 @@ name = "mayor"
 	}
 	if cfg.Beads.Provider != "" {
 		t.Errorf("Beads.Provider = %q, want empty", cfg.Beads.Provider)
+	}
+	if cfg.Beads.Backend != "" {
+		t.Errorf("Beads.Backend = %q, want empty", cfg.Beads.Backend)
 	}
 }
 

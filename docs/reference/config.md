@@ -249,6 +249,7 @@ BeadsConfig holds bead store settings.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `provider` | string |  | `bd` | Provider selects the bead store backend: "bd" (default), "file", or "exec:&lt;script&gt;" for a user-supplied script. |
+| `backend` | string |  |  | Backend selects the coordination-store storage engine when Provider is "bd" or omitted. Valid values are "" or "dolt" for the managed Dolt SQL server, and "bbolt" for an embedded single-file store. Enum: ``, `dolt`, `bbolt` |
 
 ## ChatSessionsConfig
 

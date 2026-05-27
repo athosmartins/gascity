@@ -135,6 +135,28 @@ func isRetryableManagedDoltLifecycleError(err error) bool {
 // Called by gc start and controller config reload. Rigs must have absolute
 // paths before calling (resolve relative paths first).
 func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer) error {
+	bboltActive, err := cityUsesBboltBackend(cityPath, cfg)
+	if err != nil {
+		return fmt.Errorf("bead store: %w", err)
+	}
+	if bboltActive {
+		path := bboltCityStorePath(cityPath)
+		fmt.Fprintf(stderr, "coord-store: using bbolt backend %s\n", path) //nolint:errcheck // best-effort startup signal
+		store, err := openBboltCityStore(cityPath, config.EffectiveHQPrefix(cfg))
+		if err != nil {
+			return err
+		}
+		if err := store.Shutdown(); err != nil {
+			return fmt.Errorf("bbolt bead store: close %s: %w", path, err)
+		}
+		if len(cfg.Rigs) > 0 {
+			allRigs := collectRigRoutes(cityPath, cfg)
+			if err := writeAllRoutes(allRigs); err != nil {
+				return fmt.Errorf("writing routes: %w", err)
+			}
+		}
+		return nil
+	}
 	if err := validateCanonicalCompatDoltDrift(cityPath, cfg); err != nil {
 		return err
 	}
@@ -198,6 +220,13 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 // Returns (deferred bool, err). deferred=true means the bd provider
 // skipped init — the caller should tell the user it's deferred to gc start.
 func initDirIfReady(cityPath, dir, prefix string) (deferred bool, err error) {
+	bboltActive, err := cityUsesBboltBackend(cityPath, nil)
+	if err != nil {
+		return false, fmt.Errorf("bead store: %w", err)
+	}
+	if bboltActive {
+		return false, nil
+	}
 	provider := beadsProvider(cityPath)
 	if cityUsesBdStoreContract(cityPath) {
 		if gcDoltSkip() {
@@ -651,6 +680,13 @@ func resolveRigPaths(cityPath string, rigs []config.Rig) {
 // Acquires a per-city semaphore to prevent concurrent start operations
 // from causing spawn storms.
 func ensureBeadsProvider(cityPath string) error {
+	bboltActive, err := cityUsesBboltBackend(cityPath, nil)
+	if err != nil {
+		return fmt.Errorf("bead store: %w", err)
+	}
+	if bboltActive {
+		return nil
+	}
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return nil
 	}
@@ -698,6 +734,13 @@ func ensureBeadsProvider(cityPath string) error {
 // Called by gc stop after agents have been terminated.
 // For exec providers, fires "stop". For file providers, always available.
 func shutdownBeadsProvider(cityPath string) error {
+	bboltActive, err := cityUsesBboltBackend(cityPath, nil)
+	if err != nil {
+		return fmt.Errorf("bead store: %w", err)
+	}
+	if bboltActive {
+		return nil
+	}
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return clearManagedDoltRuntimeStateUnlessPostgres(cityPath)
 	}
@@ -738,6 +781,13 @@ func shutdownBeadsProvider(cityPath string) error {
 // providers that run bd init elsewhere (for example gc-beads-k8s inside the
 // pod) must set it in their own wrapper before invoking bd init.
 func initBeadsForDir(cityPath, dir, prefix, doltDatabase string) error {
+	bboltActive, err := cityUsesBboltBackend(cityPath, nil)
+	if err != nil {
+		return fmt.Errorf("bead store: %w", err)
+	}
+	if bboltActive {
+		return nil
+	}
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		if err := seedDeferredManagedBeadsErr(cityPath, dir, prefix, doltDatabase); err != nil {
 			return err
@@ -927,6 +977,13 @@ func initFileStoreForDir(cityPath, dir string) error {
 // Acquires a per-city semaphore to prevent concurrent health/recovery
 // operations from causing a thundering herd when dolt bounces.
 func healthBeadsProvider(cityPath string) error {
+	bboltActive, err := cityUsesBboltBackend(cityPath, nil)
+	if err != nil {
+		return fmt.Errorf("bead store: %w", err)
+	}
+	if bboltActive {
+		return nil
+	}
 	if cityUsesBdStoreContract(cityPath) && gcDoltSkip() {
 		return nil
 	}

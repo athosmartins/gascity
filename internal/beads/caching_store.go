@@ -198,12 +198,13 @@ func NewCachingStore(backing Store, onChange func(eventType, beadID string, payl
 	prefix := ""
 	bdBacking := false
 	nilBdBacking := false
+	if prefixed, ok := backing.(interface{ IDPrefix() string }); ok {
+		prefix = prefixed.IDPrefix()
+	}
 	if bd, ok := backing.(*BdStore); ok {
 		bdBacking = true
 		if bd == nil {
 			nilBdBacking = true
-		} else {
-			prefix = bd.IDPrefix()
 		}
 	}
 	cs := newCachingStore(backing, prefix, onChange)

@@ -107,6 +107,14 @@ func (s *BboltStore) Shutdown() error {
 	return err
 }
 
+// IDPrefix returns the generated bead ID prefix owned by this store.
+func (s *BboltStore) IDPrefix() string {
+	if s == nil {
+		return ""
+	}
+	return s.prefix
+}
+
 // Create persists a new bead and its generated ID sequence.
 func (s *BboltStore) Create(b Bead) (Bead, error) {
 	s.mu.Lock()
