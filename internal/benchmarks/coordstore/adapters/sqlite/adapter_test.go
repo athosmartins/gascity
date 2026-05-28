@@ -46,6 +46,43 @@ func TestOpenRecoversGeneratedIDSequence(t *testing.T) {
 	}
 }
 
+func TestOpenRecoversCustomGeneratedIDSequence(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	first := NewWithDriver(DefaultDriverName, DefaultPragmas, "custom")
+	if err := first.Open(ctx, coordstore.Config{DataDir: dir}); err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	created, err := first.Create(ctx, coordstore.Record{Title: "first", Status: "open", Type: "task"})
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if created.ID != "custom-1" {
+		t.Fatalf("first generated ID = %q, want custom-1", created.ID)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+
+	second := NewWithDriver(DefaultDriverName, DefaultPragmas, "custom")
+	if err := second.Open(ctx, coordstore.Config{DataDir: dir}); err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := second.Close(); err != nil {
+			t.Fatalf("second close: %v", err)
+		}
+	})
+	next, err := second.Create(ctx, coordstore.Record{Title: "second", Status: "open", Type: "task"})
+	if err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+	if next.ID != "custom-2" {
+		t.Fatalf("next generated ID = %q, want custom-2", next.ID)
+	}
+}
+
 // brokenPragmasForContrast documents the pre-fix configuration that caused
 // the ga-4advr OOM at 32m22s under MemoryMax=8G. Kept as a negative
 // baseline for TestWALUnboundedWithCheckpointerDisabled. Do not use in

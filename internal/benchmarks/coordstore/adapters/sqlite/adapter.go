@@ -258,10 +258,15 @@ func (a *Adapter) nextID() string {
 }
 
 func (a *Adapter) recoverSequence(ctx context.Context, db *sql.DB) error {
+	prefix := a.idPrefix
+	if prefix == "" {
+		prefix = "sq"
+	}
+	pattern := prefix + "-%"
 	rows, err := db.QueryContext(ctx, `
 SELECT id FROM records WHERE id LIKE ?
 UNION ALL
-SELECT id FROM ephemeral WHERE id LIKE ?`, "sq-%", "sq-%")
+SELECT id FROM ephemeral WHERE id LIKE ?`, pattern, pattern)
 	if err != nil {
 		return fmt.Errorf("sqlite: recover id sequence: %w", err)
 	}
@@ -272,7 +277,7 @@ SELECT id FROM ephemeral WHERE id LIKE ?`, "sq-%", "sq-%")
 		if err := rows.Scan(&id); err != nil {
 			return fmt.Errorf("sqlite: recover id sequence scan: %w", err)
 		}
-		raw := strings.TrimPrefix(id, "sq-")
+		raw := strings.TrimPrefix(id, prefix+"-")
 		value, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
 			continue
