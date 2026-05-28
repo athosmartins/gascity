@@ -27,10 +27,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var authMu sync.Mutex
-var cachedBridgeWSToken string
-var cachedBridgeWSTokenBaseURL string
-var cachedBridgeWSTokenExpiresAt time.Time
+var (
+	authMu                       sync.Mutex
+	cachedBridgeWSToken          string
+	cachedBridgeWSTokenBaseURL   string
+	cachedBridgeWSTokenExpiresAt time.Time
+)
 
 var defaultWSURLCandidates = []string{
 	"ws://127.0.0.1:3773/ws",
@@ -95,9 +97,6 @@ type execStartConfig struct {
 	CopyFiles          []execCopyEntry   `json:"copy_files,omitempty"`
 }
 
-// NewProvider creates a t3bridge Provider with an internal exec shim for the
-// small remaining helper surface and native WebSocket calls for T3 lifecycle
-// work.
 // resolveWsURLCandidates reads the t3code WebSocket URL from the environment,
 // the ws-url file, and finally stable loopback defaults. Called on each
 // connection so a t3code restart with a new port/token is picked up without
@@ -216,13 +215,6 @@ func resolveWsURL() string {
 	return candidates[0]
 }
 
-func resolveT3ServerDir() string {
-	if v := os.Getenv("T3_SERVER_DIR"); strings.TrimSpace(v) != "" {
-		return strings.TrimSpace(v)
-	}
-	return "/data/projects/t3code/apps/server"
-}
-
 func resolveT3BaseDir() string {
 	if v := os.Getenv("T3_HOME"); strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
@@ -252,26 +244,6 @@ func decodeIssuedBearerSessionToken(output []byte) (string, error) {
 		return "", fmt.Errorf("empty token")
 	}
 	return token, nil
-}
-
-func resolveT3HTTPURL() (string, error) {
-	wsURL := resolveWsURL()
-	parsed, err := url.Parse(wsURL)
-	if err != nil {
-		return "", fmt.Errorf("parse ws url: %w", err)
-	}
-	switch parsed.Scheme {
-	case "ws":
-		parsed.Scheme = "http"
-	case "wss":
-		parsed.Scheme = "https"
-	default:
-		return "", fmt.Errorf("unsupported websocket scheme: %s", parsed.Scheme)
-	}
-	parsed.Path = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func resolveBearerSessionToken() (string, error) {
@@ -320,7 +292,7 @@ func issueT3WebSocketToken(wsURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("request bridge ws token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", fmt.Errorf("request bridge ws token: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -400,7 +372,7 @@ func softenBridgeStartupError(err error) error {
 		return err
 	}
 	if isTransientBridgeError(err) {
-		return fmt.Errorf("%w: %v", runtime.ErrSessionInitializing, err)
+		return fmt.Errorf("%w: %w", runtime.ErrSessionInitializing, err)
 	}
 	return err
 }
@@ -447,6 +419,8 @@ func authenticatedWsURL(wsURL string) (string, http.Header, error) {
 	return parsed.String(), nil, nil
 }
 
+// NewProvider creates a t3bridge Provider backed by native WebSocket calls to
+// the T3 orchestration API, clearing any legacy exec-shim state dir on startup.
 func NewProvider() *Provider {
 	cleanupLegacyStateDir()
 	return &Provider{
@@ -540,13 +514,6 @@ func bearerSessionTokenPath() string {
 	return filepath.Join(resolveNativeStateDir(), "auth-bearer-session-token")
 }
 
-func writeCachedBearerSessionToken(token string) error {
-	if err := ensureNativeStateDir(); err != nil {
-		return err
-	}
-	return os.WriteFile(bearerSessionTokenPath(), []byte(token), 0o600)
-}
-
 func readCachedBearerSessionToken() (string, error) {
 	data, err := os.ReadFile(bearerSessionTokenPath())
 	if err != nil {
@@ -556,14 +523,6 @@ func readCachedBearerSessionToken() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
-}
-
-func removeCachedBearerSessionToken() error {
-	err := os.Remove(bearerSessionTokenPath())
-	if os.IsNotExist(err) {
-		return nil
-	}
-	return err
 }
 
 func writeMetaValue(name, key, value string) error {
@@ -637,7 +596,7 @@ func copyFileToPath(src, dstRoot, relDst string) error {
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	defer func() { _ = in.Close() }()
 
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -646,7 +605,7 @@ func copyFileToPath(src, dstRoot, relDst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
 	if _, err := io.Copy(out, in); err != nil {
 		return err
@@ -725,6 +684,8 @@ func threadCustomMetadata(thread map[string]interface{}) map[string]string {
 	return meta
 }
 
+// ParseSessionEnv decodes a JSON session-env map, returning nil for empty or
+// invalid input.
 func ParseSessionEnv(raw string) map[string]string {
 	if strings.TrimSpace(raw) == "" {
 		return nil
@@ -736,6 +697,8 @@ func ParseSessionEnv(raw string) map[string]string {
 	return env
 }
 
+// SessionNameFromMetadata derives the GC session name from thread custom
+// metadata, falling back to the session env and then the agent name.
 func SessionNameFromMetadata(meta map[string]string) string {
 	if meta == nil {
 		return ""
@@ -882,14 +845,14 @@ func (p *Provider) clearRecentStart(name string) {
 	delete(p.recentStarts, name)
 }
 
-func (p *Provider) withinRecentStart(name string, window time.Duration) bool {
+func (p *Provider) withinRecentStart(name string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	startedAt, ok := p.recentStarts[name]
 	if !ok {
 		return false
 	}
-	if time.Since(startedAt) >= window {
+	if time.Since(startedAt) >= 30*time.Second {
 		delete(p.recentStarts, name)
 		return false
 	}
@@ -931,7 +894,7 @@ func (p *Provider) rpcCallOnce(method string, params map[string]interface{}, req
 			lastErr = fmt.Errorf("%s: %w", candidate, err)
 			continue
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		payload := params
 		if payload == nil {
@@ -949,7 +912,7 @@ func (p *Provider) rpcCallOnce(method string, params map[string]interface{}, req
 			continue
 		}
 
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
@@ -1232,7 +1195,8 @@ func (p *Provider) dispatchThreadModelSelection(threadID, provider, model string
 	})
 }
 
-func (p *Provider) dispatchActivity(threadID, kind, summary, tone string, payload map[string]interface{}) error {
+func (p *Provider) dispatchActivity(threadID, kind, summary string, payload map[string]interface{}) error {
+	tone := "info"
 	now := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	return p.rpcDispatchCommand(map[string]interface{}{
 		"type":      "thread.activity.append",
@@ -1360,25 +1324,6 @@ func threadIsActive(snapshot map[string]interface{}, threadID string) bool {
 	return false
 }
 
-func threadSessionStatus(snapshot map[string]interface{}, threadID string) string {
-	for _, thread := range snapshotThreads(snapshot) {
-		id, _ := thread["id"].(string)
-		if id != threadID {
-			continue
-		}
-		session, _ := thread["session"].(map[string]interface{})
-		if session == nil {
-			return "none"
-		}
-		status, _ := session["status"].(string)
-		if status == "" {
-			return "none"
-		}
-		return status
-	}
-	return "gone"
-}
-
 func threadHasRequiredGCMetadata(snapshot map[string]interface{}, threadID string) bool {
 	for _, thread := range snapshotThreads(snapshot) {
 		id, _ := thread["id"].(string)
@@ -1428,30 +1373,6 @@ func decodeEnvelope(data json.RawMessage) *StartupEnvelope {
 	return &envelope
 }
 
-func encodeExecStartConfig(cfg runtime.Config, startupEnvelope json.RawMessage) ([]byte, error) {
-	copyFiles := make([]execCopyEntry, 0, len(cfg.CopyFiles))
-	for _, ce := range cfg.CopyFiles {
-		copyFiles = append(copyFiles, execCopyEntry{Src: ce.Src, RelDst: ce.RelDst})
-	}
-	return json.Marshal(execStartConfig{
-		WorkDir:            cfg.WorkDir,
-		Command:            cfg.Command,
-		Env:                cfg.Env,
-		StartupEnvelope:    startupEnvelope,
-		ProcessNames:       cfg.ProcessNames,
-		Nudge:              cfg.Nudge,
-		ReadyPromptPrefix:  cfg.ReadyPromptPrefix,
-		ReadyDelayMs:       cfg.ReadyDelayMs,
-		PreStart:           cfg.PreStart,
-		SessionSetup:       cfg.SessionSetup,
-		SessionSetupScript: cfg.SessionSetupScript,
-		SessionLive:        cfg.SessionLive,
-		PackOverlayDirs:    cfg.PackOverlayDirs,
-		OverlayDir:         cfg.OverlayDir,
-		CopyFiles:          copyFiles,
-	})
-}
-
 func buildThreadEnv(env map[string]string) map[string]string {
 	threadEnv := make(map[string]string)
 	for key, value := range env {
@@ -1477,7 +1398,8 @@ func buildThreadEnv(env map[string]string) map[string]string {
 	return threadEnv
 }
 
-func buildGCMetadata(envelope StartupEnvelope, runtimeProvider, state string, sessionEnv map[string]string) map[string]interface{} {
+func buildGCMetadata(envelope StartupEnvelope, runtimeProvider string, sessionEnv map[string]string) map[string]interface{} {
+	state := "active"
 	groupKind := "workspace"
 	groupID := envelope.GC.CityName
 	groupLabel := strings.ToUpper(strings.TrimSpace(envelope.GC.CityName))
@@ -1560,7 +1482,7 @@ func (p *Provider) isPersistentAgent(thread map[string]interface{}) bool {
 
 func (p *Provider) recordStateChange(threadID, state, summary string, extra map[string]interface{}) {
 	_ = p.dispatchThreadMeta(threadID, map[string]interface{}{"gc.state": state})
-	_ = p.dispatchActivity(threadID, "gc.state.changed", summary, "info", stateChangePayload(state, extra))
+	_ = p.dispatchActivity(threadID, "gc.state.changed", summary, stateChangePayload(state, extra))
 }
 
 func (p *Provider) removeWorktreeForThread(thread map[string]interface{}) {
@@ -1847,10 +1769,10 @@ func (p *Provider) refreshAssignmentProjection(threadID string, envelope Startup
 	if next.Assignment.MoleculeID == "" {
 		next.Assignment.MoleculeID = bead.Metadata["molecule_id"]
 	}
-	_ = p.dispatchThreadMeta(threadID, buildGCMetadata(next, providerName, "active", nil))
+	_ = p.dispatchThreadMeta(threadID, buildGCMetadata(next, providerName, nil))
 }
 
-func (p *Provider) runEventWatcher(ctx context.Context, name string, cfg runtime.Config, binding threadBinding, envelope StartupEnvelope, providerName string) {
+func (p *Provider) runEventWatcher(ctx context.Context, _ string, cfg runtime.Config, binding threadBinding, envelope StartupEnvelope, providerName string) {
 	cityPath := cfg.Env["GC_CITY_PATH"]
 	if cityPath == "" {
 		cityPath = cfg.Env["GC_CITY"]
@@ -1864,7 +1786,7 @@ func (p *Provider) runEventWatcher(ctx context.Context, name string, cfg runtime
 	if err != nil {
 		return
 	}
-	defer recorder.Close()
+	defer func() { _ = recorder.Close() }()
 
 	cache := beadStoreForWatcher(cfg.WorkDir, cfg.Env)
 	_ = cache.Prime(ctx)
@@ -1877,7 +1799,7 @@ func (p *Provider) runEventWatcher(ctx context.Context, name string, cfg runtime
 	if err != nil {
 		return
 	}
-	defer watcher.Close()
+	defer func() { _ = watcher.Close() }()
 
 	agentName := cfg.Env["GC_AGENT"]
 	currentBead := cfg.Env["GC_BEAD"]
@@ -1908,7 +1830,7 @@ func (p *Provider) runEventWatcher(ctx context.Context, name string, cfg runtime
 				"title":     bead.Title,
 			})
 		}
-		_ = p.dispatchActivity(binding.ThreadID, kind, summary, "info", payload)
+		_ = p.dispatchActivity(binding.ThreadID, kind, summary, payload)
 	}
 }
 
@@ -1941,7 +1863,7 @@ func (p *Provider) stopEventWatcher(name string) {
 func (p *Provider) IsRunning(name string) bool {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
-		if p.withinRecentStart(name, 30*time.Second) {
+		if p.withinRecentStart(name) {
 			fmt.Fprintf(os.Stderr, "t3bridge: IsRunning(%s) — snapshot soft-unavailable during startup grace → true (%v)\n", name, err)
 			return true
 		}
@@ -1955,7 +1877,7 @@ func (p *Provider) IsRunning(name string) bool {
 		return false
 	}
 	status := p.threadSessionStatus(binding.ThreadID)
-	if (status == "none" || status == "gone") && p.withinRecentStart(name, 30*time.Second) {
+	if (status == "none" || status == "gone") && p.withinRecentStart(name) {
 		fmt.Fprintf(os.Stderr, "t3bridge: IsRunning(%s) threadID=%s — startup grace period → true\n", name, binding.ThreadID)
 		return true
 	}
@@ -2000,7 +1922,9 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 	return names, nil
 }
 
-func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+// Start creates or reuses a T3 thread for the named session and dispatches the
+// startup prompt and any nudge.
+func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) error {
 	fmt.Fprintf(os.Stderr, "t3bridge: Start(%s) called, wsURL=%s\n", name, resolveWsURL())
 
 	var envelope StartupEnvelope
@@ -2156,11 +2080,11 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 				Model:       modelName,
 			}
 			p.setRecentStart(name, time.Now())
-			_ = p.dispatchThreadMeta(threadID, buildGCMetadata(envelope, providerName, "active", buildThreadEnv(cfg.Env)))
+			_ = p.dispatchThreadMeta(threadID, buildGCMetadata(envelope, providerName, buildThreadEnv(cfg.Env)))
 			if worktreePath != "" {
 				_ = p.rpcUpdateThreadMeta(threadID, worktreeBranch, worktreePath)
 			}
-			_ = p.dispatchActivity(threadID, "gc.session.reused", "GC session reused", "info", map[string]interface{}{
+			_ = p.dispatchActivity(threadID, "gc.session.reused", "GC session reused", map[string]interface{}{
 				"agent":       envelope.GC.Agent,
 				"template":    envelope.GC.Template,
 				"convoyId":    envelope.Assignment.ConvoyID,
@@ -2201,7 +2125,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	}
 	fmt.Fprintf(os.Stderr, "t3bridge: Start(%s) creating thread id=%s project=%s title=%s branch=%s worktree=%s\n", //nolint:errcheck
 		name, threadID, projectID, threadTitle, createBranch, createWorktreePath)
-	initialGCMetadata := buildGCMetadata(envelope, providerName, "active", buildThreadEnv(cfg.Env))
+	initialGCMetadata := buildGCMetadata(envelope, providerName, buildThreadEnv(cfg.Env))
 	if err := p.dispatchThreadCreate(
 		threadID,
 		projectID,
@@ -2227,7 +2151,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	p.setRecentStart(name, time.Now())
 	fmt.Fprintf(os.Stderr, "t3bridge: Start(%s) writing gc metadata thread=%s\n", name, threadID) //nolint:errcheck
 	_ = p.dispatchThreadMeta(threadID, initialGCMetadata)
-	_ = p.dispatchActivity(threadID, "gc.session.started", "GC session started", "info", map[string]interface{}{
+	_ = p.dispatchActivity(threadID, "gc.session.started", "GC session started", map[string]interface{}{
 		"agent":       envelope.GC.Agent,
 		"rig":         envelope.GC.RigName,
 		"city":        envelope.GC.CityName,
@@ -2248,7 +2172,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		if err := p.dispatchTurnStart(threadID, prompt, providerName, modelName); err != nil {
 			return fail(err)
 		}
-		_ = p.dispatchActivity(threadID, "gc.prompt.sent", "GC startup prompt sent", "info", map[string]interface{}{
+		_ = p.dispatchActivity(threadID, "gc.prompt.sent", "GC startup prompt sent", map[string]interface{}{
 			"textLength": len(prompt),
 		})
 	}
@@ -2261,7 +2185,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 		if err := p.dispatchTurnStart(threadID, nudgeText, providerName, modelName); err != nil {
 			return fail(err)
 		}
-		_ = p.dispatchActivity(threadID, "gc.nudge.sent", "GC nudge sent", "info", map[string]interface{}{
+		_ = p.dispatchActivity(threadID, "gc.nudge.sent", "GC nudge sent", map[string]interface{}{
 			"source": func() string {
 				if cfg.Nudge != "" {
 					return "startup"
@@ -2275,6 +2199,8 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 	return nil
 }
 
+// Stop tears down the session's event watcher and stops or archives its T3
+// thread; persistent agents are left running.
 func (p *Provider) Stop(name string) error {
 	p.stopEventWatcher(name)
 	snapshot, err := p.rpcSnapshot()
@@ -2316,6 +2242,7 @@ func (p *Provider) Stop(name string) error {
 	return nil
 }
 
+// Interrupt cancels the in-flight turn for the named session, if any.
 func (p *Provider) Interrupt(name string) error {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
@@ -2335,10 +2262,14 @@ func (p *Provider) Interrupt(name string) error {
 	return nil
 }
 
-func (p *Provider) IsAttached(name string) bool {
+// IsAttached reports whether a local terminal is attached. T3 sessions are
+// headless, so this is always false.
+func (p *Provider) IsAttached(_ string) bool {
 	return false
 }
 
+// Attach reports where the session can be viewed in the T3 Code UI; it never
+// attaches a local terminal.
 func (p *Provider) Attach(name string) error {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
@@ -2357,10 +2288,7 @@ func (p *Provider) Attach(name string) error {
 func (p *Provider) ProcessAlive(name string, _ []string) bool {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
-		if p.withinRecentStart(name, 30*time.Second) {
-			return true
-		}
-		return false
+		return p.withinRecentStart(name)
 	}
 	binding := snapshotThreadBinding(snapshotThreadBySessionName(snapshot, name))
 	if binding == nil {
@@ -2370,6 +2298,7 @@ func (p *Provider) ProcessAlive(name string, _ []string) bool {
 	return status == "running" || status == "ready"
 }
 
+// Nudge delivers content to the session as a new user turn.
 func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
@@ -2399,6 +2328,8 @@ func (p *Provider) Nudge(name string, content []runtime.ContentBlock) error {
 	return p.dispatchTurnStart(binding.ThreadID, text, provider, model)
 }
 
+// SetMeta persists a session metadata value and reflects drain transitions onto
+// the T3 thread.
 func (p *Provider) SetMeta(name, key, value string) error {
 	if err := writeMetaValue(name, key, value); err != nil {
 		return err
@@ -2424,10 +2355,13 @@ func (p *Provider) SetMeta(name, key, value string) error {
 	return nil
 }
 
+// GetMeta reads a previously stored session metadata value.
 func (p *Provider) GetMeta(name, key string) (string, error) {
 	return readMetaValue(name, key)
 }
 
+// RemoveMeta deletes a session metadata key and reflects drain-clearing onto the
+// T3 thread.
 func (p *Provider) RemoveMeta(name, key string) error {
 	err := removeMetaValue(name, key)
 	if err != nil {
@@ -2454,6 +2388,8 @@ func (p *Provider) RemoveMeta(name, key string) error {
 	return nil
 }
 
+// Peek returns a short human-readable summary of the session thread's latest
+// activity.
 func (p *Provider) Peek(name string, lines int) (string, error) {
 	resultMap, err := p.rpcCall("gc.peekThreadMessages", map[string]interface{}{
 		"sessionName": name,
@@ -2528,10 +2464,12 @@ func (p *Provider) Peek(name string, lines int) (string, error) {
 	return "Thread " + binding.ThreadID, nil
 }
 
+// GetLastActivity returns the timestamp of the session thread's most recent
+// update.
 func (p *Provider) GetLastActivity(name string) (time.Time, error) {
 	snapshot, err := p.rpcSnapshot()
 	if err != nil {
-		if p.withinRecentStart(name, 30*time.Second) {
+		if p.withinRecentStart(name) {
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			return p.recentStarts[name], nil
@@ -2543,7 +2481,7 @@ func (p *Provider) GetLastActivity(name string) (time.Time, error) {
 	}
 	thread := snapshotThreadBySessionName(snapshot, name)
 	if thread == nil {
-		if p.withinRecentStart(name, 30*time.Second) {
+		if p.withinRecentStart(name) {
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			return p.recentStarts[name], nil
@@ -2553,10 +2491,12 @@ func (p *Provider) GetLastActivity(name string) (time.Time, error) {
 	return threadUpdatedAt(thread), nil
 }
 
-func (p *Provider) ClearScrollback(name string) error {
+// ClearScrollback is a no-op; T3 sessions keep no local scrollback.
+func (p *Provider) ClearScrollback(_ string) error {
 	return nil
 }
 
+// CopyTo copies a file or directory tree into the session's working directory.
 func (p *Provider) CopyTo(name, src, relDst string) error {
 	if strings.TrimSpace(name) == "" || strings.TrimSpace(src) == "" {
 		return nil
@@ -2615,20 +2555,24 @@ func (p *Provider) CopyTo(name, src, relDst string) error {
 	return nil
 }
 
-func (p *Provider) SendKeys(name string, keys ...string) error {
+// SendKeys is a no-op; T3 sessions do not accept raw key input.
+func (p *Provider) SendKeys(_ string, _ ...string) error {
 	return nil
 }
 
+// RunLive is a no-op; t3bridge does not support live interactive runs.
 func (p *Provider) RunLive(_ string, _ runtime.Config) error {
 	return nil
 }
 
+// Capabilities reports the optional provider features t3bridge supports.
 func (p *Provider) Capabilities() runtime.ProviderCapabilities {
 	return runtime.ProviderCapabilities{
 		CanReportActivity: true,
 	}
 }
 
+// SleepCapability reports how the named session may be put to sleep.
 func (p *Provider) SleepCapability(string) runtime.SessionSleepCapability {
 	return runtime.SessionSleepCapabilityTimedOnly
 }

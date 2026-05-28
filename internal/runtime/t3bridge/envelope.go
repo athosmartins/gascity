@@ -2,13 +2,18 @@ package t3bridge
 
 import "encoding/json"
 
+// AgentKind distinguishes a durable named session from an interchangeable
+// pooled worker.
 type AgentKind string
 
 const (
+	// AgentKindNamed is a durable, individually-addressed session.
 	AgentKindNamed AgentKind = "named"
-	AgentKindPool  AgentKind = "pool"
+	// AgentKindPool is an interchangeable worker drawn from a pool.
+	AgentKindPool AgentKind = "pool"
 )
 
+// GCSection carries Gas City identity and placement for a session.
 type GCSection struct {
 	CityPath    string `json:"cityPath"`
 	CityName    string `json:"cityName"`
@@ -20,6 +25,8 @@ type GCSection struct {
 	SessionName string `json:"sessionName"`
 }
 
+// RuntimeSection describes the provider, model, and working directory the
+// session should run with.
 type RuntimeSection struct {
 	Provider         string `json:"provider"`
 	Model            string `json:"model,omitempty"`
@@ -32,18 +39,21 @@ type RuntimeSection struct {
 	Command          string `json:"command,omitempty"`
 }
 
+// WorktreeSection describes a git worktree bound to the session.
 type WorktreeSection struct {
 	Cwd          string `json:"cwd"`
 	WorktreePath string `json:"worktreePath"`
 	Branch       string `json:"branch"`
 }
 
+// StartupSection holds the initial prompt and nudge for a new session.
 type StartupSection struct {
 	PromptTemplate string `json:"promptTemplate,omitempty"`
 	StartupPrompt  string `json:"startupPrompt"`
 	InitialNudge   string `json:"initialNudge,omitempty"`
 }
 
+// AssignmentSection captures the bead and convoy work assigned to a session.
 type AssignmentSection struct {
 	BeadID            string `json:"beadId,omitempty"`
 	BeadTitle         string `json:"beadTitle,omitempty"`
@@ -56,10 +66,12 @@ type AssignmentSection struct {
 	Formula           string `json:"formula,omitempty"`
 }
 
+// ContextSection carries GC environment variables passed through to the session.
 type ContextSection struct {
 	GCEnv map[string]string `json:"gcEnv,omitempty"`
 }
 
+// ResumeSection controls thread reuse and rebind policy across restarts.
 type ResumeSection struct {
 	Policy                 string `json:"policy"`
 	AllowThreadReuse       bool   `json:"allowThreadReuse"`
@@ -68,6 +80,7 @@ type ResumeSection struct {
 	RequiredThreadModel    string `json:"requiredThreadModel,omitempty"`
 }
 
+// StartupEnvelope is the full descriptor handed to T3 when starting a session.
 type StartupEnvelope struct {
 	Version    int               `json:"version"`
 	GC         GCSection         `json:"gc"`
@@ -79,6 +92,7 @@ type StartupEnvelope struct {
 	Worktree   *WorktreeSection  `json:"worktree,omitempty"`
 }
 
+// Intent is the high-level input used to build a StartupEnvelope.
 type Intent struct {
 	AgentKind          AgentKind
 	WakeMode           string
@@ -103,6 +117,7 @@ func allowThreadReuse(kind AgentKind, wakeMode string) bool {
 	return true
 }
 
+// BuildStartupEnvelope builds the JSON startup envelope described by intent.
 func BuildStartupEnvelope(intent Intent) (json.RawMessage, error) {
 	policy := intent.ResumePolicy
 	if policy == "" {

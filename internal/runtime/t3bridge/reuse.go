@@ -4,6 +4,7 @@ package t3bridge
 // startup envelope arrives.
 type ReuseDecision string
 
+// Thread-reuse decisions returned by DecideThreadReuse.
 const (
 	ReuseDecisionReuse    ReuseDecision = "reuse"
 	ReuseDecisionRecreate ReuseDecision = "recreate"

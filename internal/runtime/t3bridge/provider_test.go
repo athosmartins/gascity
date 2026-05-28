@@ -362,7 +362,7 @@ func TestBuildThreadEnv_DropsStartupEnvelope(t *testing.T) {
 }
 
 func TestBuildGCMetadata_UsesFirstClassT3BridgeProviderName(t *testing.T) {
-	meta := buildGCMetadata(StartupEnvelope{}, "codex", "active", nil)
+	meta := buildGCMetadata(StartupEnvelope{}, "codex", nil)
 	if got := meta["gc.provider"]; got != "t3bridge" {
 		t.Fatalf("gc.provider = %v, want t3bridge", got)
 	}
@@ -664,7 +664,7 @@ func newT3BridgeTestServer(t *testing.T, snapshot map[string]interface{}) *t3Bri
 			t.Errorf("upgrade websocket: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		var req struct {
 			ID      string          `json:"id"`
@@ -736,15 +736,6 @@ func (ts *t3BridgeTestServer) authCalls() int {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	return ts.authRequestCount
-}
-
-func (ts *t3BridgeTestServer) lastWSAuthorization() string {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	if len(ts.wsAuthorization) == 0 {
-		return ""
-	}
-	return ts.wsAuthorization[len(ts.wsAuthorization)-1]
 }
 
 func (ts *t3BridgeTestServer) wsCalls() int {
