@@ -977,13 +977,6 @@
           "type": "object",
           "description": "Providers defines named provider presets for agent startup."
         },
-        "packs": {
-          "additionalProperties": {
-            "$ref": "#/$defs/PackSource"
-          },
-          "type": "object",
-          "description": "Packs defines named remote pack sources fetched via git (V1 mechanism)."
-        },
         "imports": {
           "additionalProperties": {
             "$ref": "#/$defs/Import"
@@ -1338,11 +1331,11 @@
       "properties": {
         "source": {
           "type": "string",
-          "description": "Source is the pack location: a local relative path (e.g.,\n\"./assets/imports/gastown\") or a remote URL (e.g.,\n\"github.com/gastownhall/gastown\"). Local paths have no version."
+          "description": "Source is the durable authored pack location: a local path, a remote git\nURL, or a remote git URL with a monorepo subpath such as\n\"github.com/org/repo//packs/foo\". Registry handles are lookup-only in\nthis release wave; authored [imports.*] entries store the resolved source\nplus optional version."
         },
         "version": {
           "type": "string",
-          "description": "Version is a semver constraint for remote imports (e.g., \"^1.2\").\nEmpty for local paths. \"sha:\u003chex\u003e\" for commit pinning."
+          "description": "Version is an optional semver constraint for git-backed imports (e.g.,\n\"^1.2\"). Empty for local paths. \"sha:\u003chex\u003e\" pins a specific commit."
         },
         "export": {
           "type": "boolean",
@@ -1654,28 +1647,6 @@
       "additionalProperties": false,
       "type": "object",
       "description": "PackRigDefaults holds the [defaults.rig] block — defaults applied to rigs created from this pack."
-    },
-    "PackSource": {
-      "properties": {
-        "source": {
-          "type": "string",
-          "description": "Source is the git repository URL."
-        },
-        "ref": {
-          "type": "string",
-          "description": "Ref is the git ref to checkout (branch, tag, or commit). Defaults to HEAD."
-        },
-        "path": {
-          "type": "string",
-          "description": "Path is a subdirectory within the repo containing the pack files."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "source"
-      ],
-      "description": "PackSource defines a remote pack repository."
     },
     "Patches": {
       "properties": {
@@ -2430,5 +2401,5 @@
     }
   },
   "title": "Gas City Configuration",
-  "description": "Schema for city.toml — the PackV2 deployment file for a Gas City instance. Pack definitions live in pack.toml and conventional pack directories such as agents/, formulas/, orders/, and commands/. Use [imports.*] for PackV2 composition; legacy includes, [packs.*], and [[agent]] fields remain visible for migration compatibility.\n\n\u003e **PackV2 format source of truth:** The public PackV2 format and loader semantics are specified in [Gas City Pack Specification (2.0)](/specs/pack-spec)."
+  "description": "Schema for city.toml — the PackV2 deployment file for a Gas City instance. Pack definitions live in pack.toml and conventional pack directories such as agents/, formulas/, orders/, and commands/. Use [imports.*] for PackV2 composition; legacy includes and [[agent]] fields remain visible for migration compatibility.\n\n\u003e **PackV2 format source of truth:** The public PackV2 format and loader semantics are specified in [Gas City Pack Specification (2.0)](/specs/pack-spec)."
 }

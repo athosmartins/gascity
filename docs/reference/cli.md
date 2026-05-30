@@ -1491,10 +1491,37 @@ gc import
 
 ## gc import add
 
-Add a pack import
+Add a pack import.
+
+The source argument is resolved once and written as a durable [imports.&lt;name&gt;]
+entry using source plus optional version. Supported sources are:
+
+- local paths outside git worktrees: stored as plain paths, with no lock entry
+- local paths inside git worktrees at HEAD: promoted to a file:// repo source
+  with the pack subpath and locked to the current commit
+- remote git repositories: cloned and locked; --version accepts a semver
+  constraint or sha:&lt;commit&gt;
+- remote git repository subpaths: use source strings such as
+  github.com/org/repo//packs/foo or GitHub tree URLs
+
+Registry catalog handles are lookup shortcuts in this wave, not durable
+[imports.*] field values. After lookup, authored TOML stores the resolved
+source and optional version.
 
 ```
 gc import add <source> [flags]
+```
+
+**Example:**
+
+```
+gc import add ./packs/review
+gc import add github.com/org/repo//packs/review --version '^1.2.0'
+gc import add https://github.com/org/repo/tree/main/packs/review --name review
+
+# For uncommitted packs inside a git worktree, edit TOML directly:
+# [imports.review]
+# source = "/Users/you/shared-packs/packs/review"
 ```
 
 | Flag | Type | Default | Description |

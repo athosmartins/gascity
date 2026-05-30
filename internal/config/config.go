@@ -169,7 +169,12 @@ type City struct {
 	// Providers defines named provider presets for agent startup.
 	Providers map[string]ProviderSpec `toml:"providers,omitempty"`
 	// Packs defines named remote pack sources fetched via git (V1 mechanism).
-	Packs map[string]PackSource `toml:"packs,omitempty"`
+	//
+	// Deprecated: accepted for legacy migration and fetch/list compatibility
+	// only. PackV2 authored config uses [imports.*] with source plus optional
+	// version, so this legacy surface is intentionally omitted from generated
+	// public schemas and reference docs.
+	Packs map[string]PackSource `toml:"packs,omitempty" jsonschema:"-"`
 	// Imports defines named pack imports (V2 mechanism). Each key is a
 	// binding name; the value specifies the source and optional version,
 	// export, and transitive controls. Processed during ExpandCityPacks.
@@ -673,8 +678,11 @@ type AgentOverride struct {
 	OptionDefaults map[string]string `toml:"option_defaults,omitempty"`
 }
 
-// PackSource defines a remote pack repository.
-// Referenced by name in rig pack fields and fetched into the cache.
+// PackSource defines a legacy remote pack repository.
+// Referenced by name in V1 pack fields and fetched into the cache.
+//
+// Deprecated: retained for legacy migration and fetch/list compatibility.
+// PackV2 authored imports use Import.Source and Import.Version instead.
 type PackSource struct {
 	// Source is the git repository URL.
 	Source string `toml:"source" jsonschema:"required"`
@@ -689,12 +697,14 @@ type PackSource struct {
 // name (the TOML key), a source (local path or remote URL), and
 // optional version/export/transitive controls.
 type Import struct {
-	// Source is the pack location: a local relative path (e.g.,
-	// "./assets/imports/gastown") or a remote URL (e.g.,
-	// "github.com/gastownhall/gastown"). Local paths have no version.
+	// Source is the durable authored pack location: a local path, a remote git
+	// URL, or a remote git URL with a monorepo subpath such as
+	// "github.com/org/repo//packs/foo". Registry handles are lookup-only in
+	// this release wave; authored [imports.*] entries store the resolved source
+	// plus optional version.
 	Source string `toml:"source" jsonschema:"required"`
-	// Version is a semver constraint for remote imports (e.g., "^1.2").
-	// Empty for local paths. "sha:<hex>" for commit pinning.
+	// Version is an optional semver constraint for git-backed imports (e.g.,
+	// "^1.2"). Empty for local paths. "sha:<hex>" pins a specific commit.
 	Version string `toml:"version,omitempty"`
 	// Export re-exports this import's contents into the parent pack's
 	// namespace. Consumers of the parent get this import's agents
