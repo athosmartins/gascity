@@ -170,10 +170,10 @@ type City struct {
 	Providers map[string]ProviderSpec `toml:"providers,omitempty"`
 	// Packs defines named remote pack sources fetched via git (V1 mechanism).
 	//
-	// Deprecated: accepted for legacy migration and fetch/list compatibility
-	// only. PackV2 authored config uses [imports.*] with source plus optional
-	// version, so this legacy surface is intentionally omitted from generated
-	// public schemas and reference docs.
+	// Legacy pack source map, accepted for migration and fetch/list
+	// compatibility only. PackV2 authored config uses [imports.*] with source
+	// plus optional version, so this legacy surface is intentionally omitted
+	// from generated public schemas and reference docs.
 	Packs map[string]PackSource `toml:"packs,omitempty" jsonschema:"-"`
 	// Imports defines named pack imports (V2 mechanism). Each key is a
 	// binding name; the value specifies the source and optional version,
@@ -681,7 +681,7 @@ type AgentOverride struct {
 // PackSource defines a legacy remote pack repository.
 // Referenced by name in V1 pack fields and fetched into the cache.
 //
-// Deprecated: retained for legacy migration and fetch/list compatibility.
+// PackSource is retained for legacy migration and fetch/list compatibility.
 // PackV2 authored imports use Import.Source and Import.Version instead.
 type PackSource struct {
 	// Source is the git repository URL.
