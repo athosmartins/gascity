@@ -121,6 +121,14 @@ var cityFlag string
 // Empty means "discover from cwd or omit."
 var rigFlag string
 
+var hqStoreCache sync.Map // map[string]*hqStoreCacheEntry
+
+type hqStoreCacheEntry struct {
+	ready chan struct{}
+	store *beads.HQStore
+	err   error
+}
+
 // run executes the gc CLI with the given args, writing output to stdout and
 // errors to stderr. Returns the exit code.
 func run(args []string, stdout, stderr io.Writer) int {
@@ -1152,11 +1160,62 @@ func openCompatibleFileStore(scopeRoot, cityPath string) (*beads.FileStore, erro
 }
 
 func openHQStoreAt(scopeRoot, cityPath string) (*beads.HQStore, error) {
+	storeDir, err := canonicalHQStoreDir(scopeRoot)
+	if err != nil {
+		return nil, err
+	}
+	cityPath, err = canonicalHQCityPath(cityPath)
+	if err != nil {
+		return nil, err
+	}
+	scopeRoot = hqStoreScopeRoot(storeDir)
+
+	entry := &hqStoreCacheEntry{ready: make(chan struct{})}
+	actual, loaded := hqStoreCache.LoadOrStore(storeDir, entry)
+	if loaded {
+		cached := actual.(*hqStoreCacheEntry)
+		<-cached.ready
+		return cached.store, cached.err
+	}
+
+	entry.store, entry.err = openHQStoreUncached(scopeRoot, cityPath, storeDir)
+	close(entry.ready)
+	if entry.err != nil {
+		hqStoreCache.Delete(storeDir)
+		return nil, entry.err
+	}
+	return entry.store, nil
+}
+
+func canonicalHQStoreDir(scopeRoot string) (string, error) {
+	storeDir := filepath.Join(scopeRoot, ".gc", "hqstore")
+	abs, err := filepath.Abs(filepath.Clean(storeDir))
+	if err != nil {
+		return "", fmt.Errorf("resolving hqstore dir %q: %w", storeDir, err)
+	}
+	return abs, nil
+}
+
+func canonicalHQCityPath(cityPath string) (string, error) {
+	if strings.TrimSpace(cityPath) == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(filepath.Clean(cityPath))
+	if err != nil {
+		return "", fmt.Errorf("resolving hqstore city path %q: %w", cityPath, err)
+	}
+	return abs, nil
+}
+
+func hqStoreScopeRoot(storeDir string) string {
+	return filepath.Dir(filepath.Dir(storeDir))
+}
+
+func openHQStoreUncached(scopeRoot, cityPath, storeDir string) (*beads.HQStore, error) {
 	cfg, err := loadCityConfig(cityPath, io.Discard)
 	if err != nil {
 		cfg = nil
 	}
-	storeDir := filepath.Join(scopeRoot, ".gc", "hqstore")
 	return beads.OpenHQStore(
 		storeDir,
 		beads.WithHQStoreIDPrefix(issuePrefixForScope(scopeRoot, cityPath, cfg)),
