@@ -1,0 +1,32 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "gascity/designer",
+  "elements": [
+    {"type":"text","id":"title","x":280,"y":10,"text":"Single-Runtime Enforcement: Spawn-Time Kill Flow","fontSize":24,"strokeColor":"#1e1e1e"},
+    {"type":"text","id":"s1title","x":40,"y":50,"text":"Flow: Spawn-Time Orphan Kill (Site 1 — session.Manager)","fontSize":18,"strokeColor":"#2563eb"},
+    {"type":"rectangle","id":"f1-rec","x":50,"y":85,"width":120,"height":40,"backgroundColor":"#ffd8a8","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#f59e0b","label":{"text":"Reconciler","fontSize":14}},
+    {"type":"arrow","id":"f1-l1","x":170,"y":105,"width":0,"height":480,"points":[[0,0],[0,480]],"strokeColor":"#b0b0b0","strokeWidth":1,"strokeStyle":"dashed","endArrowhead":null},
+    {"type":"rectangle","id":"f1-mgr","x":230,"y":85,"width":140,"height":40,"backgroundColor":"#b2f2bb","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#22c55e","label":{"text":"session.Manager","fontSize":14}},
+    {"type":"arrow","id":"f1-l2","x":300,"y":125,"width":0,"height":480,"points":[[0,0],[0,480]],"strokeColor":"#b0b0b0","strokeWidth":1,"strokeStyle":"dashed","endArrowhead":null},
+    {"type":"rectangle","id":"f1-scanner","x":430,"y":85,"width":160,"height":40,"backgroundColor":"#d0bfff","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#8b5cf6","label":{"text":"ProcessTableScanner","fontSize":14}},
+    {"type":"arrow","id":"f1-l3","x":510,"y":125,"width":0,"height":480,"points":[[0,0],[0,480]],"strokeColor":"#b0b0b0","strokeWidth":1,"strokeStyle":"dashed","endArrowhead":null},
+    {"type":"rectangle","id":"f1-proctable","x":660,"y":85,"width":140,"height":40,"backgroundColor":"#a5d8ff","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#4a9eed","label":{"text":"proctable pkg","fontSize":14}},
+    {"type":"arrow","id":"f1-l4","x":730,"y":125,"width":0,"height":480,"points":[[0,0],[0,480]],"strokeColor":"#b0b0b0","strokeWidth":1,"strokeStyle":"dashed","endArrowhead":null},
+    {"type":"rectangle","id":"f1-provider","x":870,"y":85,"width":140,"height":40,"backgroundColor":"#c3fae8","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#06b6d4","label":{"text":"runtime.Provider","fontSize":14}},
+    {"type":"arrow","id":"f1-l5","x":940,"y":125,"width":0,"height":480,"points":[[0,0],[0,480]],"strokeColor":"#b0b0b0","strokeWidth":1,"strokeStyle":"dashed","endArrowhead":null},
+    {"type":"arrow","id":"a1","x":170,"y":155,"width":130,"height":0,"points":[[0,0],[130,0]],"strokeColor":"#1e1e1e","strokeWidth":2,"endArrowhead":"arrow","label":{"text":"Start(ctx, beadID)","fontSize":13}},
+    {"type":"arrow","id":"a2","x":300,"y":185,"width":210,"height":0,"points":[[0,0],[210,0]],"strokeColor":"#1e1e1e","strokeWidth":2,"endArrowhead":"arrow","label":{"text":"type-assert sp to ProcessTableScanner","fontSize":13}},
+    {"type":"arrow","id":"a3","x":510,"y":215,"width":220,"height":0,"points":[[0,0],[220,0]],"strokeColor":"#8b5cf6","strokeWidth":2,"endArrowhead":"arrow","label":{"text":"FindRuntimesBySessionID(beadID)","fontSize":13}},
+    {"type":"arrow","id":"a4","x":730,"y":245,"width":-220,"height":0,"points":[[0,0],[-220,0]],"strokeColor":"#4a9eed","strokeWidth":2,"endArrowhead":"arrow","strokeStyle":"dashed","label":{"text":"[]LiveRuntime (pid, isTracked=false=orphan)","fontSize":13}},
+    {"type":"arrow","id":"a5","x":510,"y":275,"width":220,"height":0,"points":[[0,0],[220,0]],"strokeColor":"#ef4444","strokeWidth":2,"endArrowhead":"arrow","label":{"text":"TerminateRuntime(orphan) SIGTERM+SIGKILL","fontSize":13}},
+    {"type":"arrow","id":"a6","x":730,"y":305,"width":-220,"height":0,"points":[[0,0],[-220,0]],"strokeColor":"#ef4444","strokeWidth":2,"endArrowhead":"arrow","strokeStyle":"dashed","label":{"text":"nil (or err: log, continue)","fontSize":13}},
+    {"type":"arrow","id":"a7","x":300,"y":340,"width":640,"height":0,"points":[[0,0],[640,0]],"strokeColor":"#22c55e","strokeWidth":2,"endArrowhead":"arrow","label":{"text":"sp.Start(ctx, sessName, cfg) [exactly one runtime now]","fontSize":13}},
+    {"type":"arrow","id":"a8","x":940,"y":370,"width":-640,"height":0,"points":[[0,0],[-640,0]],"strokeColor":"#22c55e","strokeWidth":2,"endArrowhead":"arrow","strokeStyle":"dashed","label":{"text":"nil","fontSize":13}},
+    {"type":"arrow","id":"a9","x":300,"y":400,"width":-130,"height":0,"points":[[0,0],[-130,0]],"strokeColor":"#1e1e1e","strokeWidth":2,"endArrowhead":"arrow","strokeStyle":"dashed","label":{"text":"Info{}, nil","fontSize":13}},
+    {"type":"rectangle","id":"f1-note-notsupported","x":430,"y":440,"width":300,"height":40,"backgroundColor":"#fff3bf","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#f59e0b","strokeWidth":1,"label":{"text":"If sp does NOT implement scanner: skip to sp.Start","fontSize":13}},
+    {"type":"rectangle","id":"f1-note-err","x":430,"y":490,"width":300,"height":40,"backgroundColor":"#ffc9c9","fillStyle":"solid","roundness":{"type":3},"strokeColor":"#ef4444","strokeWidth":1,"label":{"text":"Scan err: log + continue (never abort spawn)","fontSize":13}}
+  ],
+  "appState": {"viewBackgroundColor":"#ffffff"},
+  "files": {}
+}
