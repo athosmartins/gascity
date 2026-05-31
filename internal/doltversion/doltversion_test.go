@@ -18,19 +18,19 @@ func TestParse(t *testing.T) {
 	}{
 		{
 			name:      "dolt version prefix",
-			input:     "dolt version 1.86.2",
-			wantRaw:   "1.86.2",
-			wantMajor: 1,
-			wantMinor: 86,
-			wantPatch: 2,
+			input:     "dolt version 2.1.0",
+			wantRaw:   "2.1.0",
+			wantMajor: 2,
+			wantMinor: 1,
+			wantPatch: 0,
 		},
 		{
 			name:      "build metadata",
-			input:     "dolt version 1.86.2+build-5",
-			wantRaw:   "1.86.2",
-			wantMajor: 1,
-			wantMinor: 86,
-			wantPatch: 2,
+			input:     "dolt version 2.1.0+build-5",
+			wantRaw:   "2.1.0",
+			wantMajor: 2,
+			wantMinor: 1,
+			wantPatch: 0,
 		},
 		{
 			name:       "pre-release",
@@ -43,11 +43,11 @@ func TestParse(t *testing.T) {
 		},
 		{
 			name:       "pre-release with build metadata",
-			input:      "dolt version 1.86.2-rc1+build.5",
-			wantRaw:    "1.86.2-rc1+build.5",
-			wantMajor:  1,
-			wantMinor:  86,
-			wantPatch:  2,
+			input:      "dolt version 2.1.0-rc1+build.5",
+			wantRaw:    "2.1.0-rc1+build.5",
+			wantMajor:  2,
+			wantMinor:  1,
+			wantPatch:  0,
 			wantPreRel: true,
 		},
 		{
@@ -84,12 +84,12 @@ func TestCheckFinalMinimum(t *testing.T) {
 		input   string
 		wantErr error
 	}{
-		{name: "at floor", input: "dolt version 1.86.2"},
-		{name: "above floor", input: "dolt version 1.86.10"},
-		{name: "below floor", input: "dolt version 1.86.1", wantErr: ErrBelowMinimum},
-		{name: "pre-release at floor", input: "dolt version 1.86.2-rc1", wantErr: ErrPreRelease},
-		{name: "pre-release with build metadata at floor", input: "dolt version 1.86.2-rc1+build.5", wantErr: ErrPreRelease},
-		{name: "pre-release above floor", input: "dolt version 2.0.0-rc1", wantErr: ErrPreRelease},
+		{name: "at floor", input: "dolt version 2.1.0"},
+		{name: "above floor", input: "dolt version 2.1.1"},
+		{name: "below floor", input: "dolt version 2.0.10", wantErr: ErrBelowMinimum},
+		{name: "pre-release at floor", input: "dolt version 2.1.0-rc1", wantErr: ErrPreRelease},
+		{name: "pre-release with build metadata at floor", input: "dolt version 2.1.0-rc1+build.5", wantErr: ErrPreRelease},
+		{name: "pre-release above floor", input: "dolt version 2.1.1-rc1", wantErr: ErrPreRelease},
 	}
 
 	for _, tt := range tests {
