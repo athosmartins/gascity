@@ -38,8 +38,8 @@ well-known rules or private files referenced by TOML fields.
 
 A pack may be used in three contexts:
 
-1. As the root pack of a city. The root pack is the city directory containing
-   `city.toml` and the root `pack.toml`.
+1. As the city pack. The city pack is the root pack: the city directory
+   containing `city.toml` and the root `pack.toml`.
 2. As a city-level imported pack. Its city-scoped and unscoped definitions are
    loaded into the city-level surface.
 3. As a rig-level imported pack. Its rig-scoped and unscoped definitions are
@@ -159,7 +159,7 @@ The following file-system constructs must not be used as public pack format:
 | Construct | Rule | Preferred replacement |
 |---|---|---|
 | Cache directories | A checked-in `pack.toml` must not point at Gas City's local cache as a durable dependency. | Use durable `[imports.<binding>].source` plus optional `version`. |
-| Registry handles | A checked-in `pack.toml` must not persist command-time handles such as `main:gastown`. | Use the registry record's durable `source` and optional `version`. |
+| Registry handles | A checked-in `pack.toml` must not persist command-time handles such as `main:gascity`. | Use the registry record's durable `source` and optional `version`. |
 | Consumer rig names inside reusable packs | A reusable pack must not assume the names of rigs that will import it. | Use `scope = "rig"` and let the loader stamp the consuming rig name. |
 | Top-level `scripts/` | New packs must not place user scripts in top-level `scripts/`. | Put command/doctor entrypoints beside their command/check, or put private scripts under `assets/`. |
 
@@ -194,7 +194,7 @@ The `[pack]` table defines pack metadata.
 
 ```toml
 [pack]
-name = "gastown"
+name = "gascity"
 schema = 2
 version = "1.4.0"
 requires_gc = ">=0.13.0"
@@ -235,8 +235,8 @@ Rig-scoped requirements are validated while loading the pack for a rig.
 Pack imports are named dependencies.
 
 ```toml
-[imports.gastown]
-source = "<resolver coordinate from registry record>"
+[imports.gascity]
+source = "https://github.com/gastownhall/gascity-packs/tree/main/gascity"
 version = "sha:d3617d1319a1206ac85f69ba024ec395c49c6f4b"
 ```
 
@@ -244,9 +244,10 @@ The binding name is local to the importing file. Current loader behavior uses
 binding names for deterministic ordering of imports. It does not add binding
 names to runtime agent identities.
 
-A `source` string is a pack resolver coordinate, not necessarily a
-browser-dereferenceable URL. For Git-backed sources, the Git remote and any
-pack-root subdirectory selector are part of the same source string.
+A `source` string is a pack resolver coordinate. For GitHub-hosted packs, a
+browser-dereferenceable `tree/<ref>/<path>` URL is the preferred authored form.
+For other Git-backed sources, the Git remote and any pack-root subdirectory
+selector are part of the same source string.
 
 | Field | Type | Required | Rule |
 |---|---|---|---|
@@ -254,10 +255,10 @@ pack-root subdirectory selector are part of the same source string.
 | `version` | string | no | Compatibility constraint for versioned sources. |
 
 Public import TOML must not use fields named `path`, `ref`, `commit`, or
-`hash`. Registry handles such as `main:gastown` are command-time lookup handles
+`hash`. Registry handles such as `main:gascity` are command-time lookup handles
 and must not be persisted as `source`.
 
-Root-pack imports use the same table shape at the top level of the root
+City-pack imports use the same table shape at the top level of the root
 `pack.toml`:
 
 ```toml
@@ -720,7 +721,7 @@ For pack imports, the reference is the `source` field of a `PackImport`.
 Import bindings are sorted lexicographically before their sources are loaded.
 This gives deterministic load order for TOML maps.
 
-Root-pack imports are read from top-level `[imports.<binding>]` tables in the
+City-pack imports are read from top-level `[imports.<binding>]` tables in the
 root `pack.toml`. Rig imports are read from `[rigs.imports.<binding>]` under
 the corresponding `[[rigs]]` entry. Pack-to-pack imports are read from
 top-level `[imports.<binding>]` in `pack.toml`.
@@ -753,7 +754,7 @@ configuration: `gc pack registry add`, `list`, `remove`, `refresh`, `search`,
 and `show`.
 
 Registry handles are not durable dependency coordinates. The shipped registry
-commands may accept a handle such as `main:gastown` while searching or
+commands may accept a handle such as `main:gascity` while searching or
 inspecting registry records; persisted pack TOML must store the resolved
 durable `source` and optional `version` constraint instead.
 

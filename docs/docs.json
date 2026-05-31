@@ -130,7 +130,6 @@
           "guides/index",
           "guides/migrating-to-pack-vnext",
           "guides/understanding-packs",
-          "guides/using-packs",
           "guides/shareable-packs",
           "guides/using-json-from-gc"
         ]
