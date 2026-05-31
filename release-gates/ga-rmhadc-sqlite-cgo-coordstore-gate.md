@@ -1,11 +1,11 @@
 # Release gate: ga-rmhadc
 
-**Bead:** ga-rmhadc - needs-deploy: feat(coordstore): opt-in SQLite-cgo bead store backend (default off)  
-**Source review bead:** ga-hx7ap3  
-**PR:** #2738 - https://github.com/gastownhall/gascity/pull/2738  
-**Branch:** `builder/ga-aec8q.16-sqlite-cutover`  
-**Code HEAD before gate:** `af686065dd25431077dcab891aef668d3518d298`  
-**Base:** `origin/main` at `fa150384f`  
+**Bead:** ga-rmhadc - needs-deploy: feat(coordstore): opt-in SQLite-cgo bead store backend (default off)
+**Source review bead:** ga-hx7ap3
+**PR:** #2738 - https://github.com/gastownhall/gascity/pull/2738
+**Branch:** `builder/ga-aec8q.16-sqlite-cutover`
+**Code HEAD before gate:** `af686065dd25431077dcab891aef668d3518d298`
+**Base:** `origin/main` at `fa150384f`
 **Verdict:** **PASS**
 
 ## Criteria
