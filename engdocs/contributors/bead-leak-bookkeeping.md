@@ -418,6 +418,11 @@ session aliases already covered by the session row (`adoption_barrier`,
   `mc=730`, while stale non-message counts stayed bounded at `ga=13` and
   `mc=24`. No live reaper mutation was run because the new root path had no
   safe candidates to close.
+- Latest read-only live measurement at 2026-06-01T14:08:45Z: raw
+  `status='open'` wisp counts still exceeded the literal AC (`ga=593`,
+  `mc=795`). Active non-message rows were `ga=597` and `mc=634`, but stale
+  non-message rows remained bounded at `ga=13` and `mc=24`; `gt` and `my_db`
+  remained at zero active wisps. `mc` still had `161` active mail wisps.
 - Dolt compaction remains blocked for `mc` by
   `/data/projects/maintainer-city/.gc/runtime/packs/dolt/compact-quarantine/mc`
   (`post-flatten value hash changed without row-count increase`,
@@ -494,3 +499,6 @@ session aliases already covered by the session row (`adoption_barrier`,
   total (`ga=653M`, `mc=545M`, `gt=33M`, `bd=34M`, `gp=50M`,
   `my_db=59M`). These are explicit manual-review blockers, not remaining
   compactor code paths.
+  A 2026-06-01T14:08:45Z marker/storage recheck found the same two marker
+  files still present; local Dolt storage remained about `1.4G` total
+  (`ga=676M`, `mc=571M`, `gt=33M`, `bd=34M`, `gp=50M`, `my_db=59M`).
