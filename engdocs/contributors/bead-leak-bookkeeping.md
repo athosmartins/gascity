@@ -84,6 +84,13 @@ pool demand, named demand, pool assignment release, store selection, pool
 desired-state wake, and workflow-run API projection readers. The graph-v2 root
 decorators no longer persist `gc.run_target` on new workflow roots; they stamp
 only the canonical `gc.routed_to` delivery key.
+Live legacy roots were backfilled on 2026-06-01T10:58:02Z by grouping exact
+`ga.wisps` workflow-root IDs through the `gc ... bd update` wrapper with
+`--set-metadata gc.routed_to=<run_target>`. The repair covered 139 `ga` roots
+that still had `gc.run_target` with empty `gc.routed_to` (129 closed, 6 in
+progress, 4 open). Post-repair SQL found `0` matching rows in both `ga.wisps`
+and `mc.wisps`, including `0` open or in-progress workflow roots missing the
+canonical delivery key.
 
 `TestGastownIdleOpenBeadCountsStayBounded` now runs in Tier B nightly
 acceptance. `.github/workflows/nightly.yml` schedules the Tier B job daily at
@@ -174,6 +181,10 @@ Dolt log. Unverified legacy markers still stop before any force-push.
 - `go test ./cmd/gc -run 'Test(BatchOnGraphWorkflowStartsWorkflowWithoutRoutingChild|DefaultScaleCheckCountsIgnoresRunTargetOnlyPersistedWork|DefaultScaleCheckCountsAndNamedDemandIgnoresRunTargetOnlyReadyWork|FilterAssignedWorkBeadsForPoolDemandIgnoresRunTargetOnlyWork|StoreForPoolAssignment_IgnoresRunTargetForStoreRouting|ComputePoolDesiredStates_IgnoresRunTargetOnlyWakeDemand|RunTargetRoutedToBackfillCheck|InstantiateSlingFormulaGraphWorkflowPreservesRoutedTo|DoctorCheckNamesGolden|CmdHookIgnoresRunTargetOnlyRoot)$' -count=1`
   passed for the sling-side route stamping, doctor backfill path, hook
   boundary, and routed_to-only runtime reader cleanup.
+- Live route-key verification on 2026-06-01T10:58:02Z found no `ga` or `mc`
+  workflow roots with `gc.run_target` and missing `gc.routed_to` after the
+  scoped backfill. Before repair, `ga` had `139` such roots (`129` closed, `6`
+  in progress, `4` open); `mc` had `0`.
 - `go test ./internal/api -run TestWorkflowProjectionTargetIgnoresRunTarget -count=1`
   passed for workflow-run API projection using the canonical delivery key.
 - `go test ./internal/api -count=1` passed after updating order-feed workflow
@@ -239,11 +250,13 @@ Dolt log. Unverified legacy markers still stop before any force-push.
   `session=24` older than 24h by `created_at`. This live city is not idle, so
   the raw threshold remains a live backlog acceptance gap rather than proof of
   an idle-city leak.
-- Live read-only route-key inspection at 2026-06-01 found `137` `ga.wisps`
-  workflow roots with `gc.run_target` and missing `gc.routed_to`: `128` closed,
-  `5` in progress, and `4` open. `mc.wisps` had `0`. No live backfill mutation
-  was run from this report pass; the new `gc doctor --fix` check is the repair
-  path for those legacy roots.
+- Live route-key inspection and repair at 2026-06-01T10:58:02Z found `139`
+  `ga.wisps` workflow roots with `gc.run_target` and missing `gc.routed_to`:
+  `129` closed, `6` in progress, and `4` open. `mc.wisps` had `0`. The exact
+  `ga` rows were repaired through the `gc ... bd update` wrapper with
+  `--set-metadata gc.routed_to=<run_target>`. Post-repair SQL found `0`
+  matching rows across both `ga` and `mc`, including `0` open or in-progress
+  workflow roots missing `gc.routed_to`.
 - Branch reaper dry-run on the same live server after the stale-only alert
   patch reported `stale_wisps:115`, `mail_wisps:134`, `would_close_wisps:0`,
   and made no escalation mail call with `GC_REAPER_ALERT_THRESHOLD=500`.
