@@ -69,11 +69,14 @@ the bead with `gc.final_disposition=controller_error`, the wrapper preserves
 that disposition instead of re-closing the bead as `control_quarantined`.
 
 `TestGastownIdleOpenBeadCountsStayBounded` now runs in Tier B nightly
-acceptance. It starts an isolated Gastown city with fake sessions, shortens the
-patrol interval, adds a fast formula order and a fast exec order, and samples
-open issue-tier and wisp-tier counts across repeated controller cycles. The
-test fails if either open-count series grows beyond a small transient jitter
-window after warmup.
+acceptance. `.github/workflows/nightly.yml` schedules the Tier B job daily at
+06:00 UTC and calls `make test-acceptance-b`; the Makefile target runs
+`go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b/...`. The
+test starts an isolated Gastown city with fake sessions, shortens the patrol
+interval, adds a fast formula order and a fast exec order, and samples open
+issue-tier and wisp-tier counts across repeated controller cycles. The test
+fails if either open-count series grows beyond a small transient jitter window
+after warmup.
 
 `ga-hiew1` split into two retention checks in this branch. First, the built-in
 Dolt compactor order remains installed and dispatched through the managed Dolt
@@ -94,7 +97,12 @@ targets still skip without querying. This covers cities such as
 managed-by-operator Dolt server on `127.0.0.1:3307`, not a `gc start` managed
 runtime. When a database is already under compaction quarantine, the command now
 prints the marker path, reason, and creation timestamp so the required manual
-review artifact is visible from the failed run output.
+review artifact is visible from the failed run output. Explicit
+`GC_DOLT_COMPACT_ONLY_DBS` entries also seed database discovery, so an operator
+can target a database even when `gc rig list` times out and the local metadata
+fallback misses that rig. Pending-push dry-run now validates marker shape and
+freshness before claiming it would retry a remote push, matching the live retry
+guard.
 
 ## Creation Paths
 
@@ -124,10 +132,13 @@ review artifact is visible from the failed run output.
   and drained-asleep alias changes.
 - `go test ./cmd/gc -run 'TestCmdSessionPrune|TestSessionActionJSONSchema' -count=1`
   passed for the session prune CLI surface.
-- `go test ./examples/dolt -count=1` passed for the compactor endpoint change.
+- `go test ./examples/dolt -count=1` passed for the compactor endpoint,
+  explicit target discovery, and pending-push dry-run marker checks.
 - `go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b -run TestGastownIdleOpenBeadCountsStayBounded`
-  passed on 2026-06-01, proving the nightly idle Gastown regression runs
-  against the current branch.
+  passed on 2026-06-01, proving the idle Gastown regression itself against the
+  current branch. Nightly coverage is wired through
+  `.github/workflows/nightly.yml` -> `make test-acceptance-b` -> the
+  `acceptance_b` Tier B package.
 - `go vet ./...` and `git diff --check` passed.
 - `.githooks/pre-commit` ran with `core.hooksPath=.githooks`; it failed in
   unrelated baseline `cmd/gc` shards. Latest log directory:
@@ -163,14 +174,19 @@ review artifact is visible from the failed run output.
 - Live session-bead inspection on 2026-06-01 found stale `mc` session wisps
   shaped as `state=asleep` plus `sleep_reason=drained` with missing `slept_at`;
   the current patch makes those rows closeable by the reaper's drained-state
-  prune pass. The branch reaper session-state prune has not yet been run
-  destructively against `/data/projects/maintainer-city` after this patch.
-- Live measurement on 2026-06-01T08:47:24Z: `ga` had `729` open non-message
-  rows but only `13` stale non-message rows older than 24h; `mc` had `434`
-  open non-message rows plus `133` mail rows, with only `24` stale non-message
-  rows and `0` drained-session candidates older than 24h by `updated_at`.
-  This is the evidence for changing the reaper page from total open
-  non-message rows to stale non-message rows.
+  prune pass. A non-mutating SQL check at 2026-06-01T09:05:58Z found `0`
+  drained-session candidates older than 24h by `updated_at` in both `ga` and
+  `mc`, so no destructive prune was run. `mc` still has `21` created-old
+  drained-asleep rows whose newest `updated_at` is `2026-06-01 00:40:42`;
+  the reaper intentionally ages them from the terminal-state update timestamp.
+- Live measurement at 2026-06-01T09:05:58Z: raw `status='open'` wisp counts
+  were `ga=645` and `mc=575`, so `ga-k5ds4` remains open under its literal raw
+  threshold AC. The stale leak surface was bounded: `ga` had `661`
+  open/hooked/in-progress non-message rows but only `13` older than 24h; `mc`
+  had `447` open/hooked/in-progress non-message rows plus `136` mail rows, with
+  only `24` non-message rows older than 24h and `0` drained-session candidates
+  older than 24h by `updated_at`. This is the evidence for changing the reaper
+  page from total open non-message rows to stale non-message rows.
 - Branch reaper dry-run on the same live server after the stale-only alert
   patch reported `stale_wisps:115`, `mail_wisps:134`, `would_close_wisps:0`,
   and made no escalation mail call with `GC_REAPER_ALERT_THRESHOLD=500`.
@@ -179,3 +195,13 @@ review artifact is visible from the failed run output.
   (`post-flatten value hash changed without row-count increase`,
   `created_at=2026-05-20T11:14:29Z`). A branch dry-run with
   `GC_DOLT_COMPACT_ONLY_DBS=ga,mc` reached that marker and failed before any GC.
+- `ga` has a stale pending-push marker at
+  `/data/projects/maintainer-city/.gc/runtime/packs/dolt/compact-pending-push/ga`
+  (`flatten and full GC succeeded but remote push failed`,
+  `created_at=2026-05-16T18:03:26Z`). The marker is also legacy/incomplete: it
+  contains no `remote=` field. A branch dry-run with
+  `GC_DOLT_COMPACT_ONLY_DBS=ga` now discovers the explicit `ga` target even
+  though `gc rig list` times out, then fails with
+  `pending_push marker is missing remote — manual intervention required` before
+  any remote push retry. A combined `GC_DOLT_COMPACT_ONLY_DBS=ga,mc` dry-run now
+  reports both blockers in one run and exits with two failed databases.
