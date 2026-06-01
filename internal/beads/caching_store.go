@@ -259,14 +259,6 @@ func NewCachingStoreForTestWithPrefix(backing Store, idPrefix string, onChange f
 	return newCachingStore(backing, idPrefix, onChange)
 }
 
-// IDPrefix returns the bead ID prefix owned by this cache, without trailing "-".
-func (c *CachingStore) IDPrefix() string {
-	if c == nil {
-		return ""
-	}
-	return c.idPrefix
-}
-
 func newCachingStore(backing Store, idPrefix string, onChange func(eventType, beadID string, payload json.RawMessage)) *CachingStore {
 	return &CachingStore{
 		backing:     backing,
@@ -289,6 +281,14 @@ func newCachingStore(backing Store, idPrefix string, onChange func(eventType, be
 
 func defaultCachePrimeRetryDelay(attempt int) time.Duration {
 	return time.Duration(attempt*5) * time.Second
+}
+
+// IDPrefix returns the bead ID prefix owned by this cache's backing store.
+func (c *CachingStore) IDPrefix() string {
+	if c == nil {
+		return ""
+	}
+	return c.idPrefix
 }
 
 func normalizeIDPrefix(prefix string) string {
