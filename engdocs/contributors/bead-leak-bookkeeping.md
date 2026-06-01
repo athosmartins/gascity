@@ -151,6 +151,9 @@ inspection found they can dwarf the actual Noms data even when a database is far
 below the flatten threshold. This cleanup is independent of history flattening:
 dry-run reports the cache it would purge, while a live run removes only that
 cache directory and can still skip flattening for below-threshold databases.
+`GC_DOLT_COMPACT_REMOTE_CACHE_ONLY=1` stops immediately after this rebuildable
+cache cleanup, so operators can reclaim cache bloat without retrying pending
+remote pushes or touching quarantine/pending-GC state.
 
 ## Creation Paths
 
@@ -174,7 +177,7 @@ cache directory and can still skip flattening for below-threshold databases.
 | `cmd/gc/wisp_gc.go` / `wisp autoclose` | Close attached workflow roots and owned workflow beads from CLI-driven cleanup. Purge expired closed wisps, order-tracking beads, and closed graph-v2 workflow-root closures. | Patched to include workflow-root closure GC through indexed metadata queries guarded by `sourceworkflow.IsWorkflowRoot`. |
 | `cmd/gc/order_dispatch.go` | Close order-tracking beads after dispatch attempt completion. | Existing defer is the primary owner; stale tracking-bead bugs should be treated as order-dispatch defects. |
 | `cmd/gc/doctor_run_target_backfill.go` | Mechanical repair for workflow roots with `gc.run_target` but missing `gc.routed_to`. | New `gc doctor --fix` check backfills the canonical claim key without touching non-workflow beads or already-routed roots. |
-| `examples/dolt/commands/compact/run.sh` | Bound Dolt storage by flattening high-commit databases, running full GC, retrying safe pending-push/pending-GC markers, and pruning rebuildable `.dolt/git-remote-cache` directories. | Patched so remote-cache cleanup runs before commit-count skips and before blocking quarantine markers; dry-run reports the exact cache path without deleting it. |
+| `examples/dolt/commands/compact/run.sh` | Bound Dolt storage by flattening high-commit databases, running full GC, retrying safe pending-push/pending-GC markers, and pruning rebuildable `.dolt/git-remote-cache` directories. | Patched so remote-cache cleanup runs before commit-count skips and before blocking quarantine markers; dry-run reports the exact cache path without deleting it; cache-only mode reclaims cache bloat without retrying pending remote pushes. |
 
 ## Verification Snapshot
 
@@ -191,6 +194,11 @@ cache directory and can still skip flattening for below-threshold databases.
   legacy pending-push marker recovery.
 - `go test ./examples/dolt -run 'TestCompactScript(PurgesRemoteCacheBelowThresholdWithoutFlattening|DryRunReportsRemoteCacheWithoutRemoving)$' -count=1`
   failed before the remote-cache cleanup patch and passed after it.
+- `go test ./examples/dolt -run 'TestCompactScriptRemoteCacheOnlySkipsPendingPushRetry$' -count=1`
+  failed before `GC_DOLT_COMPACT_REMOTE_CACHE_ONLY` because a pending-push
+  marker still triggered a remote push retry after cache purge, then passed
+  after cache-only mode left the marker untouched and skipped push/fetch/flatten
+  SQL.
 - `go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b -run TestGastownIdleOpenBeadCountsStayBounded`
   passed on 2026-06-01, proving the idle Gastown regression itself against the
   current branch. Nightly coverage is wired through
@@ -221,7 +229,7 @@ cache directory and can still skip flattening for below-threshold databases.
 - `go vet ./...` and `git diff --check` passed.
 - `.githooks/pre-commit` ran with `core.hooksPath=.githooks`; it failed in
   unrelated baseline `cmd/gc` shards. Latest log directory:
-  `/data/tmp/gc-local-tests.P48tn7`.
+  `/data/tmp/gc-local-tests.ETgSn1`.
 
 ## Remaining Work
 
@@ -302,12 +310,7 @@ cache directory and can still skip flattening for below-threshold databases.
   `local_branch=main`, `remote_branch=main`, proves remote head
   `7kon6u7jt09nhukq4urpqc598am91u5o` is in the local `ga` Dolt log, and exits
   cleanly with `pending_push=present — dry-run (would retry remote push)`. No
-  mutating remote push was run from this report pass. As of
-  2026-06-01T11:24:25Z, `ga` still has a rebuildable
-  `.dolt/git-remote-cache` directory of about `1.2G`; a branch dry-run reports
-  it would purge that cache before retrying the pending remote push, but the
-  live purge was intentionally not run because the non-dry path would also
-  execute the pending-push retry. A combined
+  mutating remote push was run from this report pass. A combined
   `GC_DOLT_COMPACT_ONLY_DBS=ga,mc` dry-run now exits nonzero only because of the
   remaining `mc` quarantine; `ga` reaches the recoverable dry-run retry path.
 - Live remote-cache remediation on 2026-06-01T11:24:25Z used the branch
@@ -320,6 +323,17 @@ cache directory and can still skip flattening for below-threshold databases.
   database hash `3mkjngdd1bt41a7absg1acpngnkbkht4`. Additional live runs
   purged remote caches for `mc`, `bd`, `gp`, and `my_db`; `mc` still stopped on
   its integrity quarantine before any GC. Local Dolt storage dropped from about
-  `21G` before the `gt` purge to `3.1G` after the cache purges. The remaining
-  per-database sizes are dominated by `ga=2.3G` and `mc=1.8G`, with only `ga`
-  still showing a `.dolt/git-remote-cache` directory.
+  `21G` before the `gt` purge to `3.1G` after those cache purges.
+- Live `ga` remote-cache remediation on 2026-06-01T11:37:55Z used
+  `GC_DOLT_COMPACT_REMOTE_CACHE_ONLY=1` with `GC_DOLT_COMPACT_ONLY_DBS=ga`.
+  Dry-run first reported it would purge
+  `/data/services/gascity-local-dolt/ga/.dolt/git-remote-cache` and then skip
+  compaction state checks. The live cache-only run purged that directory without
+  retrying the pending remote push. Post-run SQL still showed `ga` clean at `0`
+  status rows with `4789` commits and database hash
+  `a7508lcjajm1sicm5qh0qvsdapdgev69`; the legacy pending-push marker remained
+  present for an explicit future push decision. After this pass no
+  `.dolt/git-remote-cache` directories remained under
+  `/data/services/gascity-local-dolt`, and local Dolt storage was about `1.8G`
+  total (`ga=1.2G`, `mc=498M`, `gt=33M`, `bd=34M`, `gp=46M`,
+  `my_db=59M`).

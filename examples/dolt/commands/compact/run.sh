@@ -78,6 +78,9 @@
 #   GC_DOLT_COMPACT_DRY_RUN              (optional) — when set, prints
 #                                         what would happen but does not
 #                                         execute any DOLT_RESET / COMMIT.
+#   GC_DOLT_COMPACT_REMOTE_CACHE_ONLY    (optional) — when set, purge
+#                                         rebuildable git remote caches and skip
+#                                         pending push/GC and flatten checks.
 #   GC_DOLT_COMPACT_ONLY_DBS              (optional) — comma-separated list of
 #                                         database names to compact. When set,
 #                                         all other databases are skipped.
@@ -178,7 +181,17 @@ push_timeout="${GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS:-120}"
 pending_push_max_age_secs="${GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS:-172800}"
 compact_remote="${GC_DOLT_COMPACT_REMOTE:-}"
 dry_run="${GC_DOLT_COMPACT_DRY_RUN:-}"
+remote_cache_only="${GC_DOLT_COMPACT_REMOTE_CACHE_ONLY:-}"
 only_dbs="${GC_DOLT_COMPACT_ONLY_DBS:-}"
+
+case "$remote_cache_only" in
+  ''|0|false|FALSE|no|NO)
+    remote_cache_only=""
+    ;;
+  *)
+    remote_cache_only=1
+    ;;
+esac
 
 case "$threshold_commits" in
   ''|*[!0-9]*)
@@ -1455,6 +1468,10 @@ flatten_database() {
   fi
 
   purge_remote_cache "$db" || return 1
+  if [ -n "$remote_cache_only" ]; then
+    printf 'compact: db=%s remote_cache_only=1 — skip compaction state checks\n' "$db"
+    return 0
+  fi
 
   if has_compact_marker "$quarantine_dir" "$db"; then
     quarantine_marker=$(compact_marker_path "$quarantine_dir" "$db")

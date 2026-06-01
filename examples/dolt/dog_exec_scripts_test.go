@@ -164,6 +164,7 @@ func (f compactScriptFixture) run(t *testing.T, mode string, extraEnv ...string)
 		"GC_DOLT_COMPACT_DRY_RUN",
 		"GC_DOLT_COMPACT_ONLY_DBS",
 		"GC_DOLT_COMPACT_REMOTE",
+		"GC_DOLT_COMPACT_REMOTE_CACHE_ONLY",
 		"GC_FAKE_DOLT_COMPACT_MODE",
 		"GC_FAKE_DOLT_COUNT_FILE",
 		"GC_FAKE_DOLT_STATE_FILE",
@@ -897,6 +898,64 @@ func TestCompactScriptDryRunReportsRemoteCacheWithoutRemoving(t *testing.T) {
 	}
 	if _, err := os.Stat(cacheFile); err != nil {
 		t.Fatalf("dry-run should leave remote cache in place: %v", err)
+	}
+}
+
+func TestCompactScriptRemoteCacheOnlySkipsPendingPushRetry(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	cacheFile := filepath.Join(fixture.dataDir, "beads", ".dolt", "git-remote-cache", "cache", "repo.git", "objects", "pack", "pack.pack")
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0o755); err != nil {
+		t.Fatalf("mkdir remote cache fixture: %v", err)
+	}
+	if err := os.WriteFile(cacheFile, []byte("cached remote pack"), 0o644); err != nil {
+		t.Fatalf("write remote cache fixture: %v", err)
+	}
+
+	pendingPush := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-push", "beads")
+	if err := os.MkdirAll(filepath.Dir(pendingPush), 0o755); err != nil {
+		t.Fatalf("mkdir pending-push fixture: %v", err)
+	}
+	if err := os.WriteFile(pendingPush, []byte(
+		"db=beads\n"+
+			"reason=flatten and full GC succeeded but remote push failed\n"+
+			"created_at="+time.Now().UTC().Format("2006-01-02T15:04:05Z")+"\n"+
+			"remote=origin\n"+
+			"expected_remote_head=headcommit\n"+
+			"expected_remote_head_verified=1\n"+
+			"compacted_from_head=headcommit\n"+
+			"local_branch=main\n"+
+			"remote_branch=main\n",
+	), 0o600); err != nil {
+		t.Fatalf("write pending-push fixture: %v", err)
+	}
+
+	out, err := fixture.run(t, "remote_success",
+		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500",
+		"GC_DOLT_COMPACT_REMOTE_CACHE_ONLY=1",
+	)
+	if err != nil {
+		t.Fatalf("remote-cache-only compact failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "remote_cache=purged") ||
+		!strings.Contains(out, "remote_cache_only=1") {
+		t.Fatalf("output missing remote-cache-only notices:\n%s", out)
+	}
+	cacheDir := filepath.Join(fixture.dataDir, "beads", ".dolt", "git-remote-cache")
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("remote cache should be removed, stat=%v", err)
+	}
+	if _, err := os.Stat(pendingPush); err != nil {
+		t.Fatalf("remote-cache-only must leave pending-push marker for explicit retry: %v", err)
+	}
+	data, err := os.ReadFile(fixture.doltLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(data)
+	for _, forbidden := range []string{"DOLT_PUSH", "DOLT_FETCH", "DOLT_RESET", "DOLT_COMMIT"} {
+		if strings.Contains(log, forbidden) {
+			t.Fatalf("remote-cache-only must not run %s:\n%s", forbidden, log)
+		}
 	}
 }
 
