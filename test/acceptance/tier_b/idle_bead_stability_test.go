@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 )
 
 func TestGastownIdleOpenBeadCountsStayBounded(t *testing.T) {
+	probe := idleBeadStabilityProbeConfig(t)
 	env := newIsolatedTierBEnv(t, "fake")
 	c := helpers.NewCity(t, env)
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "gastown"))
@@ -43,11 +45,11 @@ func TestGastownIdleOpenBeadCountsStayBounded(t *testing.T) {
 		t.Fatalf("idle probe order did not create a wisp within 30s; last snapshot: %s", activity)
 	}
 
-	time.Sleep(3 * time.Second)
-	samples := make([]beadCountSnapshot, 0, 8)
-	for i := 0; i < 8; i++ {
+	time.Sleep(probe.Warmup)
+	samples := make([]beadCountSnapshot, 0, probe.Samples)
+	for i := 0; i < probe.Samples; i++ {
 		samples = append(samples, readOpenBeadSnapshot(t, c.Dir))
-		time.Sleep(2 * time.Second)
+		time.Sleep(probe.Interval)
 	}
 
 	first := samples[0]
@@ -69,6 +71,64 @@ func TestGastownIdleOpenBeadCountsStayBounded(t *testing.T) {
 	if maxWisps > first.OpenWisps+toleratedOpenJitter || last.OpenWisps > first.OpenWisps+toleratedOpenJitter {
 		t.Fatalf("open wisp count grew during idle cycles:\n%s", formatBeadCountSnapshots(samples))
 	}
+}
+
+func TestIdleBeadStabilityProbeConfigReadsNightlyOverrides(t *testing.T) {
+	t.Setenv("GC_IDLE_BEAD_STABILITY_WARMUP", "10s")
+	t.Setenv("GC_IDLE_BEAD_STABILITY_SAMPLES", "36")
+	t.Setenv("GC_IDLE_BEAD_STABILITY_INTERVAL", "5s")
+
+	got := idleBeadStabilityProbeConfig(t)
+	if got.Warmup != 10*time.Second {
+		t.Fatalf("Warmup = %s, want 10s", got.Warmup)
+	}
+	if got.Samples != 36 {
+		t.Fatalf("Samples = %d, want 36", got.Samples)
+	}
+	if got.Interval != 5*time.Second {
+		t.Fatalf("Interval = %s, want 5s", got.Interval)
+	}
+}
+
+type idleBeadStabilityProbe struct {
+	Warmup   time.Duration
+	Samples  int
+	Interval time.Duration
+}
+
+func idleBeadStabilityProbeConfig(t *testing.T) idleBeadStabilityProbe {
+	t.Helper()
+	return idleBeadStabilityProbe{
+		Warmup:   idleProbeDurationEnv(t, "GC_IDLE_BEAD_STABILITY_WARMUP", 3*time.Second),
+		Samples:  idleProbeSamplesEnv(t, "GC_IDLE_BEAD_STABILITY_SAMPLES", 8),
+		Interval: idleProbeDurationEnv(t, "GC_IDLE_BEAD_STABILITY_INTERVAL", 2*time.Second),
+	}
+}
+
+func idleProbeDurationEnv(t *testing.T, key string, fallback time.Duration) time.Duration {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		t.Fatalf("%s must be a positive Go duration, got %q", key, raw)
+	}
+	return d
+}
+
+func idleProbeSamplesEnv(t *testing.T, key string, fallback int) int {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 2 {
+		t.Fatalf("%s must be an integer >= 2, got %q", key, raw)
+	}
+	return n
 }
 
 func newIsolatedTierBEnv(t *testing.T, sessionProvider string) *helpers.Env {

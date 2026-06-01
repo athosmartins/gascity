@@ -74,9 +74,12 @@ acceptance. `.github/workflows/nightly.yml` schedules the Tier B job daily at
 `go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b/...`. The
 test starts an isolated Gastown city with fake sessions, shortens the patrol
 interval, adds a fast formula order and a fast exec order, and samples open
-issue-tier and wisp-tier counts across repeated controller cycles. The test
-fails if either open-count series grows beyond a small transient jitter window
-after warmup.
+issue-tier and wisp-tier counts across repeated controller cycles. Local runs
+keep the fast default window (`3s` warmup, `8` samples, `2s` interval). The
+nightly workflow overrides that to `10s` warmup, `36` samples, and a `5s`
+interval so the scheduled regression watches the idle city for roughly three
+minutes. The test fails if either open-count series grows beyond a small
+transient jitter window after warmup.
 
 `ga-hiew1` split into two retention checks in this branch. First, the built-in
 Dolt compactor order remains installed and dispatched through the managed Dolt
@@ -142,11 +145,15 @@ Dolt log. Unverified legacy markers still stop before any force-push.
   passed on 2026-06-01, proving the idle Gastown regression itself against the
   current branch. Nightly coverage is wired through
   `.github/workflows/nightly.yml` -> `make test-acceptance-b` -> the
-  `acceptance_b` Tier B package.
+  `acceptance_b` Tier B package, with nightly-only long-run overrides for the
+  idle stability window.
+- `go test -tags acceptance_b -timeout 3m ./test/acceptance/tier_b -run 'Test(IdleBeadStabilityProbeConfigReadsNightlyOverrides|GastownIdleOpenBeadCountsStayBounded)$' -count=1`
+  passed for the nightly idle-probe override parser and the default-duration
+  idle stability probe.
 - `go vet ./...` and `git diff --check` passed.
 - `.githooks/pre-commit` ran with `core.hooksPath=.githooks`; it failed in
   unrelated baseline `cmd/gc` shards. Latest log directory:
-  `/data/tmp/gc-local-tests.Ifz8Nk`.
+  `/data/tmp/gc-local-tests.8FkCAz`.
 
 ## Remaining Work
 
@@ -191,6 +198,15 @@ Dolt log. Unverified legacy markers still stop before any force-push.
   only `24` non-message rows older than 24h and `0` drained-session candidates
   older than 24h by `updated_at`. This is the evidence for changing the reaper
   page from total open non-message rows to stale non-message rows.
+- Live re-measurement at 2026-06-01T09:54:06Z: raw `status='open'` wisp counts
+  were `ga=576` and `mc=614`. The rows above 500 were still dominated by live
+  workflow/mail load rather than reaper-eligible stale step wisps: `ga` open
+  rows were `spec=444`, `task=129`, `convoy=3`, with only `task=9` and
+  `convoy=3` older than 24h by `created_at`; `mc` open rows were `task=344`,
+  `message=142`, `spec=89`, `session=39`, with only `message=78` and
+  `session=24` older than 24h by `created_at`. This live city is not idle, so
+  the raw threshold remains a live backlog acceptance gap rather than proof of
+  an idle-city leak.
 - Branch reaper dry-run on the same live server after the stale-only alert
   patch reported `stale_wisps:115`, `mail_wisps:134`, `would_close_wisps:0`,
   and made no escalation mail call with `GC_REAPER_ALERT_THRESHOLD=500`.
