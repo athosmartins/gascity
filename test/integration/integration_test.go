@@ -89,12 +89,24 @@ func TestMain(m *testing.M) {
 
 	subprocess := os.Getenv("GC_SESSION") == "subprocess"
 
+	// Build gc binary to a temp directory.
+	tmpDir, err := os.MkdirTemp("", "gc-integration-*")
+	if err != nil {
+		panic("integration: creating temp dir: " + err.Error())
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := tmuxtest.ConfigureProcessEnv(filepath.Join(tmpDir, "tmux")); err != nil {
+		panic("integration: configuring tmux test env: " + err.Error())
+	}
+
 	// Tmux check: skip all tests if tmux not available AND not using subprocess.
 	if !subprocess {
 		if _, err := exec.LookPath("tmux"); err != nil {
+			_ = os.RemoveAll(tmpDir)
 			os.Exit(0)
 		}
-		// Pre-sweep: kill any orphaned gc-gctest-* sessions from prior crashes.
+		// Pre-sweep: kill this run's root plus stale sibling orphans.
 		tmuxtest.KillAllTestSessions(&mainTB{})
 	} else {
 		// Best-effort pre-sweep of stale subprocess integration cities and
@@ -103,13 +115,6 @@ func TestMain(m *testing.M) {
 	}
 	stopSignalSweeper := installIntegrationSignalSweeper(subprocess)
 	defer stopSignalSweeper()
-
-	// Build gc binary to a temp directory.
-	tmpDir, err := os.MkdirTemp("", "gc-integration-*")
-	if err != nil {
-		panic("integration: creating temp dir: " + err.Error())
-	}
-	defer os.RemoveAll(tmpDir)
 
 	testGCHome = filepath.Join(tmpDir, "gc-home")
 	if err := os.MkdirAll(testGCHome, 0o755); err != nil {
@@ -206,6 +211,7 @@ func TestMain(m *testing.M) {
 		sweepSubprocessTestProcesses()
 	}
 
+	_ = os.RemoveAll(tmpDir)
 	os.Exit(code)
 }
 
