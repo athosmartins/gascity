@@ -1007,6 +1007,61 @@ func TestCompactScriptPreservesRemoteCacheBeforePendingPushRetry(t *testing.T) {
 	}
 }
 
+func TestCompactScriptRunsLocalFullGCBeforePendingPushRetry(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	oldgenFile := filepath.Join(fixture.dataDir, "beads", ".dolt", "noms", "oldgen", "archive")
+	if err := os.MkdirAll(filepath.Dir(oldgenFile), 0o755); err != nil {
+		t.Fatalf("mkdir oldgen fixture: %v", err)
+	}
+	if err := os.WriteFile(oldgenFile, []byte("orphaned oldgen data"), 0o644); err != nil {
+		t.Fatalf("write oldgen fixture: %v", err)
+	}
+
+	pendingPush := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-push", "beads")
+	if err := os.MkdirAll(filepath.Dir(pendingPush), 0o755); err != nil {
+		t.Fatalf("mkdir pending-push fixture: %v", err)
+	}
+	if err := os.WriteFile(pendingPush, []byte(
+		"db=beads\n"+
+			"reason=flatten and full GC succeeded but remote push failed\n"+
+			"created_at="+time.Now().UTC().Format("2006-01-02T15:04:05Z")+"\n"+
+			"remote=origin\n"+
+			"expected_remote_head=headcommit\n"+
+			"expected_remote_head_verified=1\n"+
+			"compacted_from_head=headcommit\n"+
+			"local_branch=main\n"+
+			"remote_branch=main\n",
+	), 0o600); err != nil {
+		t.Fatalf("write pending-push fixture: %v", err)
+	}
+
+	out, err := fixture.run(t, "remote_fetch_failure", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("pending-push retry should keep fetch failure recoverable after local GC: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "pending_push oldgen_archives=present") ||
+		!strings.Contains(out, "pending-push local-GC") {
+		t.Fatalf("output missing pending-push local-GC evidence:\n%s", out)
+	}
+	if _, err := os.Stat(oldgenFile); !os.IsNotExist(err) {
+		t.Fatalf("pending-push local full GC should reclaim oldgen fixture, stat=%v", err)
+	}
+	if _, err := os.Stat(pendingPush); err != nil {
+		t.Fatalf("failed remote fetch should keep pending-push marker: %v", err)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "CALL DOLT_GC('--full')") {
+		t.Fatalf("pending-push retry should run local full GC before remote repair:\n%s", log)
+	}
+	if strings.Contains(log, "DOLT_RESET") || strings.Contains(log, "DOLT_COMMIT") {
+		t.Fatalf("pending-push local full GC must not flatten again:\n%s", log)
+	}
+}
+
 func TestCompactScriptDefaultThresholdIs2000(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "success")

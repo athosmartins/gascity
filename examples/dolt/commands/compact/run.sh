@@ -50,7 +50,10 @@
 #
 # Remote push failures are recorded in compact-pending-push markers and do not
 # fail local compaction. Later runs retry those markers before threshold skips,
-# and unverified remote heads must become ancestry-verifiable before push.
+# and unverified remote heads must become ancestry-verifiable before push. If
+# orphaned oldgen archives are present while a pending push blocks normal
+# threshold-based compaction, the retry path runs a local full GC before the
+# remote repair attempt; that reclaims local storage without flattening again.
 # Surgical mode (preserve recent N commits via interactive rebase) is
 # intentionally not implemented; flatten is sufficient for bloat recovery
 # and avoids the rebase-vs-concurrent-write hazards.
@@ -1622,6 +1625,15 @@ flatten_database() {
     fi
     if [ "$legacy_pending_push_recovered" != "1" ]; then
       ensure_remote_push_retry_fresh "$pending_push_dir" "$db" "pending_push" || return 1
+    fi
+    if oldgen_has_files "$db"; then
+      if [ -n "$dry_run" ]; then
+        printf 'compact: db=%s pending_push oldgen_archives=present — dry-run (would run local DOLT_GC --full before remote push retry)\n' "$db"
+      else
+        printf 'compact: db=%s pending_push oldgen_archives=present — running local DOLT_GC --full before remote push retry\n' "$db"
+        start=$(date +%s)
+        run_full_gc "$db" "pending-push local-GC" "pending-push local-GC" "$start" || return 1
+      fi
     fi
     if [ -n "$dry_run" ]; then
       printf 'compact: db=%s pending_push=present — dry-run (would retry remote push)\n' "$db"

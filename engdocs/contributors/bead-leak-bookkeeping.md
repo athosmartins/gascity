@@ -158,6 +158,12 @@ immediately after this rebuildable cache cleanup, so operators can reclaim cache
 bloat without retrying pending remote pushes or touching quarantine/pending-GC
 state.
 
+Pending-push retry now also runs local `DOLT_GC('--full')` first when oldgen
+archives are present. That lets a locally compacted database keep reclaiming
+storage even if the remote repair remains blocked, while still avoiding another
+flatten and preserving the pending-push marker until a remote fetch/push
+succeeds.
+
 ## Creation Paths
 
 | Path | Beads opened | Bookkeeping owner |
@@ -180,7 +186,7 @@ state.
 | `cmd/gc/wisp_gc.go` / `wisp autoclose` | Close attached workflow roots and owned workflow beads from CLI-driven cleanup. Purge expired closed wisps, order-tracking beads, and closed graph-v2 workflow-root closures. | Patched to include workflow-root closure GC through indexed metadata queries guarded by `sourceworkflow.IsWorkflowRoot`. |
 | `cmd/gc/order_dispatch.go` | Close order-tracking beads after dispatch attempt completion. | Existing defer is the primary owner; stale tracking-bead bugs should be treated as order-dispatch defects. |
 | `cmd/gc/doctor_run_target_backfill.go` | Mechanical repair for workflow roots with `gc.run_target` but missing `gc.routed_to`. | New `gc doctor --fix` check backfills the canonical claim key without touching non-workflow beads or already-routed roots. |
-| `examples/dolt/commands/compact/run.sh` | Bound Dolt storage by flattening high-commit databases, running full GC, retrying safe pending-push/pending-GC markers, and pruning rebuildable `.dolt/git-remote-cache` directories. | Patched so remote-cache cleanup runs before commit-count skips and before blocking quarantine markers, while preserving the cache during pending remote repair retries; dry-run reports the exact cache path without deleting it; cache-only mode reclaims cache bloat without retrying pending remote pushes. |
+| `examples/dolt/commands/compact/run.sh` | Bound Dolt storage by flattening high-commit databases, running full GC, retrying safe pending-push/pending-GC markers, and pruning rebuildable `.dolt/git-remote-cache` directories. | Patched so remote-cache cleanup runs before commit-count skips and before blocking quarantine markers, while preserving the cache during pending remote repair retries; pending-push retry runs local full GC when oldgen archives are present; dry-run reports exact cache and local-GC actions; cache-only mode reclaims cache bloat without retrying pending remote pushes. |
 
 ## Verification Snapshot
 
@@ -207,6 +213,11 @@ state.
   purged `.dolt/git-remote-cache` and the retry fetch failed before push; it
   passed after default pending-push retry preserved the remote cache and cleared
   the marker.
+- `go test ./examples/dolt -run 'TestCompactScriptRunsLocalFullGCBeforePendingPushRetry$' -count=1`
+  failed before the pending-push local-GC patch because a pending remote repair
+  skipped full GC and left oldgen archives in place; it passed after the retry
+  path reclaimed oldgen without flattening again and kept the marker when remote
+  fetch still failed.
 - `go test -tags acceptance_b -timeout 10m -v ./test/acceptance/tier_b -run TestGastownIdleOpenBeadCountsStayBounded`
   passed on 2026-06-01, proving the idle Gastown regression itself against the
   current branch. Nightly coverage is wired through
@@ -237,7 +248,7 @@ state.
 - `go vet ./...` and `git diff --check` passed.
 - `.githooks/pre-commit` ran with `core.hooksPath=.githooks`; it failed in
   unrelated baseline `cmd/gc` shards. Latest log directory:
-  `/data/tmp/gc-local-tests.fodGTC`.
+  `/data/tmp/gc-local-tests.fUVGF1`.
 
 ## Remaining Work
 
@@ -352,3 +363,18 @@ state.
   runs do not delete the cache immediately before a remote repair; the existing
   `ga` marker still requires an explicit remote-cache reinitialization or remote
   repair decision before retrying the stale push.
+- Live `ga` pending-push local-GC remediation on 2026-06-01T11:57:16Z used the
+  branch compactor with `GC_DOLT_DATA_DIR=/data/services/gascity-local-dolt`,
+  `GC_DOLT_MANAGED_LOCAL=0`, and `GC_DOLT_COMPACT_ONLY_DBS=ga`. Dry-run first
+  reported `pending_push oldgen_archives=present`. The live run completed
+  `DOLT_GC('--full')` in `11s`, then attempted the existing remote repair and
+  failed at `DOLT_FETCH('origin')` because the remote cache still needs
+  reinitialization. The marker was preserved and upgraded with
+  `remote=origin`, `expected_remote_head=7kon6u7jt09nhukq4urpqc598am91u5o`,
+  `expected_remote_head_verified=1`, `local_branch=main`, and
+  `remote_branch=main`; a subsequent dry-run now stops on the stale full marker
+  age guard before any force-push. Post-run SQL showed `ga` clean at `0` status
+  rows with `4793` commits and database hash
+  `2od9635iqrpmfvs92gthl4bftgacr28j`. Local Dolt storage dropped to about
+  `1.2G` total, with `ga=521M` and `mc=516M`; no `.dolt/git-remote-cache`
+  directories remained.
