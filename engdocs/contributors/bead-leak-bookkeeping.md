@@ -196,7 +196,13 @@ still refuses to create arbitrary paths from a malformed error message.
 | `internal/mail/beadmail` mail provider | Ephemeral message beads for sends and replies. | Mail is user/controller work, not stale non-message workflow debris. Reaper excludes messages from the non-message leak alert and tracks mail backlog through the separate mail-wisp threshold. |
 | `internal/extmsg/*_service.go` external-messaging projections | Task-typed mirror beads for transcript entries/state, bindings, memberships, groups, group participants, and delivery context. | These are projection/state rows. Binding, membership, and participant services close superseded or removed rows explicitly; transcript/state rows are retention data and should be bounded by an extmsg-specific retention policy, not generic wisp age cleanup. |
 | `cmd/gc/convergence_store.go` convergence loop | `convergence` beads with `Status=in_progress` for manual convergence loops. | The convergence handler writes terminal metadata and state on approval, stop, or no-convergence. Reconcile paths repair partial/orphaned convergence state; these are not reaper-owned workflow wisps. |
-| Convoy and API helper paths under `cmd/gc/` and `internal/api/` | User-visible issue-tier convoys/tasks plus dependency edges such as `tracks`. | User/controller workflow owns closure. These are not age-reaped unless they are wisp-tier stale closure candidates. |
+| Manual/API task and convoy creators in `cmd/gc/cmd_bd_store_bridge.go`, `cmd/gc/cmd_handoff.go`, `cmd/gc/cmd_prompt.go`, `cmd/gc/cmd_sling.go`, `cmd/gc/cmd_convoy.go`, `internal/convoy/convoy.go`, `internal/api/huma_handlers_beads.go`, and `internal/api/huma_handlers_convoys.go` | User-visible issue-tier tasks, prompt-synthesis tasks, handoff tasks, auto-convoys, and explicit convoys, often with `tracks` dependencies. | User/controller workflow owns closure. These are not age-reaped unless they are wisp-tier stale closure candidates; convoy `check`/`autoclose` handles owned convoys whose tracked work is terminal. |
+
+The creation-path table above was cross-checked against non-test
+`Create(beads.Bead...)` call sites on 2026-06-01. The remaining unlisted
+matches are storage wrappers (`bead_policy_store`, bead stores themselves) or
+session aliases already covered by the session row (`adoption_barrier`,
+`session_name_lookup`, `session_beads`).
 
 ## Cleanup Paths
 
