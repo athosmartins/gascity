@@ -1,8 +1,8 @@
 # S6: Anti-requirements — Dolt/beads Feature Usage Audit
 
-**Spike:** `ga-aec8q.6`  
-**Date:** 2026-05-22  
-**Author:** gascity/architect  
+**Spike:** `ga-aec8q.6`
+**Date:** 2026-05-22
+**Author:** gascity/architect
 **Method:** Static code analysis — exhaustive `grep` across all `*.go` production files (non-test) in `internal/` and `cmd/gc/`, cross-referenced with architecture docs (`engdocs/design/beads-dolt-contract-redesign.md`, `engdocs/architecture/beads.md`), and persistent memory about the live HQ Dolt topology.
 
 ---

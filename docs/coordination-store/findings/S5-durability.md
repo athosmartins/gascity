@@ -1,8 +1,8 @@
 # S5: Durability & Restart-Resilience Matrix
 
-**Spike:** `ga-aec8q.5`  
-**Date:** 2026-05-22  
-**Author:** gascity/architect  
+**Spike:** `ga-aec8q.5`
+**Date:** 2026-05-22
+**Author:** gascity/architect
 **Method:** Static code analysis — `internal/beads/`, `internal/session/`, `internal/events/`, `cmd/gc/session_reconciler.go`, `cmd/gc/wisp_gc.go`, `cmd/gc/order_dispatch.go`, `internal/citylayout/`, `internal/sessionlog/`
 
 ---
