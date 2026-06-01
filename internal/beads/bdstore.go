@@ -1823,7 +1823,8 @@ func (s *BdStore) Children(parentID string, opts ...QueryOpt) ([]Bead, error) {
 	})
 }
 
-// Ready returns open ready beads via bd ready.
+// Ready returns open ready beads via bd ready, including ephemeral rows for
+// wisp-aware tier modes.
 func (s *BdStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 	q := readyQueryFromArgs(query)
 	includeEphemeral := q.TierMode == TierBoth || q.TierMode == TierWisps
@@ -1865,8 +1866,12 @@ func bdReadyArgs(q ReadyQuery, includeEphemeral bool) []string {
 	if q.Assignee != "" {
 		args = append(args, "--assignee", q.Assignee)
 	}
-	if q.Limit > 0 {
-		args = append(args, "--limit", strconv.Itoa(q.Limit))
+	cliLimit := q.Limit
+	if q.TierMode == TierWisps && q.Limit > 0 {
+		cliLimit = 0
+	}
+	if cliLimit > 0 {
+		args = append(args, "--limit", strconv.Itoa(cliLimit))
 	} else {
 		args = append(args, "--limit", "0")
 	}

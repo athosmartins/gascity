@@ -829,6 +829,145 @@ func TestReady(t *testing.T) {
 	}
 }
 
+func TestReady_wispsRequestsEphemeralRows(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "ready-args.txt")
+	script := writeScript(t, dir, `
+op="$1"; shift
+case "$op" in
+  ready)
+    printf '%s\n' "$*" > "`+argsFile+`"
+    case " $* " in
+      *" --include-ephemeral "*)
+        echo '[{"id":"EX-issue","title":"regular","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"},{"id":"EX-wisp","title":"wisp","status":"open","type":"task","created_at":"2026-02-27T10:01:00Z","ephemeral":true}]'
+        ;;
+      *)
+        echo '[{"id":"EX-issue","title":"regular","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"}]'
+        ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	s := NewStore(script)
+
+	got, err := s.Ready(beads.ReadyQuery{TierMode: beads.TierWisps})
+	if err != nil {
+		t.Fatalf("Ready(TierWisps): %v", err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if !strings.Contains(string(args), "--include-ephemeral") {
+		t.Fatalf("ready args = %q, want --include-ephemeral", string(args))
+	}
+	if len(got) != 1 || got[0].ID != "EX-wisp" {
+		t.Fatalf("Ready(TierWisps) = %+v, want only EX-wisp", got)
+	}
+}
+
+func TestReady_tierBothRequestsEphemeralRows(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "ready-args.txt")
+	script := writeScript(t, dir, `
+op="$1"; shift
+case "$op" in
+  ready)
+    printf '%s\n' "$*" > "`+argsFile+`"
+    case " $* " in
+      *" --include-ephemeral "*)
+        echo '[{"id":"EX-issue","title":"regular","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"},{"id":"EX-wisp","title":"wisp","status":"open","type":"task","created_at":"2026-02-27T10:01:00Z","ephemeral":true}]'
+        ;;
+      *)
+        echo '[{"id":"EX-issue","title":"regular","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"}]'
+        ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	s := NewStore(script)
+
+	got, err := s.Ready(beads.ReadyQuery{TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("Ready(TierBoth): %v", err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if !strings.Contains(string(args), "--include-ephemeral") {
+		t.Fatalf("ready args = %q, want --include-ephemeral", string(args))
+	}
+	if len(got) != 2 {
+		t.Fatalf("Ready(TierBoth) returned %d beads, want durable and ephemeral rows: %+v", len(got), got)
+	}
+	if got[0].ID != "EX-issue" || got[1].ID != "EX-wisp" {
+		t.Fatalf("Ready(TierBoth) = %+v, want EX-issue then EX-wisp", got)
+	}
+}
+
+func TestReady_includeEphemeralUnsupportedReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, `
+op="$1"; shift
+case "$op" in
+  ready)
+    case " $* " in
+      *" --include-ephemeral "*)
+        echo "unsupported flag: --include-ephemeral" >&2
+        exit 1
+        ;;
+      *)
+        echo '[{"id":"EX-issue","title":"regular","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"}]'
+        ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	s := NewStore(script)
+
+	_, err := s.Ready(beads.ReadyQuery{TierMode: beads.TierBoth})
+	if err == nil {
+		t.Fatal("Ready(TierBoth) succeeded with a script that rejected --include-ephemeral, want error")
+	}
+	if !strings.Contains(err.Error(), "unsupported flag: --include-ephemeral") {
+		t.Fatalf("Ready(TierBoth) error = %q, want unsupported flag context", err)
+	}
+}
+
+func TestReady_includeEphemeralExit2ReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	script := writeScript(t, dir, `
+op="$1"; shift
+case "$op" in
+  ready)
+    case " $* " in
+      *" --include-ephemeral "*)
+        echo "unknown argument: --include-ephemeral" >&2
+        exit 2
+        ;;
+      *)
+        echo '[{"id":"EX-issue","title":"regular","status":"open","type":"task","created_at":"2026-02-27T10:00:00Z"}]'
+        ;;
+    esac
+    ;;
+  *) exit 2 ;;
+esac
+`)
+	s := NewStore(script)
+
+	_, err := s.Ready(beads.ReadyQuery{TierMode: beads.TierBoth})
+	if err == nil {
+		t.Fatal("Ready(TierBoth) succeeded after ready --include-ephemeral exited 2, want error")
+	}
+	if !strings.Contains(err.Error(), "unknown argument: --include-ephemeral") {
+		t.Fatalf("Ready(TierBoth) error = %q, want exit-2 stderr context", err)
+	}
+}
+
 func TestReady_treatsMissingOrEmptyStatusAsOpen(t *testing.T) {
 	dir := t.TempDir()
 	script := writeScript(t, dir, `
