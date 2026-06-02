@@ -3411,6 +3411,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeRequestResultSessionMessage) | ({
     type: 'request.result.session.submit';
 } & TypedEventStreamEnvelopeRequestResultSessionSubmit) | ({
+    type: 'session.cold_start_timeout';
+} & TypedEventStreamEnvelopeSessionColdStartTimeout) | ({
     type: 'session.crashed';
 } & TypedEventStreamEnvelopeSessionCrashed) | ({
     type: 'session.drain_acked_with_assigned_work';
@@ -4037,6 +4039,20 @@ export type TypedEventStreamEnvelopeRequestResultSessionSubmit = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.cold_start_timeout
+ */
+export type TypedEventStreamEnvelopeSessionColdStartTimeout = {
+    actor: string;
+    message?: string;
+    payload: NoPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.cold_start_timeout';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.crashed
  */
 export type TypedEventStreamEnvelopeSessionCrashed = {
@@ -4362,6 +4378,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeRequestResultSessionMessage) | ({
     type: 'request.result.session.submit';
 } & TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit) | ({
+    type: 'session.cold_start_timeout';
+} & TypedTaggedEventStreamEnvelopeSessionColdStartTimeout) | ({
     type: 'session.crashed';
 } & TypedTaggedEventStreamEnvelopeSessionCrashed) | ({
     type: 'session.drain_acked_with_assigned_work';
@@ -5026,6 +5044,21 @@ export type TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit = {
     subject?: string;
     ts: string;
     type: 'request.result.session.submit';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.cold_start_timeout
+ */
+export type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: NoPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'session.cold_start_timeout';
     workflow?: WorkflowEventProjection;
 };
 
