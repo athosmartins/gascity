@@ -358,7 +358,7 @@ func ListWorkflowBeads(store beads.Store, rootID string) ([]beads.Bead, error) {
 	if store == nil || rootID == "" {
 		return nil, nil
 	}
-	root, err := store.Get(rootID)
+	root, err := beads.HandlesFor(store).Live.Get(rootID)
 	if err != nil {
 		return nil, err
 	}

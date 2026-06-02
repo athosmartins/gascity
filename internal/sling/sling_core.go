@@ -768,7 +768,7 @@ func withSourceWorkflowLaunchLock(ctx context.Context, deps SlingDeps, sourceBea
 	var result SlingResult
 	err := sourceworkflow.WithLock(ctx, deps.CityPath, sourceWorkflowLockScope(deps), sourceBeadID, func() error {
 		previousWorkflowID := ""
-		sourceBead, err := deps.Store.Get(sourceBeadID)
+		sourceBead, err := beads.HandlesFor(deps.Store).Live.Get(sourceBeadID)
 		if err != nil && !errors.Is(err, beads.ErrNotFound) {
 			return fmt.Errorf("get source bead %s: %w", sourceBeadID, err)
 		}
@@ -962,7 +962,7 @@ func sourceWorkflowRootByIDInStore(store beads.Store, sourceBeadID, workflowID, 
 	if store == nil {
 		return sourceWorkflowRoot{}, false, "not_found", nil
 	}
-	root, err := store.Get(workflowID)
+	root, err := beads.HandlesFor(store).Live.Get(workflowID)
 	if err != nil {
 		if errors.Is(err, beads.ErrNotFound) {
 			return sourceWorkflowRoot{}, false, "not_found", nil

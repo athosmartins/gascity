@@ -313,6 +313,55 @@ func TestListLiveRootsTreatsLegacyRootAsStoreScoped(t *testing.T) {
 	}
 }
 
+func TestListWorkflowBeadsUsesLiveRootState(t *testing.T) {
+	backing := beads.NewMemStore()
+	root, err := backing.Create(beads.Bead{
+		Title:  "workflow root",
+		Type:   "task",
+		Status: "in_progress",
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	child, err := backing.Create(beads.Bead{
+		Title:    "workflow child",
+		Type:     "task",
+		Status:   "open",
+		ParentID: root.ID,
+		Metadata: map[string]string{
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(child): %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+	if err := backing.Close(root.ID); err != nil {
+		t.Fatalf("Close(root): %v", err)
+	}
+	if err := backing.Close(child.ID); err != nil {
+		t.Fatalf("Close(child): %v", err)
+	}
+
+	workflowBeads, err := ListWorkflowBeads(cache, root.ID)
+	if err != nil {
+		t.Fatalf("ListWorkflowBeads: %v", err)
+	}
+	statusByID := map[string]string{}
+	for _, bead := range workflowBeads {
+		statusByID[bead.ID] = bead.Status
+	}
+	if statusByID[root.ID] != "closed" {
+		t.Fatalf("root status = %q, want closed from live backing store", statusByID[root.ID])
+	}
+	if statusByID[child.ID] != "closed" {
+		t.Fatalf("child status = %q, want closed from live backing store", statusByID[child.ID])
+	}
+}
+
 type parentLastCloseStore struct {
 	*beads.MemStore
 }

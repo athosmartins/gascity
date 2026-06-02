@@ -148,7 +148,7 @@ func closeOrphanedControl(store beads.Store, bead beads.Bead, opts ProcessOption
 	if rootID == "" || rootStoreRef == "" || rootID == bead.ID {
 		return ControlResult{}, false, nil
 	}
-	if _, err := store.Get(rootID); err == nil {
+	if _, err := beads.HandlesFor(store).Live.Get(rootID); err == nil {
 		return ControlResult{}, false, nil
 	} else if !errors.Is(err, beads.ErrNotFound) {
 		return ControlResult{}, false, fmt.Errorf("%s: loading workflow root %s: %w", bead.ID, rootID, err)
@@ -719,7 +719,7 @@ func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptio
 	resolvedStores := make(map[string]beads.Store)
 	visited := make(map[string]bool)
 	for hop := 0; hop < maxSourceChainHops; hop++ {
-		current, err := currentStore.Get(currentID)
+		current, err := beads.HandlesFor(currentStore).Live.Get(currentID)
 		if err != nil {
 			if errors.Is(err, beads.ErrNotFound) {
 				opts.tracef("close-source-chain root=%s stop reason=deleted_current at_id=%s ref=%s", rootID, currentID, sourceChainStoreLabel(currentRef))
@@ -767,7 +767,7 @@ func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptio
 
 		var stopWalk bool
 		loadAndClose := func() error {
-			loaded, err := nextStore.Get(nextID)
+			loaded, err := beads.HandlesFor(nextStore).Live.Get(nextID)
 			if err != nil {
 				if errors.Is(err, beads.ErrNotFound) {
 					opts.tracef("close-source-chain root=%s stop reason=deleted_parent source=%s ref=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef))
@@ -1290,7 +1290,7 @@ func listByWorkflowRoot(store beads.Store, rootID string) ([]beads.Bead, error) 
 
 	result := make([]beads.Bead, 0, len(all)+1)
 	seen := make(map[string]bool, len(all)+1)
-	if root, err := store.Get(rootID); err == nil {
+	if root, err := beads.HandlesFor(store).Live.Get(rootID); err == nil {
 		result = append(result, root)
 		seen[root.ID] = true
 	} else if !errors.Is(err, beads.ErrNotFound) {

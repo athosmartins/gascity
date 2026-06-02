@@ -2277,6 +2277,39 @@ func TestRollbackGraphV2ReplacementLaunchRestoresReplacedRoot(t *testing.T) {
 	}
 }
 
+func TestSourceWorkflowRootByIDInStoreUsesLiveRootState(t *testing.T) {
+	backing := beads.NewMemStore()
+	root, err := backing.Create(beads.Bead{
+		Title:  "previous graph root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":                                "workflow",
+			"gc.formula_contract":                    "graph.v2",
+			"gc.source_bead_id":                      "BL-42",
+			sourceworkflow.SourceStoreRefMetadataKey: "city:test",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(root): %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+	if err := backing.Close(root.ID); err != nil {
+		t.Fatalf("Close(root): %v", err)
+	}
+
+	_, ok, reason, err := sourceWorkflowRootByIDInStore(cache, "BL-42", root.ID, "city:test", "city:test")
+	if err != nil {
+		t.Fatalf("sourceWorkflowRootByIDInStore: %v", err)
+	}
+	if ok || reason != "closed" {
+		t.Fatalf("sourceWorkflowRootByIDInStore ok=%t reason=%q, want closed root to be non-live", ok, reason)
+	}
+}
+
 func TestDoSlingDefaultGraphFormulaAllowsDifferentLiveBareBeadRoots(t *testing.T) {
 	formulaDir := t.TempDir()
 	writeNamedGraphV2ConvoyFormula(t, formulaDir, "graph-a")

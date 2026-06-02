@@ -1913,6 +1913,63 @@ func sourceChainFixtureStores(f sourceChainFinalizeFixture) func() ([]SourceWork
 	}
 }
 
+func TestCloseSourceBeadChainUsesLiveSourceState(t *testing.T) {
+	t.Parallel()
+
+	f := newSourceChainFinalizeFixture(t)
+	cityCache := beads.NewCachingStoreForTest(f.cityStore, nil)
+	rigCache := beads.NewCachingStoreForTest(f.rigStore, nil)
+	if err := cityCache.PrimeActive(); err != nil {
+		t.Fatalf("city PrimeActive: %v", err)
+	}
+	if err := rigCache.PrimeActive(); err != nil {
+		t.Fatalf("rig PrimeActive: %v", err)
+	}
+	if err := f.rigStore.Close(f.rigLaunch.ID); err != nil {
+		t.Fatalf("Close(rig launch): %v", err)
+	}
+	if err := f.cityStore.Close(f.citySource.ID); err != nil {
+		t.Fatalf("Close(city source): %v", err)
+	}
+
+	resolver := func(ref string) (beads.Store, error) {
+		switch ref {
+		case "city:test":
+			return cityCache, nil
+		case "rig:test":
+			return rigCache, nil
+		default:
+			return nil, fmt.Errorf("unknown store ref: %s", ref)
+		}
+	}
+	var trace bytes.Buffer
+	if err := closeSourceBeadChain(rigCache, f.workflow.ID, ProcessOptions{
+		ResolveStoreRef: resolver,
+		SourceWorkflowStores: func() ([]SourceWorkflowStore, error) {
+			return []SourceWorkflowStore{
+				{Store: cityCache, StoreRef: "city:test"},
+				{Store: rigCache, StoreRef: "rig:test"},
+			}, nil
+		},
+		Tracef: func(format string, args ...any) {
+			fmt.Fprintf(&trace, format+"\n", args...) //nolint:errcheck // test buffer
+		},
+	}); err != nil {
+		t.Fatalf("closeSourceBeadChain: %v", err)
+	}
+
+	traceText := trace.String()
+	for _, sourceID := range []string{f.rigLaunch.ID, f.citySource.ID} {
+		want := "skip reason=already_closed source=" + sourceID
+		if !strings.Contains(traceText, want) {
+			t.Fatalf("trace missing %q:\n%s", want, traceText)
+		}
+	}
+	if strings.Contains(traceText, " closed source=") {
+		t.Fatalf("trace shows stale close instead of already_closed skip:\n%s", traceText)
+	}
+}
+
 func TestProcessWorkflowFinalizeRetriesWhenSourceStoreResolverFails(t *testing.T) {
 	t.Parallel()
 

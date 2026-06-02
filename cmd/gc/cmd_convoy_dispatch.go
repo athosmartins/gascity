@@ -1580,7 +1580,7 @@ func countOpenMatchedBeads(matches []sourceWorkflowStoreMatch) (int, error) {
 	open := 0
 	for _, match := range matches {
 		for _, bead := range match.beads {
-			current, err := match.store.Get(bead.ID)
+			current, err := beads.HandlesFor(match.store).Live.Get(bead.ID)
 			if err != nil {
 				if errors.Is(err, beads.ErrNotFound) {
 					continue
@@ -1768,12 +1768,12 @@ func findWorkflowBeads(store beads.Store, workflowID string) []beads.Bead {
 		rootIDs = append(rootIDs, root.ID)
 		addBead(root)
 	}
-	if root, err := store.Get(workflowID); err == nil {
+	if root, err := beads.HandlesFor(store).Live.Get(workflowID); err == nil {
 		addRoot(root)
 	}
 	// Query on gc.workflow_id only; the predicate is applied in-memory via
 	// addRoot so we pick up graph.v2-only roots alongside legacy roots.
-	if roots, err := store.List(beads.ListQuery{
+	if roots, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 		Metadata: map[string]string{
 			"gc.workflow_id": workflowID,
 		},
@@ -1784,7 +1784,7 @@ func findWorkflowBeads(store beads.Store, workflowID string) []beads.Bead {
 		}
 	}
 	for _, rootID := range rootIDs {
-		all, err := store.List(beads.ListQuery{
+		all, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
 			Metadata:      map[string]string{"gc.root_bead_id": rootID},
 			IncludeClosed: true,
 		})
