@@ -345,7 +345,7 @@ func TestCollectAssignedWorkBeadsIncludesReadyOpenAssignedWisp(t *testing.T) {
 	}
 }
 
-func TestCollectAssignedWorkBeadsUsesLiveReadyAfterExternalDependencyClose(t *testing.T) {
+func TestCollectAssignedWorkBeadsUsesCachedReadyAfterExternalDependencyCloseEvent(t *testing.T) {
 	backing := beads.NewMemStore()
 	blocker, err := backing.Create(beads.Bead{
 		Title:  "first attempt",
@@ -379,6 +379,15 @@ func TestCollectAssignedWorkBeadsUsesLiveReadyAfterExternalDependencyClose(t *te
 	if err := backing.Update(blocker.ID, beads.UpdateOpts{Status: &closed}); err != nil {
 		t.Fatalf("close blocker outside cache: %v", err)
 	}
+	blocker, err = backing.Get(blocker.ID)
+	if err != nil {
+		t.Fatalf("reload blocker: %v", err)
+	}
+	payload, err := json.Marshal(blocker)
+	if err != nil {
+		t.Fatalf("marshal blocker: %v", err)
+	}
+	cache.ApplyEvent("bead.updated", payload)
 
 	got, partial := collectAssignedWorkBeads(&config.City{}, cache)
 
@@ -386,11 +395,11 @@ func TestCollectAssignedWorkBeadsUsesLiveReadyAfterExternalDependencyClose(t *te
 		t.Fatal("collectAssignedWorkBeads reported partial results")
 	}
 	if len(got) != 1 || got[0].ID != retry.ID {
-		t.Fatalf("collectAssignedWorkBeads returned %#v, want live-ready retry %s after blocker close", got, retry.ID)
+		t.Fatalf("collectAssignedWorkBeads returned %#v, want cached-ready retry %s after blocker close event", got, retry.ID)
 	}
 }
 
-func TestCollectAssignedWorkBeadsUsesLiveReadyReadModel(t *testing.T) {
+func TestCollectAssignedWorkBeadsUsesCachedReadyReadModel(t *testing.T) {
 	backing := &readyStaticStore{Store: beads.NewMemStore()}
 	handoff, err := backing.Create(beads.Bead{
 		Title:    "merge me",
@@ -411,8 +420,8 @@ func TestCollectAssignedWorkBeadsUsesLiveReadyReadModel(t *testing.T) {
 	if len(got) != 1 || got[0].ID != handoff.ID {
 		t.Fatalf("collectAssignedWorkBeads returned %#v, want [%s]", got, handoff.ID)
 	}
-	if backing.readyCalls == 0 {
-		t.Fatal("backing Ready was not called; assigned ready demand must use live state")
+	if backing.readyCalls != 0 {
+		t.Fatalf("backing Ready calls = %d, want cached demand read", backing.readyCalls)
 	}
 }
 
@@ -490,7 +499,7 @@ func TestCollectAssignedWorkBeadsReprimesWhenCachedInProgressDirty(t *testing.T)
 	}
 }
 
-func TestCollectAssignedWorkBeadsFallsBackToLiveWhenCachedInProgressUnavailable(t *testing.T) {
+func TestCollectAssignedWorkBeadsReportsPartialWhenCachedInProgressUnavailable(t *testing.T) {
 	store := &cacheUnavailableListStore{MemStore: beads.NewMemStore()}
 	work, err := store.Create(beads.Bead{
 		Title:    "active handoff",
@@ -507,14 +516,14 @@ func TestCollectAssignedWorkBeadsFallsBackToLiveWhenCachedInProgressUnavailable(
 	}
 
 	got, partial := collectAssignedWorkBeads(&config.City{}, store)
-	if partial {
-		t.Fatal("collectAssignedWorkBeads reported partial with successful live fallback")
+	if !partial {
+		t.Fatal("collectAssignedWorkBeads partial = false, want partial when cached demand is unavailable")
 	}
-	if len(got) != 1 || got[0].ID != work.ID || got[0].Status != "in_progress" || got[0].Assignee != "repo/refinery" {
-		t.Fatalf("collectAssignedWorkBeads returned %#v, want live fallback in-progress %s", got, work.ID)
+	if len(got) != 0 {
+		t.Fatalf("collectAssignedWorkBeads returned %#v, want no live fallback rows for %s", got, work.ID)
 	}
-	if store.liveInProgressIssueLists == 0 {
-		t.Fatal("live issue in_progress list calls = 0, want live fallback after cache unavailable")
+	if store.liveInProgressIssueLists != 0 {
+		t.Fatalf("live issue in_progress list calls = %d, want 0", store.liveInProgressIssueLists)
 	}
 }
 
@@ -1257,7 +1266,7 @@ func TestDefaultScaleCheckCountsHonorsCachedWriteThroughDependencies(t *testing.
 	}
 }
 
-func TestDefaultScaleCheckCountsFallsBackToLiveWhenCachedEventDepsUnknown(t *testing.T) {
+func TestDefaultScaleCheckCountsReportsPartialWhenCachedEventDepsUnknown(t *testing.T) {
 	backing := &readyStaticStore{
 		Store: beads.NewMemStore(),
 		ready: []beads.Bead{{
@@ -1281,14 +1290,17 @@ func TestDefaultScaleCheckCountsFallsBackToLiveWhenCachedEventDepsUnknown(t *tes
 		storeKey: "rig:gascity",
 		store:    cache,
 	}})
-	if len(errs) != 0 {
-		t.Fatalf("defaultScaleCheckCounts errs = %v, want successful live fallback", errs)
+	if len(errs) == 0 {
+		t.Fatal("defaultScaleCheckCounts errs = nil, want cache-unavailable partial")
 	}
-	if got := counts["gascity/workflows.codex-max"]; got != 1 {
-		t.Fatalf("defaultScaleCheckCounts = %d, want live fallback count", got)
+	if !errors.Is(errs[0], beads.ErrCacheUnavailable) {
+		t.Fatalf("defaultScaleCheckCounts err = %v, want ErrCacheUnavailable", errs[0])
 	}
-	if backing.readyCalls == 0 {
-		t.Fatal("backing Ready calls = 0, want live ready fallback")
+	if got := counts["gascity/workflows.codex-max"]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 0 while cache read is partial", got)
+	}
+	if backing.readyCalls != 0 {
+		t.Fatalf("backing Ready calls = %d, want 0 live fallback calls", backing.readyCalls)
 	}
 }
 

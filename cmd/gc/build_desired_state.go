@@ -824,13 +824,13 @@ func collectAssignedWorkBeadsWithStores(
 			var err error
 			var errs []error
 			if len(assignees) == 0 {
-				ready, err = liveReadyForControllerDemandQuery(source.store, beads.ReadyQuery{Limit: assignedWorkReadyLimit(cfg)})
+				ready, err = readyForControllerDemandQuery(source.store, beads.ReadyQuery{Limit: assignedWorkReadyLimit(cfg)})
 				if err != nil {
 					errs = append(errs, fmt.Errorf("Ready(): %w", err))
 				}
 			} else {
 				for _, assignee := range assignees {
-					part, partErr := liveReadyForControllerDemandQuery(source.store, beads.ReadyQuery{Assignee: assignee, Limit: assignedWorkReadyLimit(cfg)})
+					part, partErr := readyForControllerDemandQuery(source.store, beads.ReadyQuery{Assignee: assignee, Limit: assignedWorkReadyLimit(cfg)})
 					if partErr != nil {
 						errs = append(errs, fmt.Errorf("Ready(assignee=%q): %w", assignee, partErr))
 					}
@@ -1312,11 +1312,7 @@ func sortedStringSet(values map[string]struct{}) []string {
 
 func listBothTiersForControllerDemand(store beads.Store, query beads.ListQuery) ([]beads.Bead, error) {
 	handles := beads.HandlesFor(store)
-	rows, err := handles.Cached.List(query)
-	if errors.Is(err, beads.ErrCacheUnavailable) {
-		return handles.Live.List(query)
-	}
-	return rows, err
+	return handles.Cached.List(query)
 }
 
 func readyForControllerDemand(store beads.Store) ([]beads.Bead, error) {
@@ -1326,17 +1322,7 @@ func readyForControllerDemand(store beads.Store) ([]beads.Bead, error) {
 func readyForControllerDemandQuery(store beads.Store, query beads.ReadyQuery) ([]beads.Bead, error) {
 	query.TierMode = beads.TierBoth
 	handles := beads.HandlesFor(store)
-	rows, err := handles.Cached.Ready(query)
-	if errors.Is(err, beads.ErrCacheUnavailable) {
-		return handles.Live.Ready(query)
-	}
-	return rows, err
-}
-
-func liveReadyForControllerDemandQuery(store beads.Store, query beads.ReadyQuery) ([]beads.Bead, error) {
-	query.TierMode = beads.TierBoth
-	handles := beads.HandlesFor(store)
-	return handles.Live.Ready(query)
+	return handles.Cached.Ready(query)
 }
 
 // mergeNamedSessionDemand ensures that named-session assignee demand is
