@@ -71,8 +71,21 @@ func (e controllerCommandError) Is(target error) bool {
 
 const (
 	controllerSocketPathLimit        = 100
+	controllerReadyCacheCommand      = "beads-ready-cache"
 	sessionCircuitResetCommandPrefix = "session-circuit-reset:"
 )
+
+type controllerReadyCacheSource func() (api.CachedRead[api.ListBody[beads.Bead]], error)
+
+type controllerReadyCacheReply struct {
+	Outcome       string       `json:"outcome"`
+	Items         []beads.Bead `json:"items,omitempty"`
+	Total         int          `json:"total,omitempty"`
+	CacheAgeS     float64      `json:"cache_age_s,omitempty"`
+	Partial       bool         `json:"partial,omitempty"`
+	PartialErrors []string     `json:"partial_errors,omitempty"`
+	Error         string       `json:"error,omitempty"`
+}
 
 type sessionCircuitResetRequest struct {
 	Identity  string `json:"identity"`
@@ -128,6 +141,7 @@ func startControllerSocket(
 	convergenceReqCh chan convergenceRequest,
 	pokeCh chan struct{},
 	controlDispatcherCh chan struct{},
+	readyCache controllerReadyCacheSource,
 ) (net.Listener, error) {
 	sockPath := controllerSocketPath(cityPath)
 	if err := os.MkdirAll(filepath.Dir(sockPath), 0o700); err != nil {
@@ -145,7 +159,7 @@ func startControllerSocket(
 			if err != nil {
 				return // listener closed
 			}
-			go handleControllerConn(conn, cityPath, cancelFn, forceShutdown, dirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh)
+			go handleControllerConn(conn, cityPath, cancelFn, forceShutdown, dirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh, readyCache)
 		}
 	}()
 	return lis, nil
@@ -165,6 +179,7 @@ func handleControllerConn(
 	convergenceReqCh chan convergenceRequest,
 	pokeCh chan struct{},
 	controlDispatcherCh chan struct{},
+	readyCache controllerReadyCacheSource,
 ) {
 	defer conn.Close()                                 //nolint:errcheck // best-effort cleanup
 	conn.SetDeadline(time.Now().Add(95 * time.Second)) //nolint:errcheck // symmetric read+write deadline; 5s margin over 30s enqueue + 60s reply
@@ -210,6 +225,8 @@ func handleControllerConn(
 			default:
 			}
 			conn.Write([]byte("ok\n")) //nolint:errcheck // best-effort ack
+		case line == controllerReadyCacheCommand:
+			handleControllerReadyCacheSocketCmd(conn, readyCache)
 		case strings.HasPrefix(line, sessionCircuitResetCommandPrefix):
 			handleSessionCircuitResetSocketCmd(conn, cityPath, line[len(sessionCircuitResetCommandPrefix):])
 		case strings.HasPrefix(line, "converge:"):
@@ -232,6 +249,36 @@ func handleControllerConn(
 			handleTraceStatusSocketCmd(conn, cityPath)
 		}
 	}
+}
+
+func handleControllerReadyCacheSocketCmd(conn net.Conn, readyCache controllerReadyCacheSource) {
+	if readyCache == nil {
+		writeJSONLine(conn, controllerReadyCacheReply{
+			Outcome: "failed",
+			Error:   "controller ready cache unavailable",
+		})
+		return
+	}
+	snapshot, err := readyCache()
+	if err != nil {
+		writeJSONLine(conn, controllerReadyCacheReply{
+			Outcome: "failed",
+			Error:   err.Error(),
+		})
+		return
+	}
+	items := snapshot.Body.Items
+	if items == nil {
+		items = []beads.Bead{}
+	}
+	writeJSONLine(conn, controllerReadyCacheReply{
+		Outcome:       "ok",
+		Items:         items,
+		Total:         snapshot.Body.Total,
+		CacheAgeS:     snapshot.AgeSeconds,
+		Partial:       snapshot.Body.Partial,
+		PartialErrors: snapshot.Body.PartialErrors,
+	})
 }
 
 func handleSessionCircuitResetSocketCmd(conn net.Conn, cityPath, payload string) {
@@ -1247,10 +1294,21 @@ func runController(
 	pokeCh := make(chan struct{}, 1)
 	controlDispatcherCh := make(chan struct{}, 1)
 	configDirty := &atomic.Bool{}
+	var readyCacheMu sync.RWMutex
+	var readyCacheState api.State
+	readyCache := func() (api.CachedRead[api.ListBody[beads.Bead]], error) {
+		readyCacheMu.RLock()
+		state := readyCacheState
+		readyCacheMu.RUnlock()
+		if state == nil {
+			return api.CachedRead[api.ListBody[beads.Bead]]{}, fmt.Errorf("controller ready cache unavailable")
+		}
+		return api.CollectCachedReadyBeads(state.BeadStores(), state.CityBeadStore())
+	}
 
 	sockPath := controllerSocketPath(cityPath)
 	forceShutdown := &atomic.Bool{}
-	lis, err := startControllerSocket(cityPath, cancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh)
+	lis, err := startControllerSocket(cityPath, cancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh, readyCache)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc start: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1315,6 +1373,9 @@ func runController(
 	cs.configDirty = configDirty
 	cs.services = cr.svc
 	cr.setControllerState(cs)
+	readyCacheMu.Lock()
+	readyCacheState = cs
+	readyCacheMu.Unlock()
 	cs.startBeadEventWatcher(ctx)
 	cs.startMaintenanceLoop(ctx)
 

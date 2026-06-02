@@ -1337,7 +1337,7 @@ func TestCachingStoreCachedListCanIncludeClosedCachedRows(t *testing.T) {
 	}
 }
 
-func TestCachingStoreReadyFallsBackAfterDependencyOmittingUpdateEvent(t *testing.T) {
+func TestCachingStoreReadyInvalidatesAfterDependencyOmittingUpdateEvent(t *testing.T) {
 	t.Parallel()
 
 	t.Run("external dep add", func(t *testing.T) {
@@ -1363,12 +1363,9 @@ func TestCachingStoreReadyFallsBackAfterDependencyOmittingUpdateEvent(t *testing
 		if ready, ok := cache.CachedReady(); ok {
 			t.Fatalf("CachedReady remained authoritative after dependency-omitting dep-add event: %v", ready)
 		}
-		ready, err := cache.Ready()
-		if err != nil {
-			t.Fatalf("Ready: %v", err)
-		}
-		if containsBeadID(ready, target.ID) {
-			t.Fatalf("Ready = %v, want backing dependency add to block %s", ready, target.ID)
+		_, readyErr := beads.HandlesFor(cache).Cached.Ready()
+		if !errors.Is(readyErr, beads.ErrCacheUnavailable) {
+			t.Fatalf("Cached.Ready error = %v, want ErrCacheUnavailable", readyErr)
 		}
 	})
 
@@ -1403,14 +1400,42 @@ func TestCachingStoreReadyFallsBackAfterDependencyOmittingUpdateEvent(t *testing
 		if ready, ok := cache.CachedReady(); ok {
 			t.Fatalf("CachedReady remained authoritative after dependency-omitting dep-remove event: %v", ready)
 		}
-		ready, err := cache.Ready()
-		if err != nil {
-			t.Fatalf("Ready: %v", err)
-		}
-		if !containsBeadID(ready, target.ID) {
-			t.Fatalf("Ready = %v, want backing dependency removal to unblock %s", ready, target.ID)
+		_, readyErr := beads.HandlesFor(cache).Cached.Ready()
+		if !errors.Is(readyErr, beads.ErrCacheUnavailable) {
+			t.Fatalf("Cached.Ready error = %v, want ErrCacheUnavailable", readyErr)
 		}
 	})
+}
+
+func TestCachingStoreDependencyOmittingCreatedEventDoesNotTreatDepsAsEmpty(t *testing.T) {
+	t.Parallel()
+
+	mem := beads.NewMemStore()
+	blocker, err := mem.Create(beads.Bead{Title: "Blocker"})
+	if err != nil {
+		t.Fatalf("Create(blocker): %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(mem, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	target, err := mem.Create(beads.Bead{Title: "Target"})
+	if err != nil {
+		t.Fatalf("Create(target): %v", err)
+	}
+	if err := mem.DepAdd(target.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatalf("backing DepAdd: %v", err)
+	}
+	cache.ApplyEvent("bead.created", dependencyOmittingUpdatePayload(t, target))
+
+	if ready, ok := cache.CachedReady(); ok {
+		t.Fatalf("CachedReady treated dependency-omitting created event as authoritative: %v", ready)
+	}
+	_, err = beads.HandlesFor(cache).Cached.Ready()
+	if !errors.Is(err, beads.ErrCacheUnavailable) {
+		t.Fatalf("Cached.Ready error = %v, want ErrCacheUnavailable", err)
+	}
 }
 
 func TestCachingStoreUpdatedEventForNewBeadDoesNotTreatUnknownDepsAsEmpty(t *testing.T) {
@@ -1556,7 +1581,7 @@ func TestCachingStoreCachedReadyUsesCompleteCreatedEventDependencies(t *testing.
 		t.Fatalf("PrimeActive: %v", err)
 	}
 
-	cache.ApplyEvent("bead.created", []byte(`{"id":"gc-1","title":"Event task","status":"open","issue_type":"task","created_at":"2026-01-01T00:00:00Z"}`))
+	cache.ApplyEvent("bead.created", []byte(`{"id":"gc-1","title":"Event task","status":"open","issue_type":"task","created_at":"2026-01-01T00:00:00Z","dependencies":[]}`))
 
 	ready, ok := cache.CachedReady()
 	if !ok {

@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/dispatch"
@@ -2860,9 +2862,86 @@ func TestNextWorkflowServeBeadsRejectsControlReadyWithoutSupervisorAPI(t *testin
 	cityDir := t.TempDir()
 	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName})
 	_, err := nextWorkflowServeBeads(query, cityDir, map[string]string{"GC_CITY_PATH": cityDir})
-	if err == nil || !strings.Contains(err.Error(), "requires supervisor API") {
-		t.Fatalf("nextWorkflowServeBeads err = %v, want supervisor API requirement", err)
+	if err == nil || !strings.Contains(err.Error(), "requires controller cache") {
+		t.Fatalf("nextWorkflowServeBeads err = %v, want controller cache requirement", err)
 	}
+}
+
+func TestNextWorkflowServeBeadsUsesControllerSocketCacheWhenHTTPAPIUnavailable(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n\n[daemon]\nformula_v2 = true\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+
+	mem := beads.NewMemStore()
+	ready, err := mem.Create(beads.Bead{
+		Title:    "control retry",
+		Type:     "task",
+		Status:   "open",
+		Assignee: config.ControlDispatcherAgentName,
+		Metadata: map[string]string{"gc.kind": "retry"},
+	})
+	if err != nil {
+		t.Fatalf("create ready bead: %v", err)
+	}
+	backing := &controlReadyBackingStore{Store: mem}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	lis, err := startControllerSocket(
+		cityDir,
+		cancel,
+		nil,
+		&atomic.Bool{},
+		make(chan reloadRequest),
+		make(chan convergenceRequest, 1),
+		make(chan struct{}, 1),
+		make(chan struct{}, 1),
+		func() (api.CachedRead[api.ListBody[beads.Bead]], error) {
+			return api.CollectCachedReadyBeads(map[string]beads.Store{"test-city": cache}, cache)
+		},
+	)
+	if err != nil {
+		t.Fatalf("startControllerSocket: %v", err)
+	}
+	defer lis.Close()                              //nolint:errcheck
+	defer os.Remove(controllerSocketPath(cityDir)) //nolint:errcheck
+	_ = ctx
+
+	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName}, config.ControlDispatcherAgentName)
+	got, err := nextWorkflowServeBeads(query, cityDir, map[string]string{
+		"GC_CITY_PATH":    cityDir,
+		"GC_SESSION_NAME": config.ControlDispatcherAgentName,
+	})
+	if err != nil {
+		t.Fatalf("nextWorkflowServeBeads: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != ready.ID {
+		t.Fatalf("nextWorkflowServeBeads = %#v, want cached ready bead %s", got, ready.ID)
+	}
+	if backing.readyCalls != 0 {
+		t.Fatalf("backing Ready calls = %d, want controller cache path only", backing.readyCalls)
+	}
+}
+
+type controlReadyBackingStore struct {
+	beads.Store
+	readyCalls int
+}
+
+func (s *controlReadyBackingStore) Ready(...beads.ReadyQuery) ([]beads.Bead, error) {
+	s.readyCalls++
+	return nil, fmt.Errorf("backing Ready must not be called")
 }
 
 // TestRunWorkflowServeOverridesInheritedCityBeadsDir is a regression test for

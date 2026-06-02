@@ -2759,7 +2759,7 @@ func TestControllerStateBeadEventWatcherReplaysEventsAfterCachePrime(t *testing.
 	if err != nil {
 		t.Fatalf("Create backing bead: %v", err)
 	}
-	payload, err := json.Marshal(map[string]beads.Bead{"bead": created})
+	payload, err := beads.MarshalEventBeadEnvelope(created)
 	if err != nil {
 		t.Fatalf("marshal bead event: %v", err)
 	}

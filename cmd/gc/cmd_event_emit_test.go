@@ -205,6 +205,74 @@ func TestEventPayloadForEmitFallsBackToStoreBead(t *testing.T) {
 	if decoded.Bead.Title != "hook-created task" {
 		t.Fatalf("payload bead title = %q, want hook-created task", decoded.Bead.Title)
 	}
+	var fields struct {
+		Bead map[string]json.RawMessage `json:"bead"`
+	}
+	if err := json.Unmarshal([]byte(payload), &fields); err != nil {
+		t.Fatalf("Unmarshal(raw payload): %v", err)
+	}
+	if _, ok := fields.Bead["dependencies"]; !ok {
+		t.Fatalf("payload = %s, want explicit dependencies snapshot", payload)
+	}
+}
+
+func TestEventPayloadForEmitEnrichesValidHookPayloadWithDependencies(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_SESSION", "fake")
+	configureIsolatedRuntimeEnv(t)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(`[workspace]
+name = "demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	if err := ensureScopedFileStoreLayout(dir); err != nil {
+		t.Fatalf("ensureScopedFileStoreLayout: %v", err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(dir); err != nil {
+		t.Fatalf("ensurePersistedScopeLocalFileStore: %v", err)
+	}
+	store, err := openStoreAtForCity(dir, dir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity: %v", err)
+	}
+	blocker, err := store.Create(beads.Bead{Title: "blocker", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(blocker): %v", err)
+	}
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(target): %v", err)
+	}
+	if err := store.DepAdd(target.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+
+	t.Chdir(dir)
+	hookPayload := `{"bead":{"id":"` + target.ID + `","title":"target","status":"open","issue_type":"task","created_at":"2026-01-01T00:00:00Z"}}`
+	var stderr bytes.Buffer
+	payload := eventPayloadForEmit(hookPayload, target.ID, &stderr)
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want none", stderr.String())
+	}
+
+	var decoded struct {
+		Bead beads.Bead `json:"bead"`
+	}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("Unmarshal(payload): %v", err)
+	}
+	if len(decoded.Bead.Dependencies) != 1 ||
+		decoded.Bead.Dependencies[0].IssueID != target.ID ||
+		decoded.Bead.Dependencies[0].DependsOnID != blocker.ID ||
+		decoded.Bead.Dependencies[0].Type != "blocks" {
+		t.Fatalf("dependencies = %#v, want %s blocks %s", decoded.Bead.Dependencies, target.ID, blocker.ID)
+	}
 }
 
 func TestEventPayloadForEmitUsesInheritedBeadsDirOutsideRig(t *testing.T) {

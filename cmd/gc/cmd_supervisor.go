@@ -1831,7 +1831,10 @@ func reconcileCities(
 		// Start controller socket AFTER the alreadyRunning check so we
 		// never destroy a live city's socket or leak a listener.
 		sockPath := filepath.Join(path, ".gc", "controller.sock")
-		lis, lisErr := startControllerSocket(path, cityCancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh)
+		readyCache := func() (api.CachedRead[api.ListBody[beads.Bead]], error) {
+			return api.CollectCachedReadyBeads(cs.BeadStores(), cs.CityBeadStore())
+		}
+		lis, lisErr := startControllerSocket(path, cityCancel, forceShutdown, configDirty, reloadReqCh, convergenceReqCh, pokeCh, controlDispatcherCh, readyCache)
 		if lisErr != nil {
 			fmt.Fprintf(stderr, "gc supervisor: city '%s': controller socket: %v\n", cityName, lisErr) //nolint:errcheck
 			lock.Close()                                                                               //nolint:errcheck // no socket to race with

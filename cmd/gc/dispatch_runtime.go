@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
@@ -800,13 +801,42 @@ func nextWorkflowServeControlReadyBeads(spec workflowServeControlReadySpec, env 
 	}
 	client := apiClient(cityPath)
 	if client == nil {
-		return nil, fmt.Errorf("control ready query requires supervisor API: %s", apiClientFallbackReason(cityPath))
+		ready, err := listReadyBeadsFromControllerCache(cityPath)
+		if err != nil {
+			return nil, fmt.Errorf("control ready query requires controller cache: API unavailable (%s), socket cache unavailable: %w", apiClientFallbackReason(cityPath), err)
+		}
+		return filterWorkflowServeControlReadyBeads(ready.Body, spec, env), nil
 	}
 	ready, err := client.ListReadyBeads()
 	if err != nil {
 		return nil, fmt.Errorf("list ready beads from supervisor cache: %w", err)
 	}
 	return filterWorkflowServeControlReadyBeads(ready.Body, spec, env), nil
+}
+
+func listReadyBeadsFromControllerCache(cityPath string) (api.CachedRead[[]beads.Bead], error) {
+	resp, err := sendControllerCommand(cityPath, controllerReadyCacheCommand)
+	if err != nil {
+		return api.CachedRead[[]beads.Bead]{}, err
+	}
+	var reply controllerReadyCacheReply
+	if err := json.Unmarshal(resp, &reply); err != nil {
+		return api.CachedRead[[]beads.Bead]{}, fmt.Errorf("decode controller ready cache reply: %w", err)
+	}
+	if reply.Outcome != "ok" {
+		if reply.Error != "" {
+			return api.CachedRead[[]beads.Bead]{}, fmt.Errorf("%s", reply.Error)
+		}
+		return api.CachedRead[[]beads.Bead]{}, fmt.Errorf("controller ready cache failed")
+	}
+	items := reply.Items
+	if items == nil {
+		items = []beads.Bead{}
+	}
+	return api.CachedRead[[]beads.Bead]{
+		Body:       items,
+		AgeSeconds: reply.CacheAgeS,
+	}, nil
 }
 
 func filterWorkflowServeControlReadyBeads(ready []beads.Bead, spec workflowServeControlReadySpec, env map[string]string) []hookBead {

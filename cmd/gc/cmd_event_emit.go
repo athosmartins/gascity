@@ -107,7 +107,34 @@ func eventPayloadForEmit(payload, beadID string, stderr io.Writer) string {
 		}
 		return string(beadPayload)
 	}
+	beadID = strings.TrimSpace(beadID)
+	if beadID != "" && beadPayloadMissingDependencySnapshot(payload) {
+		beadPayload, err := loadEventBeadPayload(beadID)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc event emit: bead payload %s: %v\n", beadID, err) //nolint:errcheck // best-effort stderr
+			return payload
+		}
+		return string(beadPayload)
+	}
 	return payload
+}
+
+func beadPayloadMissingDependencySnapshot(payload string) bool {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(payload), &root); err != nil {
+		return false
+	}
+	beadPayload, ok := root["bead"]
+	if !ok {
+		beadPayload = []byte(payload)
+	}
+	var beadFields map[string]json.RawMessage
+	if err := json.Unmarshal(beadPayload, &beadFields); err != nil {
+		return false
+	}
+	_, hasDeps := beadFields["dependencies"]
+	_, hasNeeds := beadFields["needs"]
+	return !hasDeps && !hasNeeds
 }
 
 func loadEventBeadPayload(beadID string) (json.RawMessage, error) {
@@ -127,7 +154,13 @@ func loadEventBeadPayload(beadID string) (json.RawMessage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading bead: %w", err)
 	}
-	payload, err := json.Marshal(map[string]beads.Bead{"bead": bead})
+	deps, err := store.DepList(beadID, "down")
+	if err != nil {
+		return nil, fmt.Errorf("loading bead dependencies: %w", err)
+	}
+	bead.Dependencies = deps
+	bead.Needs = nil
+	payload, err := beads.MarshalEventBeadEnvelope(bead)
 	if err != nil {
 		return nil, fmt.Errorf("marshaling bead payload: %w", err)
 	}

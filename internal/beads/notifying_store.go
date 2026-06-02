@@ -253,7 +253,7 @@ func (s *notifyingStore) notify(eventType string, b Bead) {
 	if s.onChange == nil || b.ID == "" {
 		return
 	}
-	payload, err := json.Marshal(b)
+	payload, err := MarshalEventBead(b)
 	if err != nil {
 		return
 	}

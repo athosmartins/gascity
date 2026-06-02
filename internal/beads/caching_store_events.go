@@ -238,9 +238,6 @@ func (c *CachingStore) updateEventDepsLocked(eventType string, b Bead, fields ma
 	if hasCacheEventField(fields, "dependencies") || hasCacheEventField(fields, "needs") {
 		return c.setEventDepsLocked(b.ID, depsFromBeadFields(b))
 	}
-	if eventType == "bead.created" && cacheEventLooksComplete(fields) {
-		return c.setEventDepsLocked(b.ID, depsFromBeadFields(b))
-	}
 	if eventType == "bead.updated" && cacheEventLooksComplete(fields) {
 		if refreshedFromBacking {
 			return c.setEventDepsLocked(b.ID, depsFromBeadFields(b))

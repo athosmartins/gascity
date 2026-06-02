@@ -137,7 +137,22 @@ func (s *Server) humaHandleBeadReady(ctx context.Context, input *BeadReadyInput)
 		waitForChange(ctx, s.state.EventProvider(), bp)
 	}
 
-	stores := s.state.BeadStores()
+	ready, err := CollectCachedReadyBeads(s.state.BeadStores(), s.state.CityBeadStore())
+	if err != nil {
+		return nil, err
+	}
+	return &ListOutput[beads.Bead]{
+		Index:     s.latestIndex(),
+		CacheAgeS: ready.AgeSeconds,
+		Body:      ready.Body,
+	}, nil
+}
+
+// CollectCachedReadyBeads aggregates ready beads from controller-managed cache
+// handles only. It intentionally does not fall back to backing Store.Ready(),
+// so controller consumers can preserve the "read live controller state, not
+// live bead data" invariant when the HTTP API is unavailable.
+func CollectCachedReadyBeads(stores map[string]beads.Store, cityStore beads.Store) (CachedRead[ListBody[beads.Bead]], error) {
 	rigNames := sortedRigNames(stores)
 	var all []beads.Bead
 	var pa partialAggregator
@@ -158,18 +173,15 @@ func (s *Server) humaHandleBeadReady(ctx context.Context, input *BeadReadyInput)
 		all = append(all, ready...)
 	}
 	if pa.totalOutage() {
-		return nil, pa.outageError()
+		return CachedRead[ListBody[beads.Bead]]{}, pa.outageError()
 	}
 
 	if all == nil {
 		all = []beads.Bead{}
 	}
 
-	index := s.latestIndex()
-	cacheAge := cacheAgeSeconds(s.state.CityBeadStore())
-	return &ListOutput[beads.Bead]{
-		Index:     index,
-		CacheAgeS: cacheAge,
+	return CachedRead[ListBody[beads.Bead]]{
+		AgeSeconds: cacheAgeSeconds(cityStore),
 		Body: ListBody[beads.Bead]{
 			Items:         all,
 			Total:         len(all),
