@@ -1903,7 +1903,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
-| `--notify` | bool |  | nudge the recipient after replying |
+| `--notify` | bool |  | nudge the recipient about this reply, even if earlier mail is still unread |
 | `-s`, `--subject` | string |  | reply subject line |
 
 ## gc mail send
@@ -1939,7 +1939,7 @@ gc mail send mayor "Build is green"
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | nudge the recipient after sending |
+| `--notify` | bool |  | nudge the recipient about this message, even if earlier mail is still unread |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
