@@ -122,7 +122,7 @@ Config is assembled from several sources:
 - **`city.toml`** — the root config file at the city directory root; the entry point the controller reads first and the file you always edit.
 - **Fragment files** — additional TOML files pulled in via an `include` field in `city.toml`.
 - **`pack.toml`** — reusable configuration directories (packs) that define agents and prompts.
-- **`agents/<name>/agent.toml`** — one file per agent; optional per-agent overrides (provider, rig scope, model, pool size) that sit next to the agent's prompt.
+- **`agents/<name>/agent.toml`** — one file per agent; optional per-agent overrides (provider, rig scope, model, pool size). Lives under the `agents/` directory of *any* pack — the city's own root pack, an imported pack, or a rig-level import.
 - **`formulas/*.toml`** — one file per formula; can live at the city root (`<city-root>/formulas/`) or inside a pack (`<pack-dir>/formulas/`).
 - **`orders/*.toml`** — one file per order (a formula with an Event Bus gate condition); same placement rules as formula files.
 
