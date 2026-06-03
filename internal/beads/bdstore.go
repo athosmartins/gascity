@@ -513,15 +513,16 @@ func IsPartialResult(err error) bool {
 	return errors.As(err, &partial)
 }
 
-// parseIssuesTolerant unmarshals a JSON array of bdIssue objects, skipping
-// any entries that fail to parse (e.g. corrupt metadata with non-string values).
+// parseIssuesTolerant unmarshals bd list output, skipping any entries that
+// fail to parse (e.g. corrupt metadata with non-string values). bd 1.0.4 emits
+// a top-level array; bd 1.0.5 may emit an object envelope with an issues array.
 // This prevents a single bad bead from breaking all list operations.
 func parseIssuesTolerant(data []byte) ([]bdIssue, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, nil
 	}
-	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+	raw, err := bdListIssueRows(data)
+	if err != nil {
 		// Include a snippet of the raw bd output so the failure surface is
 		// diagnosable. Historical case (gascity #1726): bd returned the
 		// literal string "None" and the unwrapped error was the opaque
@@ -555,6 +556,27 @@ func parseIssuesTolerant(data []byte) ([]bdIssue, error) {
 		return result, fmt.Errorf("skipped %d corrupt %s: %w", skipped, beadNoun, parseErr)
 	}
 	return result, nil
+}
+
+func bdListIssueRows(data []byte) ([]json.RawMessage, error) {
+	var raw []json.RawMessage
+	arrayErr := json.Unmarshal(data, &raw)
+	if arrayErr == nil {
+		return raw, nil
+	}
+
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, arrayErr
+	}
+	rawIssues, ok := envelope["issues"]
+	if !ok {
+		return nil, fmt.Errorf("JSON object missing issues field")
+	}
+	if err := json.Unmarshal(rawIssues, &raw); err != nil {
+		return nil, fmt.Errorf("issues field: %w", err)
+	}
+	return raw, nil
 }
 
 // toBead converts a bdIssue to a Gas City Bead. CreatedAt is truncated to
@@ -1614,6 +1636,9 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if query.TierMode == TierWisps || query.TierMode == TierBoth {
 		args = append(args, "--include-templates")
 	}
+	if bdListCanSkipLabels(serverQuery) {
+		args = append(args, "--skip-labels")
+	}
 	args = append(args, "--limit", fmt.Sprintf("%d", limit))
 	if serverQuery.ParentID != "" {
 		args = append(args, "--parent", serverQuery.ParentID)
@@ -1651,6 +1676,10 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 		return filtered, &PartialResultError{Op: "bd list", Err: parseErr}
 	}
 	return filtered, nil
+}
+
+func bdListCanSkipLabels(query ListQuery) bool {
+	return query.SkipLabels && query.Label == ""
 }
 
 func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssignees bool) bool {

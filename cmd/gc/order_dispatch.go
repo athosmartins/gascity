@@ -463,12 +463,12 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			storeKeysForGate = append(storeKeysForGate, orderStoreTargetKey(legacyOrderCityTarget(cityPath, m.cfg)))
 		}
 		scoped := a.ScopedName()
-		hasOpenWork, err := m.hasOpenWorkInStoresStrict(storesForGate, scoped)
+		hasOpenTracking, err := trackingIndex.hasOpenTracking(storesForGate, storeKeysForGate, scoped)
 		if err != nil {
 			logDispatchError(m.stderr, "gc: order dispatch: checking open work for %s: %v", scoped, err)
 			continue
 		}
-		if hasOpenWork {
+		if hasOpenTracking {
 			continue
 		}
 
@@ -551,7 +551,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		}
 
 		// Skip dispatch if previous work hasn't been processed yet.
-		hasOpenWork, err = trackingIndex.hasOpenWork(storesForGate, storeKeysForGate, scoped, m.hasOpenWorkInStoresStrict, true)
+		hasOpenWork, err := trackingIndex.hasOpenWork(storesForGate, storeKeysForGate, scoped, m.hasOpenWorkInStoresStrict, true)
 		if err != nil {
 			logDispatchError(m.stderr, "gc: order dispatch: checking open work for %s: %v", scoped, err)
 			continue
@@ -663,6 +663,29 @@ func newOrderDispatchTrackingIndex() *orderDispatchTrackingIndex {
 		entries: make(map[string]map[string]orderTrackingSummary),
 		errs:    make(map[string]error),
 	}
+}
+
+func (idx *orderDispatchTrackingIndex) hasOpenTracking(
+	stores []beads.Store,
+	storeKeys []string,
+	scopedName string,
+) (bool, error) {
+	if idx == nil {
+		return false, nil
+	}
+	for i, store := range stores {
+		if store == nil {
+			continue
+		}
+		entries, err := idx.entriesForStore(store, indexStoreKey(storeKeys, i))
+		if err != nil {
+			return false, err
+		}
+		if entries[scopedName].openTracking {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (idx *orderDispatchTrackingIndex) hasOpenWork(
