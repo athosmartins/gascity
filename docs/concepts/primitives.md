@@ -134,7 +134,16 @@ These files serve distinct purposes:
 **What it does for you:** `city.toml` is where you say *how* your city runs; packs, formula files, and order files are where you say *what* your agents do. Together they form the full picture of your city's desired state, with no separate state file to maintain.
 
 A minimal two-agent city declares each agent as its own directory under
-`agents/`, and uses `city.toml` for the operational defaults they inherit:
+`agents/`. Scaffold them with `gc agent add`:
+
+```shell
+gc agent add --name mayor
+gc agent add --name worker
+```
+
+Each command creates an `agents/<name>/` directory with a starter prompt. The
+result is a tree where `city.toml` holds the operational defaults the agents
+inherit:
 
 ```text
 bright-lights/
