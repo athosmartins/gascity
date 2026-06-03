@@ -147,11 +147,19 @@ type Scorecard struct {
 	// MemPass reports whether the HeapInuseDelta target was met. Only
 	// meaningful when Mem.Sampled is true.
 	MemPass bool
+	// LeakAborted is true when the run was canceled by the memory guard.
+	LeakAborted bool
+	// LeakFinding describes what triggered the memory guard abort.
+	// Empty when LeakAborted is false.
+	LeakFinding string
 }
 
 // Passed returns true if all measured targets passed, including the memory
 // target when memory was sampled.
 func (s *Scorecard) Passed() bool {
+	if s.LeakAborted {
+		return false
+	}
 	for _, r := range s.Results {
 		if r.Measured && !r.Pass {
 			return false
@@ -329,6 +337,10 @@ func (s *Scorecard) PrintTable(w io.Writer) {
 		fmt.Fprintf(w, "  %-*s  %-12s  %-12s  %-12s\n", //nolint:errcheck
 			colW, "RSS", rssBaseline, rssPeak, rssSteady)
 		fmt.Fprintf(w, "  %-*s  %-12s\n", colW, "alloc delta (churn)", FormatBytes(s.Mem.AllocDelta)) //nolint:errcheck
+	}
+
+	if s.LeakAborted {
+		fmt.Fprintf(w, "\n  *** LEAK DETECTED — run aborted: %s ***\n", s.LeakFinding) //nolint:errcheck
 	}
 
 	fmt.Fprintln(w) //nolint:errcheck
