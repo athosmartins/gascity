@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -114,6 +115,13 @@ func (t nudgeTarget) agentKey() string {
 		return t.identity
 	}
 	return t.sessionName
+}
+
+func (t nudgeTarget) pollerKey() string {
+	if t.sessionID != "" {
+		return t.sessionID
+	}
+	return t.agentKey()
 }
 
 func (t nudgeTarget) queueKeys() []string {
@@ -1052,7 +1060,7 @@ func maybeStartNudgePoller(target nudgeTarget) {
 	if target.sessionTransport() == "acp" {
 		return
 	}
-	if err := startNudgePoller(target.cityPath, target.agentKey(), target.sessionName); err != nil {
+	if err := startNudgePoller(target.cityPath, target.pollerKey(), target.sessionName); err != nil {
 		return
 	}
 }
@@ -1953,10 +1961,27 @@ func existingPollerPID(pidPath string) (bool, error) {
 	if _, err := fmt.Sscanf(pidText, "%d", &pid); err != nil || pid <= 0 {
 		return false, nil
 	}
-	if err := syscall.Kill(pid, 0); err == nil || errors.Is(err, syscall.EPERM) {
+	if pidutil.AliveWithCmdline(pid, nudgePollerCmdlineMatcher(pollerSessionNameFromPIDPath(pidPath))) {
 		return true, nil
 	}
 	return false, nil
+}
+
+func pollerSessionNameFromPIDPath(pidPath string) string {
+	base := filepath.Base(pidPath)
+	return strings.TrimSuffix(base, ".pid")
+}
+
+func nudgePollerCmdlineMatcher(sessionName string) func([]string) bool {
+	return func(argv []string) bool {
+		if !pidutil.ArgvContainsSequence(argv, "nudge", "poll") {
+			return false
+		}
+		if sessionName == "" {
+			return true
+		}
+		return pidutil.ArgvHasFlagValue(argv, "--session", sessionName)
+	}
 }
 
 func writeNudgePollerPID(pidPath string, pid int) error {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -2000,9 +2001,7 @@ func TestSendMailNotifyWithWorkerStartsPollerByAliasForAliasedTarget(t *testing.
 	prev := startNudgePoller
 	startNudgePoller = func(cityPath, agentName, sessionName string) error {
 		called = true
-		// The queued nudge carries the session fence, so the poller registration
-		// key can follow the operator-facing alias.
-		if cityPath != dir || agentName != "mayor" || sessionName != info.SessionName {
+		if cityPath != dir || agentName != info.ID || sessionName != info.SessionName {
 			t.Fatalf("unexpected poller args city=%q agent=%q session=%q", cityPath, agentName, sessionName)
 		}
 		return nil
@@ -2662,8 +2661,8 @@ func TestDeliverSlingNudgeQueuesFencedReminderAndStartsPollerForAsleepSession(t 
 	if pending[0].ContinuationEpoch != "7" {
 		t.Fatalf("queued nudge continuation_epoch = %q, want 7", pending[0].ContinuationEpoch)
 	}
-	if pollerCityPath != dir || pollerAgent != target.agentKey() || pollerSession != target.sessionName {
-		t.Fatalf("startNudgePoller = (%q, %q, %q), want (%q, %q, %q)", pollerCityPath, pollerAgent, pollerSession, dir, target.agentKey(), target.sessionName)
+	if pollerCityPath != dir || pollerAgent != target.sessionID || pollerSession != target.sessionName {
+		t.Fatalf("startNudgePoller = (%q, %q, %q), want (%q, %q, %q)", pollerCityPath, pollerAgent, pollerSession, dir, target.sessionID, target.sessionName)
 	}
 }
 
@@ -2955,6 +2954,28 @@ func TestAcquireNudgePollerLeaseAllowsBootstrapPID(t *testing.T) {
 	_, err = os.Stat(pidPath)
 	if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("pid file still exists after release: %v", err)
+	}
+}
+
+func TestExistingPollerPIDRejectsUnrelatedLivePID(t *testing.T) {
+	if goruntime.GOOS != "linux" {
+		t.Skip("poller ownership check uses /proc on linux")
+	}
+	dir := t.TempDir()
+	pidPath := nudgePollerPIDPath(dir, "sess-worker")
+	if err := os.MkdirAll(filepath.Dir(pidPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(pidPath, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	running, err := existingPollerPID(pidPath)
+	if err != nil {
+		t.Fatalf("existingPollerPID: %v", err)
+	}
+	if running {
+		t.Fatalf("existingPollerPID(%q) = true for unrelated live PID %d", pidPath, os.Getpid())
 	}
 }
 
