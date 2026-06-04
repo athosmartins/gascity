@@ -570,6 +570,8 @@ func TestDoPrimeWithHookFormat_FormatsDefaultFallback(t *testing.T) {
 	t.Setenv("GC_CITY", filepath.Join(t.TempDir(), "missing-city"))
 	t.Setenv("GC_ALIAS", "")
 	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_SESSION_NAME", "")
+	t.Setenv("GC_TEMPLATE", "")
 
 	var stdout, stderr bytes.Buffer
 	code := doPrimeWithHookFormat(nil, &stdout, &stderr, true, hookOutputFormatCodex, false)
@@ -591,6 +593,27 @@ func TestDoPrimeWithHookFormat_FormatsDefaultFallback(t *testing.T) {
 	}
 	if !strings.Contains(payload.HookSpecificOutput.AdditionalContext, "# Gas City Agent") {
 		t.Fatalf("additionalContext = %q, want default prime prompt", payload.HookSpecificOutput.AdditionalContext)
+	}
+	for _, want := range []string{
+		"managed runtime session",
+		"If $GC_SESSION_NAME is empty",
+		"bd update <id> --claim",
+		"gc.continuation_group",
+		"--metadata-field gc.routed_to=\"$GC_TEMPLATE\"",
+		"--no-assignee",
+		"gc runtime drain-ack",
+	} {
+		if !strings.Contains(payload.HookSpecificOutput.AdditionalContext, want) {
+			t.Fatalf("additionalContext missing %q:\n%s", want, payload.HookSpecificOutput.AdditionalContext)
+		}
+	}
+	for _, stale := range []string{
+		"Pick a bead and execute the work described in its title",
+		"Repeat until the queue is empty",
+	} {
+		if strings.Contains(payload.HookSpecificOutput.AdditionalContext, stale) {
+			t.Fatalf("additionalContext contains stale fallback protocol %q:\n%s", stale, payload.HookSpecificOutput.AdditionalContext)
+		}
 	}
 }
 
