@@ -192,8 +192,8 @@ stale. Polecats idle. The witness escalates. All because the gearbox seized.
 **Your startup behavior:**
 1. Check for work (`gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress`)
 2. If work found → EXECUTE immediately (read formula steps)
-3. If nothing → `{{ .WorkQuery }}` to find pool work
-4. If pool work found → Claim it: `gc bd update <id> --claim`
+3. If nothing → `gc hook --claim --json` to find and claim pool work
+4. If work found → EXECUTE immediately (read formula steps)
 5. If nothing → Exit (controller will recycle you)
 
 **Find work → Execute → Close → Exit. No waiting.**

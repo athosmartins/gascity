@@ -126,38 +126,34 @@ Your formula: `mol-polecat-work`
 
 > **The Universal Propulsion Principle: If your hook/work query finds work, YOU RUN IT.**
 
-> **CLAIM-FIRST INVARIANT:** Once a candidate bead is identified, your **next**
-> tool call MUST be `gc bd update <id> --claim`. Do NOT Read code, list files,
-> show metadata, or run any other Bash before the claim succeeds. The claim
-> flips bd status to in_progress atomically; without it, the pool reconciler
-> can recycle you mid-read and another polecat will race-claim the same bead.
-> Polecat-vs-polecat races are the #1 source of churn — close the window.
+> **CLAIM-FIRST INVARIANT:** Your first work-discovery tool call MUST be
+> `gc hook --claim --json`. Do NOT read code, list files, show metadata, or run
+> any other Bash before the hook returns a work bead. The hook resumes existing
+> assigned work or flips an unassigned routed bead to in_progress atomically;
+> without that ownership, the pool reconciler can recycle you mid-read and
+> another polecat will race-claim the same bead. Polecat-vs-polecat races are
+> the #1 source of churn — close the window.
 
 ```bash
-# Step 1a: Check for assigned in-progress work (already claimed — no race)
-gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress
+# Step 1: Find or claim work. This handles assigned in-progress work,
+# assigned ready work, routed CAS claim, and continuation affinity.
+gc hook --claim --json
 
-# Step 1b: If none, find pool work
-{{ .WorkQuery }}
-
-# Step 1c: CLAIM IMMEDIATELY — this is your next tool call, no exceptions.
-gc bd update <id> --claim                                       # Atomic CAS
-
-# Step 2: AFTER successful claim, only then read code, formula steps, etc.
+# Step 2: AFTER the hook returns action=work, only then read code, formula steps, etc.
 gc bd show <id> --json | jq '.[0].metadata'
 
-# Step 3: Work found? -> Follow formula steps. Nothing? -> Check mail
+# Step 3: Work found? -> Follow formula steps. Nothing? -> Check mail or drain
 gc mail inbox
 
 # Step 4: Execute — read formula steps and work through them in order
 ```
 
-When nudged after dispatch, run `gc hook` or `{{ .WorkQuery }}`. That lookup
-checks assigned work first (session bead ID, runtime session name, then
-alias) and only falls through to unassigned pool work routed to
+When nudged after dispatch, run `gc hook --claim --json`. That lookup checks
+assigned work first (session bead ID, runtime session name, then alias), only
+falls through to unassigned pool work routed to
 `${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat`.
 
-**Hook/work query -> Read formula steps -> Follow in order -> done sequence.**
+**Hook claim -> Read formula steps -> Follow in order -> done sequence.**
 
 ## Context Exhaustion
 

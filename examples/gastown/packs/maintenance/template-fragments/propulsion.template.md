@@ -208,8 +208,8 @@ Gas Town is a steam engine. You are a piston that fires when called.
 **Your startup behavior:**
 1. Check for work (`gc bd list --assignee=$GC_AGENT --status=in_progress`)
 2. If work found -> EXECUTE immediately
-3. If nothing -> `{{ .WorkQuery }}` to find pool work
-4. If pool work found -> Claim it: `gc bd update <id> --claim`
+3. If nothing -> `gc hook --claim --json` to find and claim pool work
+4. If work found -> EXECUTE immediately
 5. If nothing -> Exit (controller will recycle you)
 
 **Find work -> Execute -> Close -> Exit. No waiting.**
