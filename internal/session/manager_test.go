@@ -1579,6 +1579,85 @@ func TestSessionNameFor(t *testing.T) {
 	}
 }
 
+// TestReadableAutoSessionName is the ga-v53r regression test: auto-named
+// sessions must derive a human-readable, role-carrying tmux session name
+// (e.g. "oracle-gh1vh") instead of the opaque "s-<beadID>" form, while staying
+// unique per bead and tmux-safe.
+func TestReadableAutoSessionName(t *testing.T) {
+	tests := []struct {
+		name       string
+		template   string
+		beadID     string
+		wantOK     bool
+		wantName   string
+		wantPrefix string
+	}{
+		{
+			name:     "leaf role from qualified template",
+			template: "gastown/oracle",
+			beadID:   "gh-1vh",
+			wantOK:   true,
+			wantName: "oracle-gh1vh",
+		},
+		{
+			name:       "pool agent dog with uuid-style bead",
+			template:   "gastown.dog",
+			beadID:     "ga-session-690e2ff3d22ac2999f1b3d146e0a0d42",
+			wantOK:     true,
+			wantPrefix: "dog-",
+		},
+		{
+			name:     "bare role",
+			template: "digo",
+			beadID:   "gh-p7j",
+			wantOK:   true,
+			wantName: "digo-ghp7j",
+		},
+		{
+			name:     "empty template falls back",
+			template: "",
+			beadID:   "gh-1vh",
+			wantOK:   false,
+		},
+		{
+			name:     "empty bead id falls back",
+			template: "oracle",
+			beadID:   "",
+			wantOK:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := ReadableAutoSessionName(tt.template, tt.beadID)
+			if ok != tt.wantOK {
+				t.Fatalf("ReadableAutoSessionName(%q,%q) ok=%v, want %v (got=%q)", tt.template, tt.beadID, ok, tt.wantOK, got)
+			}
+			if !ok {
+				return
+			}
+			if strings.HasPrefix(got, autoSessionNamePrefix) {
+				t.Errorf("readable name %q must not use reserved prefix %q", got, autoSessionNamePrefix)
+			}
+			if !IsSessionNameSyntaxValid(got) {
+				t.Errorf("readable name %q is not tmux-safe", got)
+			}
+			if tt.wantName != "" && got != tt.wantName {
+				t.Errorf("got %q, want %q", got, tt.wantName)
+			}
+			if tt.wantPrefix != "" && !strings.HasPrefix(got, tt.wantPrefix) {
+				t.Errorf("got %q, want prefix %q", got, tt.wantPrefix)
+			}
+		})
+	}
+
+	// Uniqueness: two distinct beads under the same role must not collide.
+	a, _ := ReadableAutoSessionName("gastown/oracle", "gh-1vh")
+	b, _ := ReadableAutoSessionName("gastown/oracle", "gh-hy8")
+	if a == b {
+		t.Fatalf("distinct beads produced identical names: %q", a)
+	}
+}
+
 func TestListExcludesClosedFromActiveFilter(t *testing.T) {
 	store := beads.NewMemStore()
 	sp := runtime.NewFake()

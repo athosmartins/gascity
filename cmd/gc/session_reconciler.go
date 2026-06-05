@@ -1336,8 +1336,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if !drainCancelled {
 								_ = clearReconcilerDrainAckMetadata(sp, name)
 							}
+							spareReason := "config_drift_attached"
+							if sessionPinnedAwake(*session) {
+								spareReason = "config_drift_pinned"
+							}
 							if trace != nil {
-								trace.recordDecision("reconciler.session.drain_ack", tp.TemplateName, name, "config_drift_attached", "cancel_reconciler_ack", traceRecordPayload{
+								trace.recordDecision("reconciler.session.drain_ack", tp.TemplateName, name, spareReason, "cancel_reconciler_ack", traceRecordPayload{
 									"drain_canceled": drainCancelled,
 								}, nil, "")
 							}
@@ -1587,9 +1591,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								fmt.Fprintf(stderr, "session reconciler: recording attached config-drift deferral for %s: %v\n", name, err) //nolint:errcheck
 							}
 							drainCancelled := cancelSessionConfigDriftDrain(*session, sp, dt)
+							activeReason := "attached"
+							if sessionPinnedAwake(*session) {
+								activeReason = "pinned"
+							}
 							if trace != nil {
 								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredAttached), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
-									"active_reason":  "attached",
+									"active_reason":  activeReason,
 									"drain_canceled": drainCancelled,
 								}), nil, "")
 							}
@@ -2778,11 +2786,37 @@ func recentlyDeferredSessionAttachedConfigDrift(session beads.Bead, clk clock.Cl
 	return now.Sub(deferredAt) < sessionAttachedConfigDriftFalseNegativeLimit
 }
 
-// sessionAttachedForConfigDrift reports whether a session is currently
-// attached (a user terminal is connected) and should skip config-drift
-// handling. It checks worker-handle observation first and falls back to the
-// provider's direct attachment probe.
+// sessionPinnedAwake reports whether a session carries the durable pin
+// override (gc session pin → pin_awake=true). A pinned session is one the
+// operator has explicitly asked to keep alive; it must survive config churn.
+// Mirrors the canonical pin check used in cmd_session.go and
+// internal/session/lifecycle_projection.go.
+func sessionPinnedAwake(session beads.Bead) bool {
+	return strings.TrimSpace(session.Metadata["pin_awake"]) == "true"
+}
+
+// sessionAttachedForConfigDrift reports whether a session should be SPARED from
+// config-drift handling (drain / re-prime). A session is spared when either:
+//
+//   - it is currently attached (a user terminal — including an external/Remote
+//     Control tmux client — is connected, via worker-handle observation or the
+//     provider's direct #{session_attached} probe), OR
+//   - it carries the durable pin override (pin_awake=true).
+//
+// The pin guard is the durable fix for ga-84rm: previously only live tmux
+// attachment was honored, so a pinned-but-idle crew session (Oracle/Mila) that
+// had no terminal attached at the reconcile tick still received a config-drift
+// drain decision on every config_revision bump. Pinning is an explicit "keep
+// this alive" signal and must take precedence over config-drift drains; the
+// drift applies after the operator unpins. Both config-drift call sites route
+// through this function, so the guard is enforced uniformly (drain-ack cancel
+// path and the named/ordinary drain path alike).
 func sessionAttachedForConfigDrift(session beads.Bead, sp runtime.Provider, cityPath string, store beads.Store, cfg *config.City, name string) (bool, error) {
+	// Pin is a durable, provider-independent signal — honor it even when the
+	// runtime provider is unavailable or reports no live attachment.
+	if sessionPinnedAwake(session) {
+		return true, nil
+	}
 	if sp == nil {
 		return false, nil
 	}
