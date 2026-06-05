@@ -48,9 +48,14 @@ type releasedPoolAssignment struct {
 }
 
 // PoolSessionName derives the tmux session name for a pool worker session.
-// Format: {basename(template)}-{beadID} (e.g., "claude-mc-xyz").
-// Named sessions with an alias use the alias instead.
+// ga-v53r: uses ReadableAutoSessionName ("<role>-<beadID-tail>", e.g. "dog-d428875b151e")
+// in preference to the legacy "{basename(template)}-{beadID}" form that included
+// the full UUID and was unreadable in `tmux ls`. Falls back to the legacy form
+// when no readable name can be derived so behaviour is never worse than before.
 func PoolSessionName(template, beadID string) string {
+	if name, ok := session.ReadableAutoSessionName(template, beadID); ok {
+		return name
+	}
 	base := path.Base(template)
 	return agent.SanitizeQualifiedNameForSession(base) + "-" + beadID
 }
