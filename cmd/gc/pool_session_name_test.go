@@ -108,24 +108,41 @@ func TestSessionBeadAssigneeIdentities(t *testing.T) {
 	}
 }
 
+// TestPoolSessionName verifies ga-v53r: PoolSessionName now uses
+// ReadableAutoSessionName ("<role>-<beadID-tail>") in preference to the legacy
+// "{qualified-basename}-{beadID}" form, so `tmux ls` output is legible.
+// The legacy fallback still fires when ReadableAutoSessionName cannot derive a
+// readable base (e.g. template is empty or starts with the reserved "s-" prefix).
 func TestPoolSessionName(t *testing.T) {
 	tests := []struct {
+		name     string
 		template string
 		beadID   string
 		want     string
 	}{
-		{"gascity/claude", "mc-xyz", "claude-mc-xyz"},
-		{"claude", "mc-abc", "claude-mc-abc"},
-		{"myrig/codex", "mc-123", "codex-mc-123"},
-		{"control-dispatcher", "mc-wfc", "control-dispatcher-mc-wfc"},
-		{"gs.polecat", "mc-dot", "gs__polecat-mc-dot"},
-		{"myrig/gs.polecat", "mc-rigdot", "gs__polecat-mc-rigdot"},
+		// Readable format: leaf role + compact bead-ID tail (hyphens stripped).
+		{"rig-qualified template", "gascity/claude", "mc-xyz", "claude-mcxyz"},
+		{"bare template", "claude", "mc-abc", "claude-mcabc"},
+		{"rig-qualified codex", "myrig/codex", "mc-123", "codex-mc123"},
+		{"hyphenated template", "control-dispatcher", "mc-wfc", "control-dispatcher-mcwfc"},
+		// Dot-qualified templates: leaf component only (drops rig qualifier).
+		{"dot-qualified", "gs.polecat", "mc-dot", "polecat-mcdot"},
+		{"rig+dot qualified", "myrig/gs.polecat", "mc-rigdot", "polecat-mcrigdot"},
+		// Real-world dog pool session: UUID-style bead ID → short tail.
+		{"dog pool UUID bead", "gastown.dog", "ga-session-5634604e0bb71e944894d428875b151e", "dog-d428875b151e"},
+		// Crew session: oracle with real bead ID → "oracle-gh1vh".
+		{"oracle crew bead", "gastown/oracle", "gh-1vh", "oracle-gh1vh"},
+		// Legacy fallback: template starting with reserved "s-" prefix cannot
+		// produce a readable base → falls back to legacy "{base}-{beadID}" form.
+		{"reserved s- prefix falls back", "s-agent", "mc-xyz", "s-agent-mc-xyz"},
 	}
 	for _, tt := range tests {
-		got := PoolSessionName(tt.template, tt.beadID)
-		if got != tt.want {
-			t.Errorf("PoolSessionName(%q, %q) = %q, want %q", tt.template, tt.beadID, got, tt.want)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			got := PoolSessionName(tt.template, tt.beadID)
+			if got != tt.want {
+				t.Errorf("PoolSessionName(%q, %q) = %q, want %q", tt.template, tt.beadID, got, tt.want)
+			}
+		})
 	}
 }
 
