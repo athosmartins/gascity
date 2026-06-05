@@ -1052,6 +1052,60 @@ func TestDoSlingNudgePoolMember(t *testing.T) {
 	}
 }
 
+// TestDoSlingNudgeAdhocInstanceFallsBackToConfigAgent is the regression test
+// for ga-hawi. An unlimited pool agent ("digo") has a live runtime session
+// whose name is an opaque adhoc id ("digo-adhoc-e2510107f6"). discoverPoolInstances
+// reverse-derives that raw id as the qualifiedInstance, which is NOT a config
+// agent name, so resolveAgentIdentity fails. On parent (pre-fix), doSlingNudge
+// printed "agent ... not found in config" and bailed without delivering the
+// nudge. After the fix it falls back to the base config agent "digo" and
+// nudges its live adhoc session, so the nudge is delivered (not dropped).
+func TestDoSlingNudgeAdhocInstanceFallsBackToConfigAgent(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	const adhocSession = "digo-adhoc-e2510107f6"
+	if err := sp.Start(context.Background(), adhocSession, runtime.Config{}); err != nil {
+		t.Fatalf("Start(%q): %v", adhocSession, err)
+	}
+	sp.WaitForIdleErrors[adhocSession] = nil
+	sp.Calls = nil
+
+	// Unlimited pool agent (MaxActiveSessions nil => Max=-1 => instance
+	// expansion + prefix discovery of the running adhoc session).
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "digo", MinActiveSessions: intPtr(1)}},
+	}
+	a := cfg.Agents[0]
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	deps.CityPath = t.TempDir()
+	prev := startNudgePoller
+	startNudgePoller = func(_, _, _ string) error { return nil }
+	t.Cleanup(func() { startNudgePoller = prev })
+
+	doSlingNudge(&a, deps.CityName, deps.CityPath, cfg, sp, deps.Store, stdout, stderr)
+
+	// The opaque adhoc id must NOT cause a hard "not found in config" bail.
+	if strings.Contains(stderr.String(), "not found in config") {
+		t.Fatalf("nudge must not bail with 'not found in config' for adhoc instance; stderr=%q", stderr.String())
+	}
+	// The nudge must be addressed to the config agent (digo), delivered or
+	// queued — not silently dropped.
+	delivered := strings.Contains(stdout.String(), "Nudged digo") ||
+		strings.Contains(stdout.String(), "Queued nudge for digo")
+	nudgedSession := false
+	for _, c := range sp.Calls {
+		if (c.Method == "Nudge" || c.Method == "NudgeNow") && c.Name == adhocSession {
+			nudgedSession = true
+		}
+	}
+	if !delivered && !nudgedSession {
+		t.Fatalf("nudge was dropped for adhoc instance; stdout=%q stderr=%q calls=%+v",
+			stdout.String(), stderr.String(), sp.Calls)
+	}
+}
+
 func TestDoSlingNudgePoolMemberUsesBeadDerivedSessionName(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

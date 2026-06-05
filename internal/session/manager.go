@@ -465,7 +465,7 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 
 		sessName := explicitName
 		if sessName == "" {
-			sessName = sessionNameFor(b.ID)
+			sessName = m.autoSessionName(template, b.ID)
 			if err := m.store.SetMetadata(b.ID, "session_name", sessName); err != nil {
 				_ = m.store.Close(b.ID)
 				return fmt.Errorf("storing session name: %w", err)
@@ -729,7 +729,7 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 
 		sessName := explicitName
 		if sessName == "" {
-			sessName = sessionNameFor(b.ID)
+			sessName = m.autoSessionName(template, b.ID)
 			if err := m.store.SetMetadata(b.ID, "session_name", sessName); err != nil {
 				_ = m.store.Close(b.ID)
 				return fmt.Errorf("storing session name: %w", err)
@@ -1624,6 +1624,27 @@ func (m *Manager) PersistSessionKey(id, sessionKey string) error {
 // Uses the "s-" prefix to avoid collision with agent sessions.
 func sessionNameFor(beadID string) string {
 	return "s-" + strings.ReplaceAll(beadID, "/", "--")
+}
+
+// autoSessionName picks the runtime session_name for a session created without
+// an explicit name. It prefers a human-readable, role-derived name
+// ("<role>-<beadID-tail>", ga-v53r) so `tmux ls` is legible, and falls back to
+// the legacy "s-<beadID>" form when no readable base can be derived or the
+// readable name is already taken by another live session. The bead-ID tail
+// keeps the readable name unique per bead.
+func (m *Manager) autoSessionName(template, beadID string) string {
+	readable, ok := ReadableAutoSessionName(template, beadID)
+	if !ok {
+		return sessionNameFor(beadID)
+	}
+	if m != nil && m.store != nil {
+		if err := ensureSessionNameAvailableForSelf(m.store, readable, beadID); err != nil {
+			// Extremely unlikely (the bead-ID tail makes the name unique), but
+			// never risk a collision: fall back to the guaranteed-unique form.
+			return sessionNameFor(beadID)
+		}
+	}
+	return readable
 }
 
 // BuildResumeCommand constructs the resume command from stored session info.

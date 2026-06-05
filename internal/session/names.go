@@ -125,6 +125,100 @@ func GenerateAdhocIdentity(base string) (string, error) {
 	return base + "-adhoc-" + compact, nil
 }
 
+// ReadableAutoSessionName derives a human-readable tmux session name for an
+// auto-named session (one created without an explicit name or alias) from its
+// template/role plus a short, stable suffix taken from the bead ID.
+//
+// ga-v53r: previously auto-named sessions used sessionNameFor(beadID) →
+// "s-<beadID>" (e.g. "s-gh-1vh"), so `tmux ls` showed opaque codes the human
+// could not map to crew members. This helper instead yields
+// "<role>-<beadID-tail>" (e.g. "oracle-gh1vh", "dog-690e2ff3"), keeping the
+// per-bead uniqueness that guarantees no tmux name collision while making the
+// crew member/role legible at a glance.
+//
+// It returns ("", false) when no usable role base can be derived; callers must
+// fall back to the legacy "s-<beadID>" name in that case so behavior is never
+// worse than before. The returned name is guaranteed tmux-safe and never uses
+// the reserved autoSessionNamePrefix ("s-").
+func ReadableAutoSessionName(template, beadID string) (string, bool) {
+	base := readableSessionBase(template)
+	if base == "" {
+		return "", false
+	}
+	tail := readableBeadIDTail(beadID)
+	if tail == "" {
+		return "", false
+	}
+	name := base + "-" + tail
+	if len(name) > explicitSessionNameMaxLen {
+		// Trim the base, never the uniqueness tail.
+		keep := explicitSessionNameMaxLen - len(tail) - 1
+		if keep < 1 {
+			return "", false
+		}
+		name = base[:keep] + "-" + tail
+	}
+	// Defensive: never collide with the reserved auto-name namespace and never
+	// emit a syntactically invalid name. Both should be impossible given a
+	// non-empty role base, but fall back rather than emit a bad name.
+	if strings.HasPrefix(name, autoSessionNamePrefix) || !IsSessionNameSyntaxValid(name) {
+		return "", false
+	}
+	return name, true
+}
+
+// readableSessionBase normalizes a template/role into a tmux-safe, readable
+// base component (e.g. "gastown/oracle" → "oracle", "hw/dog" → "dog").
+func readableSessionBase(template string) string {
+	template = strings.TrimSpace(template)
+	if template == "" {
+		return ""
+	}
+	// Prefer the leaf role name (drop the rig/dir/import qualifier) for
+	// readability. Qualifiers use either "/" (rig/agent) or "." (import.agent,
+	// e.g. "gastown.dog"), so split on both and keep the trailing component.
+	if i := strings.LastIndexAny(template, "/."); i >= 0 {
+		template = template[i+1:]
+	}
+	base := agent.SanitizeQualifiedNameForSession(template)
+	base = strings.Trim(base, "-_")
+	if base == "" || strings.HasPrefix(base, autoSessionNamePrefix) {
+		return ""
+	}
+	return base
+}
+
+// readableBeadIDTail produces a short, unique-per-bead suffix from a bead ID,
+// stripping non-identifier characters so the result stays tmux-safe. The full
+// bead ID is unique, and we keep enough of its entropy-bearing tail to preserve
+// uniqueness across concurrently-created sessions.
+func readableBeadIDTail(beadID string) string {
+	beadID = strings.TrimSpace(beadID)
+	if beadID == "" {
+		return ""
+	}
+	// Drop a leading "<prefix>-session-" or "<prefix>-" so the tail carries the
+	// distinguishing hash, not the boilerplate. Keep alphanumerics only.
+	compact := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		default:
+			return -1
+		}
+	}, beadID)
+	if compact == "" {
+		return ""
+	}
+	// Keep a generous tail to preserve uniqueness for UUID-style bead IDs while
+	// staying short enough to read.
+	const maxTail = 12
+	if len(compact) > maxTail {
+		compact = compact[len(compact)-maxTail:]
+	}
+	return compact
+}
+
 // ValidateAlias validates a human-chosen session alias. Empty means
 // "no alias".
 func ValidateAlias(alias string) (string, error) {

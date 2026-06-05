@@ -1509,8 +1509,18 @@ func doSlingNudge(a *config.Agent, cityName, cityPath string, cfg *config.City,
 				}
 				member, ok := resolveAgentIdentity(cfg, ref.qualifiedInstance, currentRigContext(cfg))
 				if !ok {
-					fmt.Fprintf(stderr, "gc sling: agent %q not found in config\n", ref.qualifiedInstance) //nolint:errcheck // best-effort
-					return true
+					// ga-hawi: an adhoc / pool session's qualifiedInstance can be
+					// the raw runtime session id (e.g. "digo-adhoc-e2510107f6"),
+					// which is NOT a config agent name and so fails identity
+					// resolution. The session itself is live (we already verified
+					// it is running just above) and the sling routed by the agent's
+					// config name into *a — so fall back to *a's config identity and
+					// nudge its current live session (ref.sessionName) rather than
+					// bailing out with "agent not found in config". Without this the
+					// --nudge step 404s for any agent whose live session is
+					// adhoc-targeted, even though routing succeeded.
+					fmt.Fprintf(stderr, "gc sling: instance %q has no config identity; nudging via config agent %q on live session %q\n", ref.qualifiedInstance, a.QualifiedName(), ref.sessionName) //nolint:errcheck // best-effort
+					member = *a
 				}
 				target := buildSlingNudgeTarget(member, cityName, cityPath, cfg, sessionStore, ref.sessionName)
 				deliverSlingNudge(target, sp, sessionStore, cityPath, stdout, stderr)

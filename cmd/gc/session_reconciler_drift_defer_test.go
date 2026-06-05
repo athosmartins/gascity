@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beads"
 )
 
 // TestRecordSessionAttachedConfigDriftDeferral_SkipsWriteWithinRefreshInterval
@@ -275,6 +277,87 @@ func TestRecordSessionAttachedConfigDriftDeferral_SurvivesSkippedRefreshThenFlic
 		if !recentlyDeferredSessionAttachedConfigDrift(afterSkip, env.clk, driftKey) {
 			t.Fatalf("patrol=%s: deferral must read as valid at age refreshInterval+patrol "+
 				"(skipped refresh then flicker) or a still-attached session is drained", patrol)
+		}
+	}
+}
+
+// TestSessionAttachedForConfigDrift_PinnedIdleSessionSpared is the regression
+// test for ga-84rm: a pinned session with NO live tmux attachment (idle crew
+// like Oracle/Mila that nobody has a terminal open on at the reconcile tick)
+// must be treated as spared from config-drift handling. On parent (pre-fix)
+// this returned false because only live attachment was honored — so the
+// session fell through to a real config-drift drain decision on every
+// config_revision bump. After the fix the durable pin override (pin_awake)
+// spares it.
+func TestSessionAttachedForConfigDrift_PinnedIdleSessionSpared(t *testing.T) {
+	env := newReconcilerTestEnv()
+	session := env.createSessionBead("oracle", "oracle")
+	// Pinned, but explicitly NOT attached: no terminal connected.
+	env.setSessionMetadata(&session, map[string]string{"pin_awake": "true"})
+	env.sp.SetAttached("oracle", false)
+
+	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, env.cfg, "oracle")
+	if err != nil {
+		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
+	}
+	if !spared {
+		t.Fatal("pinned idle (unattached) session must be SPARED from config-drift drain; got spared=false")
+	}
+}
+
+// TestSessionAttachedForConfigDrift_UnpinnedIdleSessionNotSpared is the
+// counterpart guard: an UNpinned, unattached session must still be eligible for
+// config-drift handling. This proves the pin guard is narrow (it does not
+// blanket-spare every idle session) and that the original behavior is intact
+// for non-pinned crew.
+func TestSessionAttachedForConfigDrift_UnpinnedIdleSessionNotSpared(t *testing.T) {
+	env := newReconcilerTestEnv()
+	session := env.createSessionBead("digo", "digo")
+	env.sp.SetAttached("digo", false)
+
+	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, env.cfg, "digo")
+	if err != nil {
+		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
+	}
+	if spared {
+		t.Fatal("unpinned, unattached session must NOT be spared by the pin guard; got spared=true")
+	}
+}
+
+// TestSessionAttachedForConfigDrift_PinIsProviderIndependent verifies the pin
+// guard holds even when the runtime provider is unavailable (nil). Pinning is a
+// durable, bead-level signal and must not depend on a live provider probe.
+func TestSessionAttachedForConfigDrift_PinIsProviderIndependent(t *testing.T) {
+	env := newReconcilerTestEnv()
+	session := env.createSessionBead("mila", "mila")
+	env.setSessionMetadata(&session, map[string]string{"pin_awake": "true"})
+
+	spared, err := sessionAttachedForConfigDrift(session, nil, "", env.store, env.cfg, "mila")
+	if err != nil {
+		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
+	}
+	if !spared {
+		t.Fatal("pinned session must be spared even with a nil provider; got spared=false")
+	}
+}
+
+// TestSessionPinnedAwake_TrimsAndMatches checks the canonical pin predicate
+// matches the same normalization used elsewhere (trim + exact "true").
+func TestSessionPinnedAwake_TrimsAndMatches(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+	}{
+		{"true", true},
+		{"  true  ", true},
+		{"false", false},
+		{"", false},
+		{"1", false},
+	}
+	for _, tc := range cases {
+		b := beads.Bead{Metadata: map[string]string{"pin_awake": tc.val}}
+		if got := sessionPinnedAwake(b); got != tc.want {
+			t.Errorf("sessionPinnedAwake(pin_awake=%q) = %v, want %v", tc.val, got, tc.want)
 		}
 	}
 }
