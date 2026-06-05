@@ -779,11 +779,11 @@ func TestResolveTemplateExpandsPromptCommandTemplates(t *testing.T) {
 	if !strings.Contains(tp.Prompt, "Work=echo demo-city demo worker") {
 		t.Fatalf("Prompt missing expanded WorkQuery: %q", tp.Prompt)
 	}
-	if !strings.Contains(tp.Prompt, `Assigned=gc bd ready --assignee="$GC_SESSION_NAME"`) {
-		t.Fatalf("Prompt missing bd-1.0.4 assigned ready query: %q", tp.Prompt)
+	if !strings.Contains(tp.Prompt, "Assigned=echo demo-city demo worker") {
+		t.Fatalf("Prompt missing expanded AssignedReadyQuery: %q", tp.Prompt)
 	}
-	if strings.Contains(tp.Prompt, `Assigned=gc bd ready --include-ephemeral`) {
-		t.Fatalf("Prompt default assigned ready query should omit --include-ephemeral: %q", tp.Prompt)
+	if strings.Contains(tp.Prompt, "gc.routed_to") {
+		t.Fatalf("Prompt assigned-ready query should not include routed pool demand: %q", tp.Prompt)
 	}
 	if !strings.Contains(tp.Prompt, "Sling=dispatch {} --route=demo/worker --city=demo-city") {
 		t.Fatalf("Prompt missing expanded SlingQuery: %q", tp.Prompt)
@@ -818,7 +818,7 @@ func TestResolveTemplateAssignedReadyQueryUsesBD105Compatibility(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveTemplate: %v", err)
 	}
-	if !strings.Contains(tp.Prompt, `Assigned=gc bd ready --include-ephemeral --assignee="$GC_SESSION_NAME"`) {
+	if !strings.Contains(tp.Prompt, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
 		t.Fatalf("Prompt missing bd-1.0.5 assigned ready query: %q", tp.Prompt)
 	}
 }

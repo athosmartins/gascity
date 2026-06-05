@@ -93,6 +93,40 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 	}
 }
 
+func TestPoolSweepWouldDrain(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:worker"},
+		Metadata: map[string]string{
+			"session_name":         "worker-bd-123",
+			"template":             "worker",
+			"agent_name":           "worker",
+			poolManagedMetadataKey: boolMetadata(true),
+			"state":                "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	snap := newSessionBeadSnapshot([]beads.Bead{bead})
+	cfg := &config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}}
+
+	if !poolSweepWouldDrain(snap, map[string]TemplateParams{}, cfg) {
+		t.Fatalf("want drainPending=true: an open pool session is absent from desiredState (sweep would close it)")
+	}
+	if poolSweepWouldDrain(snap, map[string]TemplateParams{"worker-bd-123": {}}, cfg) {
+		t.Fatalf("want drainPending=false: the session is in desiredState")
+	}
+	if poolSweepWouldDrain(newSessionBeadSnapshot(nil), map[string]TemplateParams{}, cfg) {
+		t.Fatalf("want drainPending=false: no open sessions")
+	}
+	if poolSweepWouldDrain(nil, nil, cfg) || poolSweepWouldDrain(snap, nil, nil) {
+		t.Fatalf("nil snapshot/cfg must be safe (no drain)")
+	}
+}
+
 func TestSweepUndesiredPoolSessionBeads_UsesProcessNameFallback(t *testing.T) {
 	store := beads.NewMemStore()
 	bead, err := store.Create(beads.Bead{
@@ -3158,7 +3192,7 @@ func TestCityRuntimeTick_PrefixesEachJoinedWispGCErrorLine(t *testing.T) {
 		wg: fixedWispGC{err: fmt.Errorf(
 			"%s\n%s",
 			"deleting expired bead \"mol-1\": delete failed",
-			"listing closed order-tracking beads: list failed",
+			"listing closed molecule roots: list failed",
 		)},
 		rec:       events.Discard,
 		logPrefix: "test-city",
@@ -3177,7 +3211,7 @@ func TestCityRuntimeTick_PrefixesEachJoinedWispGCErrorLine(t *testing.T) {
 	got := stderr.String()
 	for _, want := range []string{
 		"test-city: wisp gc: deleting expired bead \"mol-1\": delete failed\n",
-		"test-city: wisp gc: listing closed order-tracking beads: list failed\n",
+		"test-city: wisp gc: listing closed molecule roots: list failed\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stderr = %q, want line %q", got, want)

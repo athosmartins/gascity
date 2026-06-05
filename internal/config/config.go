@@ -3263,23 +3263,35 @@ func (a *Agent) poolDemandTarget() string {
 }
 
 func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
-	script := `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+	return standardAssignedInProgressWorkQueryScript(includeEphemeralReady) +
+		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
+}
+
+func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
+	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
-		`done; ` +
-		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+		`done; `
+}
+
+func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
+	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=1 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
-	return script
 }
 
 func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
-	script := `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+	return legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) +
+		legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady)
+}
+
+func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
+	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
@@ -3288,8 +3300,11 @@ func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
-		`done; ` +
-		`for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
+		`done; `
+}
+
+func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
+	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
@@ -3299,7 +3314,6 @@ func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
 		`done; `
-	return script
 }
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
@@ -3324,6 +3338,20 @@ func poolDemandOriginGateScript() string {
 		`ephemeral|"") ;; ` +
 		`*) exit 0 ;; ` +
 		`esac; `
+}
+
+func routedPoolWorkQueryProbeScript(includeEphemeralReady bool, targetCount int) string {
+	script := poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
+	for i := 1; i <= targetCount; i++ {
+		script += fmt.Sprintf(`probe_pool_demand "$%d"; `, i)
+	}
+	return script + `printf "[]"`
+}
+
+func routedPoolWorkQueryCommand(includeEphemeralReady bool, targets ...string) string {
+	args := []string{"sh", "-c", routedPoolWorkQueryProbeScript(includeEphemeralReady, len(targets)), "--"}
+	args = append(args, targets...)
+	return shellquote.Join(args)
 }
 
 // EffectiveWorkQuery returns the work query command for this agent.
@@ -3393,6 +3421,81 @@ func (a *Agent) effectiveWorkQuery(includeEphemeralReady bool) string {
 		`probe_pool_demand "$2"; ` +
 		`printf "[]"`
 	return shellquote.Join([]string{"sh", "-c", script, "--", target, legacyTarget})
+}
+
+// EffectiveAssignedInProgressQuery returns the assigned-in-progress-only command
+// for prompt templates that spell out crash recovery as a separate startup tier.
+// A custom WorkQuery is treated as the caller-owned full discovery contract, so
+// split-tier prompts may run that same custom command in each query slot.
+func (a *Agent) EffectiveAssignedInProgressQuery() string {
+	return a.effectiveAssignedInProgressQuery(false)
+}
+
+// EffectiveAssignedInProgressQueryForBeads returns the assigned-in-progress
+// query using the bd compatibility semantics configured for the city.
+func (a *Agent) EffectiveAssignedInProgressQueryForBeads(beads BeadsConfig) string {
+	return a.effectiveAssignedInProgressQuery(beads.UsesBD105ReadySemantics())
+}
+
+func (a *Agent) effectiveAssignedInProgressQuery(includeEphemeralReady bool) string {
+	if a.WorkQuery != "" {
+		return a.WorkQuery
+	}
+	target := a.poolDemandTarget()
+	if legacyWorkflowControlQualifiedName(target) != "" {
+		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+	}
+	return shellquote.Join([]string{"sh", "-c", standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+}
+
+// EffectiveAssignedReadyQuery returns the assigned-ready-only command for
+// prompt templates that spell out claim-first startup in separate tiers. A
+// custom WorkQuery is treated as the caller-owned full discovery contract, so
+// split-tier prompts may run that same custom command in each query slot.
+func (a *Agent) EffectiveAssignedReadyQuery() string {
+	return a.effectiveAssignedReadyQuery(false)
+}
+
+// EffectiveAssignedReadyQueryForBeads returns the assigned-ready-only query
+// using the bd compatibility semantics configured for the city.
+func (a *Agent) EffectiveAssignedReadyQueryForBeads(beads BeadsConfig) string {
+	return a.effectiveAssignedReadyQuery(beads.UsesBD105ReadySemantics())
+}
+
+func (a *Agent) effectiveAssignedReadyQuery(includeEphemeralReady bool) string {
+	if a.WorkQuery != "" {
+		return a.WorkQuery
+	}
+	target := a.poolDemandTarget()
+	if legacyWorkflowControlQualifiedName(target) != "" {
+		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+	}
+	return shellquote.Join([]string{"sh", "-c", standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+}
+
+// EffectiveRoutedPoolQuery returns the routed-pool-only command for prompt
+// templates that spell out claim-first startup in separate tiers. It is the
+// prompt-side counterpart to EffectiveWorkQuery's routed pool tier.
+func (a *Agent) EffectiveRoutedPoolQuery() string {
+	return a.effectiveRoutedPoolQuery(false)
+}
+
+// EffectiveRoutedPoolQueryForBeads returns the routed-pool-only command using
+// the bd compatibility semantics configured for the city.
+func (a *Agent) EffectiveRoutedPoolQueryForBeads(beads BeadsConfig) string {
+	return a.effectiveRoutedPoolQuery(beads.UsesBD105ReadySemantics())
+}
+
+func (a *Agent) effectiveRoutedPoolQuery(includeEphemeralReady bool) string {
+	if a.WorkQuery != "" {
+		return a.WorkQuery
+	}
+	target := a.poolDemandTarget()
+	legacyTarget := legacyWorkflowControlQualifiedName(target)
+	if legacyTarget == "" {
+		return routedPoolWorkQueryCommand(includeEphemeralReady, target)
+	}
+	return routedPoolWorkQueryCommand(includeEphemeralReady, target, legacyTarget)
 }
 
 func legacyWorkflowControlQualifiedName(target string) string {

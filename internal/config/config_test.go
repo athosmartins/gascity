@@ -1835,6 +1835,155 @@ func TestEffectiveWorkQueryCustom(t *testing.T) {
 	}
 }
 
+func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedReadyQuery()
+	if strings.Contains(got, `--include-ephemeral`) {
+		t.Fatalf("EffectiveAssignedReadyQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
+	}
+	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=1`) {
+		t.Fatalf("EffectiveAssignedReadyQuery() missing assigned-ready tier: %q", got)
+	}
+	if strings.Contains(got, "gc.routed_to") {
+		t.Fatalf("EffectiveAssignedReadyQuery() should not include routed pool demand: %q", got)
+	}
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_NAME": "worker-session",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "ready --assignee=worker-session --json --limit=1") printf '[{"id":"assigned-ready"}]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[{"id":"assigned-ready"}]` {
+		t.Fatalf("EffectiveAssignedReadyQuery() output = %q, want assigned-ready work", out)
+	}
+}
+
+func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedReadyQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
+	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
+		t.Fatalf("EffectiveAssignedReadyQueryForBeads(bd-1.0.5) missing include-ephemeral assigned-ready tier: %q", got)
+	}
+}
+
+func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedInProgressQuery()
+	for _, want := range []string{
+		`"$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"`,
+		`bd list --status in_progress --assignee="$id" --json --limit=1`,
+		`ephemeral=true AND status=in_progress`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("EffectiveAssignedInProgressQuery() missing assigned recovery fragment %q: %q", want, got)
+		}
+	}
+	if strings.Contains(got, `bd ready`) {
+		t.Fatalf("EffectiveAssignedInProgressQuery() should not include assigned-ready or routed pool demand: %q", got)
+	}
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_ID": "worker-bead",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "list --status in_progress --assignee=worker-bead --json --limit=1") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[{"id":"assigned-in-progress","ephemeral":true}]` {
+		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want assigned in-progress work", out)
+	}
+}
+
+func TestEffectiveAssignedReadyQueryCustomPreservesOverride(t *testing.T) {
+	const custom = "custom work query"
+	a := Agent{Name: "worker", WorkQuery: custom}
+	if got := a.EffectiveAssignedInProgressQuery(); got != custom {
+		t.Fatalf("EffectiveAssignedInProgressQuery() = %q, want custom override %q", got, custom)
+	}
+	if got := a.EffectiveAssignedReadyQuery(); got != custom {
+		t.Fatalf("EffectiveAssignedReadyQuery() = %q, want custom override %q", got, custom)
+	}
+	if got := a.EffectiveRoutedPoolQuery(); got != custom {
+		t.Fatalf("EffectiveRoutedPoolQuery() = %q, want custom override %q", got, custom)
+	}
+}
+
+func TestEffectiveRoutedPoolQueryDefault(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveRoutedPoolQuery()
+	if strings.Contains(got, `bd list --include-ephemeral --status in_progress`) ||
+		strings.Contains(got, `bd ready --include-ephemeral --assignee`) {
+		t.Fatalf("EffectiveRoutedPoolQuery() should be routed-pool-only: %q", got)
+	}
+	for _, want := range []string{
+		`probe_pool_demand "$1"`,
+		`hello-world/worker`,
+		`gc.routed_to`,
+		`gc.run_target`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("EffectiveRoutedPoolQuery() missing routed pool fragment %q: %q", want, got)
+		}
+	}
+
+	out := runShellWithFakeBd(t, got, nil, `#!/bin/sh
+set -eu
+case "$*" in
+  ready*"--metadata-field gc.routed_to=hello-world/worker"*) printf '[{"id":"routed-pool"}]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[{"id":"routed-pool"}]` {
+		t.Fatalf("EffectiveRoutedPoolQuery() output = %q, want routed pool work", out)
+	}
+}
+
+func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.T) {
+	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
+	got := a.EffectiveAssignedReadyQuery()
+	for _, want := range []string{
+		`case "$id" in *control-dispatcher)`,
+		`for cand in "$id" "$legacy"`,
+		`bd ready --assignee="$cand"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("EffectiveAssignedReadyQuery() = %q, want legacy alias fragment %q", got, want)
+		}
+	}
+	if strings.Contains(got, `bd list --status in_progress`) {
+		t.Fatalf("EffectiveAssignedReadyQuery() should not include in-progress tier: %q", got)
+	}
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_NAME": "gascity--control-dispatcher",
+		"GC_ALIAS":        "gascity/control-dispatcher",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "ready --assignee=gascity--control-dispatcher --json --limit=1"|\
+  "ready --assignee=gascity/control-dispatcher --json --limit=1")
+    printf '[]'
+    ;;
+  "ready --assignee=gascity--workflow-control --json --limit=1"|\
+  "ready --assignee=gascity/workflow-control --json --limit=1")
+    printf '[{"id":"ga-legacy-ready"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if got, want := strings.TrimSpace(out), `[{"id":"ga-legacy-ready"}]`; got != want {
+		t.Fatalf("legacy assigned-ready query output = %q, want %q", got, want)
+	}
+}
+
 func TestEffectiveWorkQueryWithDir(t *testing.T) {
 	a := Agent{Name: "polecat", Dir: "hello-world"}
 	got := a.EffectiveWorkQuery()

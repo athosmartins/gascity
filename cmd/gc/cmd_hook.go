@@ -24,8 +24,8 @@ func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "hook [agent]",
-		Short: "Check for available work",
-		Long: `Checks for available work using the agent's work_query config.
+		Short: "Find routed work for an agent",
+		Long: `Finds routed work using the agent's work_query config.
 
 Without --inject: prints normalized ready-only output, exits 0 if work exists, 1 if empty.
 With --inject: silent legacy Stop-hook compatibility; skips the work query and always exits 0.
@@ -193,8 +193,18 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 	}
 	queryEnv := mergeRuntimeEnv(os.Environ(), overrides)
 	failureTemplate, emitFailureEvent := hookWorkQueryFailureTemplate(len(args) > 0, sessionTemplateContext, a.QualifiedName())
-	runner := func(command, dir string) (string, error) {
-		out, err := shellWorkQueryWithEnv(command, dir, queryEnv)
+
+	// A cross-store-eligible (city-scoped) agent federates its work query across
+	// all stores — its own first, then every rig store — matched on its own
+	// identity (vp-kvp stage iii). Rig agents get a single-entry list, so their
+	// behavior is byte-for-byte unchanged.
+	stores := []hookStore{{dir: workDir, env: queryEnv}}
+	if agentIsCrossStoreEligible(&a) {
+		stores = appendRigHookStores(stores, cityPath, cfg, &a, overrides)
+	}
+
+	runner := func(command, _ string) (string, error) {
+		out, err := firstStoreWithWork(command, stores, shellWorkQueryWithEnv)
 		if err != nil && emitFailureEvent {
 			// A killed/timed-out work query strands the session with no
 			// output and no cause on the event bus; emit one so the
