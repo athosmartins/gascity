@@ -177,6 +177,24 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
 	}
 	if sa != "" {
+		// ga-629k: when an agent opts out of Remote Control (remote_control =
+		// false on system/pool agents — dog/polecat/witness/refinery/boot/
+		// deacon), swap the file-path --settings arg for an inline override
+		// that overlays {"remoteControlAtStartup": false} onto the same managed
+		// settings (hooks preserved). The Mayor and named crew leave
+		// remote_control unset and keep the plain file-path arg, so their
+		// sessions still register for Remote Control. ensureClaudeSettingsArgs
+		// above still projects + stages the on-disk settings file, so the
+		// overlay reads current managed hooks.
+		if cfgAgent.RemoteControl != nil && !*cfgAgent.RemoteControl {
+			override, rcErr := config.RemoteControlSettingsArg(p.cityPath, providerFamily)
+			if rcErr != nil {
+				return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, rcErr)
+			}
+			if override != "" {
+				sa = override
+			}
+		}
 		command = command + " " + sa
 		settingsFile, relDst := claudeSettingsSource(p.cityPath)
 		if settingsFile != "" {

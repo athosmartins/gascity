@@ -91,6 +91,9 @@ type AgentPatch struct {
 	// InjectAssignedSkills overrides per-agent appendix injection
 	// (see Agent.InjectAssignedSkills).
 	InjectAssignedSkills *bool `toml:"inject_assigned_skills,omitempty"`
+	// RemoteControl overrides whether sessions register for Claude Code Remote
+	// Control at startup (see Agent.RemoteControl). nil = inherit.
+	RemoteControl *bool `toml:"remote_control,omitempty"`
 	// SessionSetup overrides the agent's session_setup commands.
 	SessionSetup []string `toml:"session_setup,omitempty"`
 	// SessionSetupScript overrides the agent's session_setup_script path.
@@ -363,6 +366,9 @@ func applyAgentPatchFields(a *Agent, p *AgentPatch) {
 	}
 	if p.InjectAssignedSkills != nil {
 		a.InjectAssignedSkills = p.InjectAssignedSkills
+	}
+	if p.RemoteControl != nil {
+		a.RemoteControl = p.RemoteControl
 	}
 	if len(p.SessionSetup) > 0 {
 		a.SessionSetup = append([]string(nil), p.SessionSetup...)

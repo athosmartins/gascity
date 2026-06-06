@@ -586,6 +586,9 @@ type AgentOverride struct {
 	// InjectAssignedSkills overrides Agent.InjectAssignedSkills
 	// (see that field for semantics).
 	InjectAssignedSkills *bool `toml:"inject_assigned_skills,omitempty"`
+	// RemoteControl overrides Agent.RemoteControl (Claude Code Remote Control
+	// at startup). nil = inherit.
+	RemoteControl *bool `toml:"remote_control,omitempty"`
 	// SessionSetup overrides the agent's session_setup commands.
 	SessionSetup []string `toml:"session_setup,omitempty"`
 	// SessionSetupScript overrides the agent's session_setup_script path.
@@ -2197,6 +2200,21 @@ type Agent struct {
 	ProcessNames []string `toml:"process_names,omitempty"`
 	// EmitsPermissionWarning indicates whether the agent emits permission prompts that should be suppressed.
 	EmitsPermissionWarning *bool `toml:"emits_permission_warning,omitempty"`
+	// RemoteControl controls whether sessions for this agent register for
+	// Claude Code Remote Control (the mobile/web control surface) at startup.
+	//
+	// Nil (unset) preserves the inherited default — typically the user's
+	// global ~/.claude/settings.json `remoteControlAtStartup` value — so
+	// existing behavior is unchanged. Set false on system / pool agents
+	// (dog, polecat, witness, refinery, boot, deacon) so their ephemeral
+	// worker sessions do NOT clutter the operator's remote-control list
+	// (ga-629k); leave unset/true on the Mayor and named crew, which are the
+	// sessions an operator actually wants to drive from a phone.
+	//
+	// When false and the resolved provider family is "claude", the engine
+	// overlays {"remoteControlAtStartup": false} onto the provider-owned
+	// --settings payload for that session (see remoteControlSettingsOverride).
+	RemoteControl *bool `toml:"remote_control,omitempty"`
 	// Env sets additional environment variables for the agent process.
 	Env map[string]string `toml:"env,omitempty"`
 	// OptionDefaults overrides the provider's effective schema defaults
@@ -2866,6 +2884,39 @@ func (a *Agent) SupportsInstanceExpansion() bool {
 		return true
 	}
 	return false
+}
+
+// IsSingleIdentitySession reports whether this agent is an identity-bound,
+// single-instance agent (crew like digo / mila / oracle) rather than an
+// expansion pool (dog / polecat) that legitimately runs multiple numbered
+// instances.
+//
+// ga-i67t: identity-bound agents must have at most one live session. A second
+// dispatch to a live single-identity builder used to auto-suffix a duplicate
+// (digo -> digo-1) sharing the same crew/<identity>/* branch namespace and
+// work_dir, causing git races and config-drift churn. The desired-state spawn
+// path reuses the existing live session instead of creating a duplicate when
+// this predicate is true.
+//
+// An agent is an expansion pool (NOT single-identity) when it has any explicit
+// pool control — MinActiveSessions, ScaleCheck, a namepool, or an explicit
+// MaxActiveSessions > 1. Everything else (uncapped crew, or max_active = 1 with
+// no pool controls) is treated as single-identity. Pool agents are therefore
+// exempt and keep their multi-instance behavior.
+func (a *Agent) IsSingleIdentitySession() bool {
+	if a == nil {
+		return false
+	}
+	if a.MinActiveSessions != nil || strings.TrimSpace(a.ScaleCheck) != "" {
+		return false
+	}
+	if strings.TrimSpace(a.Namepool) != "" || len(a.NamepoolNames) > 0 {
+		return false
+	}
+	if m := a.EffectiveMaxActiveSessions(); m != nil && *m > 1 {
+		return false
+	}
+	return true
 }
 
 // HasUnlimitedSessionCapacity reports whether max_active_sessions is unbounded.

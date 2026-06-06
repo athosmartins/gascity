@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -11,6 +12,54 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/shellquote"
 )
+
+// remoteControlStartupKey is the Claude Code settings key that controls whether
+// a launched session registers for Remote Control (the mobile/web control
+// surface) at startup. The user's global ~/.claude/settings.json sets this to
+// true, so every gascity-spawned claude session inherits it unless overridden
+// per session. See RemoteControlSettingsArg.
+const remoteControlStartupKey = "remoteControlAtStartup"
+
+// RemoteControlSettingsArg builds the provider --settings argument for a claude
+// session whose Remote Control registration must be forced OFF (ga-629k:
+// pool/system worker sessions should not clutter the operator's remote-control
+// list, while the Mayor and named crew keep it on).
+//
+// Claude's `--settings` flag is a SINGLE flag that accepts either a file path
+// or an inline JSON string. Passing the flag twice has undocumented merge
+// semantics, so this helper produces ONE flag whose payload is the existing
+// city settings file content with {"remoteControlAtStartup": false} overlaid.
+// This preserves the city's managed hooks (SessionStart=gc prime,
+// UserPromptSubmit=gc nudge/mail, PreCompact=handoff) while disabling remote
+// control for the session — the file path arg is never emitted in this case.
+//
+// providerName must be "claude"; other providers have no remote-control surface
+// and get an empty string (caller keeps whatever settings arg it already had).
+// Returns "" when the provider is not claude so callers can fall through to the
+// default file-path arg unchanged.
+func RemoteControlSettingsArg(cityPath, providerName string) (string, error) {
+	if providerName != "claude" {
+		return "", nil
+	}
+	merged := map[string]any{}
+	if settingsPath, _ := ProviderSettingsSource(cityPath, providerName); settingsPath != "" {
+		data, err := os.ReadFile(settingsPath) //nolint:gosec // path derived from city layout
+		if err != nil {
+			return "", fmt.Errorf("reading claude settings %q for remote-control override: %w", settingsPath, err)
+		}
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, &merged); err != nil {
+				return "", fmt.Errorf("parsing claude settings %q for remote-control override: %w", settingsPath, err)
+			}
+		}
+	}
+	merged[remoteControlStartupKey] = false
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		return "", fmt.Errorf("encoding remote-control settings override: %w", err)
+	}
+	return fmt.Sprintf("--settings %s", shellquote.Quote(string(encoded))), nil
+}
 
 // ProviderLaunchCommand is the fully composed provider command plus any
 // provider-owned settings file discovered for that launch.

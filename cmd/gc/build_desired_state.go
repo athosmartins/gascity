@@ -2499,6 +2499,30 @@ func selectOrPlanPoolSessionBead(
 			return bead, slot, nil, err
 		}
 	}
+	// ga-i67t: single-instance identity guard. For identity-bound crew agents
+	// (digo / mila / oracle — no pool controls), refuse to spawn a duplicate
+	// when a live session already owns the canonical identity. Reuse the
+	// existing session instead of auto-suffixing a second instance
+	// (digo -> digo-1) that would share the same crew/<identity>/* branch
+	// namespace and work_dir, causing git races and config-drift churn.
+	//
+	// This is stronger than the ordinary reuse scan above: it reuses the live
+	// session even when it currently holds assigned work or is asleep, because
+	// for a single-identity agent a SECOND concurrent session is never correct
+	// (the resume tier already reused the in-progress session when one matched;
+	// this branch only runs for fresh new-demand). Expansion pools (dog /
+	// polecat — Min/ScaleCheck/namepool/max>1) are exempt:
+	// IsSingleIdentitySession is false for them, so they keep multi-instance
+	// behavior with distinct numbered identities.
+	if cfgAgent.IsSingleIdentitySession() && bp != nil && bp.sessionBeads != nil {
+		identity := strings.TrimSpace(cfgAgent.QualifiedName())
+		if existing, ok := bp.sessionBeads.FindLiveSessionBeadByAgentName(identity); ok &&
+			liveSingleIdentitySessionReusable(existing, used) {
+			slot := claimDesiredPoolSlot(bp.city, cfgAgent, existing, usedSlots)
+			bead, err := normalizeNonExpandingPoolSessionBeadForSelection(bp, cfgAgent, existing)
+			return bead, slot, nil, err
+		}
+	}
 	slot := claimDesiredPoolSlot(bp.city, cfgAgent, beads.Bead{}, usedSlots)
 	_, qualifiedInstance, poolSlot := poolDesiredRequestIdentity(cfgAgent, slot)
 	if !bp.tryClaimPoolSessionCreate(template) {
@@ -2536,6 +2560,32 @@ func claimDesiredPoolSlot(cfg *config.City, cfgAgent *config.Agent, sessionBead 
 		return 0
 	}
 	return claimPoolSlotWithConfig(cfg, cfgAgent, sessionBead, used)
+}
+
+// liveSingleIdentitySessionReusable reports whether an existing session bead is
+// a live session that a single-identity agent (ga-i67t) must reuse instead of
+// spawning a duplicate. Unlike reusablePoolSessionBead it deliberately does NOT
+// exclude sessions that hold assigned work or are asleep: enforcing one live
+// session per identity takes precedence over those reuse heuristics. It still
+// excludes terminal/transient-dead states (closed, drained, failed-create) and
+// beads already consumed earlier in this build.
+func liveSingleIdentitySessionReusable(bead beads.Bead, used map[string]bool) bool {
+	if strings.TrimSpace(bead.ID) == "" {
+		return false
+	}
+	if bead.Status == "closed" {
+		return false
+	}
+	if isDrainedSessionBead(bead) {
+		return false
+	}
+	if isFailedCreateSessionBead(bead) {
+		return false
+	}
+	if used != nil && used[bead.ID] {
+		return false
+	}
+	return true
 }
 
 func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, template string, bead beads.Bead, used map[string]bool) bool {

@@ -136,7 +136,7 @@ func TestSessionAttachedForConfigDrift_PinnedIdleSessionSpared(t *testing.T) {
 	env.setSessionMetadata(&session, map[string]string{"pin_awake": "true"})
 	env.sp.SetAttached("oracle", false)
 
-	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, env.cfg, "oracle")
+	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, nil, env.cfg, "oracle")
 	if err != nil {
 		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestSessionAttachedForConfigDrift_UnpinnedIdleSessionNotSpared(t *testing.T
 	session := env.createSessionBead("digo", "digo")
 	env.sp.SetAttached("digo", false)
 
-	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, env.cfg, "digo")
+	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, nil, env.cfg, "digo")
 	if err != nil {
 		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
 	}
@@ -172,12 +172,61 @@ func TestSessionAttachedForConfigDrift_PinIsProviderIndependent(t *testing.T) {
 	session := env.createSessionBead("mila", "mila")
 	env.setSessionMetadata(&session, map[string]string{"pin_awake": "true"})
 
-	spared, err := sessionAttachedForConfigDrift(session, nil, "", env.store, env.cfg, "mila")
+	spared, err := sessionAttachedForConfigDrift(session, nil, "", env.store, nil, env.cfg, "mila")
 	if err != nil {
 		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
 	}
 	if !spared {
 		t.Fatal("pinned session must be spared even with a nil provider; got spared=false")
+	}
+}
+
+// TestSessionAttachedForConfigDrift_AssignedWorkSpared is the FIX C regression
+// (ga-r471): an UNpinned, UNattached session that holds open assigned work
+// (story:in-flight) must be SPARED from config-drift drain so a pool dog or
+// crew actively building/reviewing is not killed mid-task by a config_revision
+// bump. The drift applies once the work bead closes and the session is idle.
+func TestSessionAttachedForConfigDrift_AssignedWorkSpared(t *testing.T) {
+	env := newReconcilerTestEnv()
+	session := env.createSessionBead("digo", "digo")
+	env.sp.SetAttached("digo", false) // not attached
+	// Not pinned. Give it open assigned work (a non-session bead assigned to
+	// the session's identity).
+	if _, err := env.store.Create(beads.Bead{
+		Title:    "build story",
+		Type:     "task",
+		Status:   "open",
+		Assignee: "digo",
+	}); err != nil {
+		t.Fatalf("creating assigned work bead: %v", err)
+	}
+
+	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, nil, env.cfg, "digo")
+	if err != nil {
+		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
+	}
+	if !spared {
+		t.Fatal("session with open assigned work must be SPARED from config-drift drain; got spared=false")
+	}
+}
+
+// TestSessionAttachedForConfigDrift_NoAssignedWorkNotSpared is the FIX C
+// counterpart: an unpinned, unattached session with NO assigned work must NOT
+// be spared by the assigned-work guard — it remains eligible for config-drift
+// handling. This proves the guard is narrow and the drain path still fires for
+// idle sessions.
+func TestSessionAttachedForConfigDrift_NoAssignedWorkNotSpared(t *testing.T) {
+	env := newReconcilerTestEnv()
+	session := env.createSessionBead("digo", "digo")
+	env.sp.SetAttached("digo", false)
+	// No work bead assigned to "digo".
+
+	spared, err := sessionAttachedForConfigDrift(session, env.sp, "", env.store, nil, env.cfg, "digo")
+	if err != nil {
+		t.Fatalf("sessionAttachedForConfigDrift: %v", err)
+	}
+	if spared {
+		t.Fatal("session with no assigned work must NOT be spared by the assigned-work guard; got spared=true")
 	}
 }
 

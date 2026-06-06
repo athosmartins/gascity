@@ -1322,7 +1322,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					ackReason, reconcilerOwnedAck := reconcilerDrainAckMatchesSession(*session, sp, name)
 					if reconcilerOwnedAck && ackReason == "config-drift" {
 						driftKey := sessionConfigDriftKey(*session, cfg, tp)
-						attached, attachErr := sessionAttachedForConfigDrift(*session, sp, cityPath, store, cfg, name)
+						attached, attachErr := sessionAttachedForConfigDrift(*session, sp, cityPath, store, rigStores, cfg, name)
 						if attachErr != nil {
 							fmt.Fprintf(stderr, "session reconciler: observing config-drift attachment for %s: %v\n", name, attachErr) //nolint:errcheck
 						}
@@ -1582,7 +1582,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						// kill; a single transient IsAttached false negative
 						// would destroy conversation context irreversibly.
 						driftKey := storedHash + ":" + currentHash
-						attached, attachErr := sessionAttachedForConfigDrift(*session, sp, cityPath, store, cfg, name)
+						attached, attachErr := sessionAttachedForConfigDrift(*session, sp, cityPath, store, rigStores, cfg, name)
 						if attachErr != nil {
 							fmt.Fprintf(stderr, "session reconciler: observing config-drift attachment for %s: %v\n", name, attachErr) //nolint:errcheck
 						}
@@ -2796,12 +2796,16 @@ func sessionPinnedAwake(session beads.Bead) bool {
 }
 
 // sessionAttachedForConfigDrift reports whether a session should be SPARED from
-// config-drift handling (drain / re-prime). A session is spared when either:
+// config-drift handling (drain / re-prime). A session is spared when any of:
 //
 //   - it is currently attached (a user terminal — including an external/Remote
 //     Control tmux client — is connected, via worker-handle observation or the
 //     provider's direct #{session_attached} probe), OR
-//   - it carries the durable pin override (pin_awake=true).
+//   - it carries the durable pin override (pin_awake=true), OR
+//   - it has open assigned work in a reachable store (ga-r471): a pool dog or
+//     other worker actively building/reviewing a story (story:in-flight) must
+//     not be drained mid-task by a config_revision bump. The drift applies once
+//     the session finishes its work and the bead closes.
 //
 // The pin guard is the durable fix for ga-84rm: previously only live tmux
 // attachment was honored, so a pinned-but-idle crew session (Oracle/Mila) that
@@ -2811,23 +2815,43 @@ func sessionPinnedAwake(session beads.Bead) bool {
 // drift applies after the operator unpins. Both config-drift call sites route
 // through this function, so the guard is enforced uniformly (drain-ack cancel
 // path and the named/ordinary drain path alike).
-func sessionAttachedForConfigDrift(session beads.Bead, sp runtime.Provider, cityPath string, store beads.Store, cfg *config.City, name string) (bool, error) {
+//
+// The assigned-work guard (ga-r471) uses the same live cross-store query as the
+// session-close work guard (sessionHasOpenAssignedWorkForReachableStore), so a
+// drain decision and a close decision agree about which sessions hold work.
+// Query failures fail OPEN for sparing (treat as no assigned work) only after
+// the pin and attachment checks; the assigned-work check is best-effort and any
+// error is surfaced to the caller via the returned error.
+func sessionAttachedForConfigDrift(session beads.Bead, sp runtime.Provider, cityPath string, store beads.Store, rigStores map[string]beads.Store, cfg *config.City, name string) (bool, error) {
 	// Pin is a durable, provider-independent signal — honor it even when the
 	// runtime provider is unavailable or reports no live attachment.
 	if sessionPinnedAwake(session) {
 		return true, nil
 	}
-	if sp == nil {
-		return false, nil
-	}
 	var observeErr error
-	if attached, err := workerSessionTargetAttachedWithConfig(cityPath, store, sp, cfg, session.ID); err != nil {
-		observeErr = err
-	} else if attached {
-		return true, nil
+	if sp != nil {
+		if attached, err := workerSessionTargetAttachedWithConfig(cityPath, store, sp, cfg, session.ID); err != nil {
+			observeErr = err
+		} else if attached {
+			return true, nil
+		}
+		if sp.IsAttached(name) {
+			return true, observeErr
+		}
 	}
-	if sp.IsAttached(name) {
-		return true, observeErr
+	// ga-r471: spare sessions that hold open assigned work (story:in-flight) so
+	// an actively building/reviewing worker is not drained mid-task. Checked
+	// regardless of provider availability — a session with in-flight work must
+	// survive config drift even when the runtime provider can't be probed.
+	if store != nil {
+		hasAssignedWork, workErr := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, session)
+		if workErr != nil {
+			if observeErr == nil {
+				observeErr = workErr
+			}
+		} else if hasAssignedWork {
+			return true, observeErr
+		}
 	}
 	return false, observeErr
 }

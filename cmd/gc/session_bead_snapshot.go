@@ -213,6 +213,23 @@ func (s *sessionBeadSnapshot) FindSessionBeadByTemplate(template string) (beads.
 	return beads.Bead{}, false
 }
 
+// FindLiveSessionBeadByAgentName returns the open session bead whose concrete
+// agent identity (agent_name / alias / stamped pool identity) equals agentName,
+// if one exists. Used by the single-identity spawn guard (ga-i67t) to reuse an
+// existing live session for an identity-bound crew agent instead of creating a
+// duplicate. The index is built over open (non-closed) beads only.
+func (s *sessionBeadSnapshot) FindLiveSessionBeadByAgentName(agentName string) (beads.Bead, bool) {
+	if s == nil || strings.TrimSpace(agentName) == "" {
+		return beads.Bead{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if id := s.beadIDByAgentName[agentName]; id != "" {
+		return s.findByIDLocked(id)
+	}
+	return beads.Bead{}, false
+}
+
 func (s *sessionBeadSnapshot) FindByID(id string) (beads.Bead, bool) {
 	if s == nil || strings.TrimSpace(id) == "" {
 		return beads.Bead{}, false
