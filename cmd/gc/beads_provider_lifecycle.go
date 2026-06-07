@@ -536,8 +536,26 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 		}
 	}
 	// Non-fatal: hooks are convenience (event forwarding), not critical.
+	// A config reload must never abort just because the event hooks could not be
+	// (re)written. In particular, .beads/hooks may be intentionally emptied and
+	// made immutable (chflags uchg) to force the native controller-cache event
+	// path (ga-rfq1j). In that state the atomic temp-file write fails with EPERM
+	// ("operation not permitted"); the prior code returned that error and wedged
+	// EVERY reload, which let config drift accumulate until sessions were
+	// drained/re-primed (ga: hooks-lock reload wedge). Honor the documented
+	// non-fatal intent: log and continue.
+	installBeadHooksNonFatal(dir, cityPath)
+	return nil
+}
+
+// installBeadHooksNonFatal installs the bead event-forwarding hooks but never
+// fails the caller. Hooks are convenience, and the hooks directory may be
+// intentionally immutable (ga-rfq1j), which makes the atomic write return EPERM.
+// A reload/init must still complete so config-drift reconcile is not wedged.
+// Returns nil unconditionally; the error (if any) is logged.
+func installBeadHooksNonFatal(dir, cityPath string) error {
 	if err := installBeadHooks(dir, cityPath); err != nil {
-		return fmt.Errorf("install hooks at %s: %w", dir, err)
+		log.Printf("gc: install hooks at %s skipped (non-fatal): %v", dir, err)
 	}
 	return nil
 }

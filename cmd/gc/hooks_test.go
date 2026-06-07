@@ -609,3 +609,34 @@ func TestInstallBeadHooksRigAddIntegration(t *testing.T) {
 		t.Errorf("gc rig add did not install bd hooks: %v", err)
 	}
 }
+
+// TestInstallBeadHooksNonFatalSwallowsUnwritableDir is the regression guard for
+// the hooks-lock reload wedge: when .beads/hooks cannot be written (e.g. it was
+// emptied and made immutable per ga-rfq1j to force native cache events), the
+// strict installBeadHooks returns an error, but installBeadHooksNonFatal — used
+// by initAndHookDir — MUST swallow it so config reloads/inits never abort.
+func TestInstallBeadHooksNonFatalSwallowsUnwritableDir(t *testing.T) {
+	dir := t.TempDir()
+	hooksDir := filepath.Join(dir, ".beads", "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Make the hooks dir non-writable so the atomic temp-file write fails,
+	// mirroring the EPERM seen against a chflags-immutable directory.
+	if err := os.Chmod(hooksDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hooksDir, 0o755) })
+
+	// Precondition: the strict installer must actually fail here. If it does
+	// not (e.g. running as root, which bypasses directory permissions), the
+	// non-fatal path cannot be exercised — skip rather than pass vacuously.
+	if err := installBeadHooks(dir, dir); err == nil {
+		t.Skip("hooks dir write unexpectedly succeeded (running as root?) — cannot exercise failure path")
+	}
+
+	// The fix: the non-fatal wrapper must return nil despite the write failure.
+	if err := installBeadHooksNonFatal(dir, dir); err != nil {
+		t.Fatalf("installBeadHooksNonFatal must swallow install errors, got: %v", err)
+	}
+}
