@@ -46,6 +46,7 @@ func buildAwakeInputFromReconciler(
 			Suspended:         isAgentEffectivelySuspended(cfg, a),
 			SleepAfterIdle:    parseSleepDuration(a.SleepAfterIdle),
 			MinActiveSessions: a.EffectiveMinActiveSessions(),
+			SingletonIdentity: isSingletonIdentityAgent(a),
 		}
 		if len(a.DependsOn) > 0 {
 			agent.DependsOn = a.DependsOn
@@ -248,4 +249,24 @@ func parseSleepDuration(s string) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// isSingletonIdentityAgent reports whether an agent template collapses every
+// session bead to a single canonical identity and therefore may have at most
+// one awake session at a time across ALL activation paths (ga-b41wn).
+//
+// This is true for max_active_sessions == 1 with no namepool — covering both
+// the pool/crew flavor (UsesCanonicalSingletonPoolIdentity) and the
+// named-session flavor (a single bare canonical identity). Namepool agents are
+// excluded because each slot is a distinct addressable identity, so two awake
+// namepool members are legitimate, not a duplicate.
+func isSingletonIdentityAgent(a *config.Agent) bool {
+	if a == nil {
+		return false
+	}
+	if strings.TrimSpace(a.Namepool) != "" || len(a.NamepoolNames) > 0 {
+		return false
+	}
+	m := a.EffectiveMaxActiveSessions()
+	return m != nil && *m == 1
 }

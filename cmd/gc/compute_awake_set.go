@@ -42,6 +42,15 @@ type AwakeAgent struct {
 	Suspended         bool
 	SleepAfterIdle    time.Duration // 0 = disabled
 	MinActiveSessions int           // effective min_active_sessions; 0 = no always-warm guarantee
+	// SingletonIdentity is true for singleton-crew templates: agents whose
+	// configuration collapses every session bead to a single canonical
+	// identity (max_active_sessions == 1, no namepool). For these agents at
+	// most ONE bead may be awake at a time across ALL activation paths —
+	// new/sling, wake, resume, and reconciler-revive. The new/sling path has
+	// its own cap+mutex, but the resume/wake/revive path reactivates an
+	// EXISTING bead and bypasses that check, so the awake-set must enforce
+	// the single-identity mutex here too (ga-b41wn).
+	SingletonIdentity bool
 }
 
 // AwakeNamedSession represents a [[named_session]] config entry.
@@ -443,7 +452,130 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		result[name] = decision
 	}
 
+	// Single-identity mutex for singleton-crew templates (ga-b41wn).
+	//
+	// A singleton-crew agent (max_active_sessions == 1, no namepool) collapses
+	// every session bead to ONE canonical identity, so at most one of its beads
+	// may be awake at a time. The gc session new / SLING activation path already
+	// enforces this via a cap + mutex (ga-i67t), but the resume / wake /
+	// reconciler-revive path reactivates an EXISTING bead and never re-checks
+	// the cap. That left a window where a second bead — e.g. a manual
+	// `--resume` bead with continuation_reset_pending — could be marked awake
+	// alongside the live canonical session, producing TWO active sessions for
+	// the same crew identity on the same rig (observed: digo-wa).
+	//
+	// Every activation path funnels through ComputeAwakeSet, so deduping here
+	// closes ALL vectors with one surgical check. Among the beads this tick
+	// marked ShouldWake for a singleton-crew template, keep exactly one
+	// (refuse-or-reuse: the survivor is the healthiest/most-canonical existing
+	// session) and suppress the rest.
+	applySingletonIdentityMutex(input, result)
+
 	return result
+}
+
+// singletonTemplateSet returns the set of template (qualified agent) names that
+// are singleton-crew: at most one awake bead is permitted across all activation
+// paths.
+func singletonTemplateSet(agents []AwakeAgent) map[string]bool {
+	var set map[string]bool
+	for _, a := range agents {
+		if !a.SingletonIdentity {
+			continue
+		}
+		if set == nil {
+			set = make(map[string]bool)
+		}
+		set[a.QualifiedName] = true
+	}
+	return set
+}
+
+// applySingletonIdentityMutex enforces the single-identity mutex: for each
+// singleton-crew template, at most one bead may remain ShouldWake. When more
+// than one bead was marked awake this tick, the most preferred survivor is kept
+// and the rest are demoted to ShouldWake=false with reason "singleton-mutex".
+//
+// Survivor preference (refuse-or-reuse — favor the already-live, canonical
+// session over a freshly-reviving duplicate):
+//  1. attached to a user
+//  2. currently running (tmux alive) and state=active
+//  3. NOT a manual/resume bead (the configured canonical identity)
+//  4. NOT pending a continuation reset (avoid keeping the half-reset resume bead)
+//  5. lowest bead ID (stable tie-break)
+func applySingletonIdentityMutex(input AwakeInput, result map[string]AwakeDecision) {
+	singletons := singletonTemplateSet(input.Agents)
+	if len(singletons) == 0 {
+		return
+	}
+
+	// Group awake beads by singleton template.
+	awakeByTemplate := make(map[string][]AwakeSessionBead)
+	for _, bead := range input.SessionBeads {
+		if !singletons[bead.Template] {
+			continue
+		}
+		// Namepool / configured-named beads carry distinct identities and are
+		// never collapsed to one canonical identity; the SingletonIdentity flag
+		// already excludes namepool, and configured-named singleton agents have
+		// exactly one identity, so grouping by template is the identity here.
+		d, ok := result[bead.SessionName]
+		if !ok || !d.ShouldWake {
+			continue
+		}
+		awakeByTemplate[bead.Template] = append(awakeByTemplate[bead.Template], bead)
+	}
+
+	for _, beadsForTemplate := range awakeByTemplate {
+		if len(beadsForTemplate) < 2 {
+			continue // no collision
+		}
+		winner := beadsForTemplate[0]
+		for _, candidate := range beadsForTemplate[1:] {
+			if singletonSurvivorPreferred(input, candidate, winner) {
+				winner = candidate
+			}
+		}
+		for _, bead := range beadsForTemplate {
+			if bead.SessionName == winner.SessionName {
+				continue
+			}
+			result[bead.SessionName] = AwakeDecision{
+				ShouldWake:      false,
+				Reason:          "singleton-mutex",
+				HasAssignedWork: result[bead.SessionName].HasAssignedWork,
+			}
+		}
+	}
+}
+
+// singletonSurvivorPreferred reports whether candidate should win over current
+// as the single awake bead for a singleton-crew identity. See
+// applySingletonIdentityMutex for the preference order.
+func singletonSurvivorPreferred(input AwakeInput, candidate, current AwakeSessionBead) bool {
+	cs, ws := singletonSurvivorScore(input, candidate), singletonSurvivorScore(input, current)
+	if cs != ws {
+		return cs > ws
+	}
+	// Stable tie-break: lowest bead ID wins (deterministic across ticks).
+	return candidate.ID < current.ID
+}
+
+func singletonSurvivorScore(input AwakeInput, bead AwakeSessionBead) int {
+	score := 0
+	if input.AttachedSessions[bead.SessionName] {
+		score += 8
+	}
+	if input.RunningSessions[bead.SessionName] && bead.State == "active" {
+		score += 4
+	}
+	if !bead.ManualSession {
+		score += 2
+	}
+	if !bead.ContinuationResetPending {
+		score++
+	}
+	return score
 }
 
 func countAssignedScaleSlots(beads []AwakeSessionBead, workBeads []AwakeWorkBead, named []AwakeNamedSession, template string) int {
