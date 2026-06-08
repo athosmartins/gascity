@@ -98,8 +98,16 @@ func TestPhase0ConfigDrift_ActiveNamedSessionDefersWhenAttached(t *testing.T) {
 }
 
 func TestPhase0ConfigDrift_IdleNamedSessionRestartsInPlaceWithoutCapVacancy(t *testing.T) {
-	// When a named session is idle (detached, no recent activity),
+	// When an ON_DEMAND named session is idle (detached, no recent activity),
 	// config-drift should proceed with restart-in-place.
+	//
+	// NOTE: mode is on_demand, NOT always. An always-on named session is now
+	// probe-independently protected from config-drift disruption
+	// (sessionProtectedFromConfigDrift always-named clause + reconciler
+	// short-circuit); its protected behavior is covered by
+	// TestIdleUnpinnedAlwaysNamedSessionNotResetOutOfBand. on_demand named
+	// sessions remain restartable in place, so this test keeps that mechanics
+	// coverage under the only mode that still exercises it.
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -110,7 +118,7 @@ func TestPhase0ConfigDrift_IdleNamedSessionRestartsInPlaceWithoutCapVacancy(t *t
 		}},
 		NamedSessions: []config.NamedSession{{
 			Template: "worker",
-			Mode:     "always",
+			Mode:     "on_demand",
 		}},
 	}
 
@@ -121,7 +129,7 @@ func TestPhase0ConfigDrift_IdleNamedSessionRestartsInPlaceWithoutCapVacancy(t *t
 		Alias:                   "worker",
 		Command:                 "new-cmd",
 		ConfiguredNamedIdentity: "worker",
-		ConfiguredNamedMode:     "always",
+		ConfiguredNamedMode:     "on_demand",
 	}
 
 	oldRuntime := runtime.Config{Command: "old-cmd"}
@@ -135,7 +143,7 @@ func TestPhase0ConfigDrift_IdleNamedSessionRestartsInPlaceWithoutCapVacancy(t *t
 	env.setSessionMetadata(&session, map[string]string{
 		namedSessionMetadataKey:      "true",
 		namedSessionIdentityMetadata: "worker",
-		namedSessionModeMetadata:     "always",
+		namedSessionModeMetadata:     "on_demand",
 		"session_key":                "old-provider-conversation",
 		"started_config_hash":        runtime.CoreFingerprint(oldRuntime),
 		"started_live_hash":          runtime.LiveFingerprint(oldRuntime),
@@ -170,6 +178,10 @@ func TestPhase0ConfigDrift_IdleNamedSessionRestartsInPlaceWithoutCapVacancy(t *t
 func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T) {
 	// Recent activity is a headless-use signal, but it must not let a live
 	// process loop hide one fixed config-drift episode forever.
+	//
+	// NOTE: mode is on_demand. always-mode named sessions are now protected
+	// (never restarted on drift); the bounded recent-activity deferral that
+	// eventually restarts still applies to on_demand named sessions.
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -179,7 +191,7 @@ func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T
 		}},
 		NamedSessions: []config.NamedSession{{
 			Template: "worker",
-			Mode:     "always",
+			Mode:     "on_demand",
 		}},
 	}
 
@@ -190,7 +202,7 @@ func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T
 		Alias:                   "worker",
 		Command:                 "new-cmd",
 		ConfiguredNamedIdentity: "worker",
-		ConfiguredNamedMode:     "always",
+		ConfiguredNamedMode:     "on_demand",
 	}
 
 	oldRuntime := runtime.Config{Command: "old-cmd"}
@@ -205,7 +217,7 @@ func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T
 	env.setSessionMetadata(&session, map[string]string{
 		namedSessionMetadataKey:      "true",
 		namedSessionIdentityMetadata: "worker",
-		namedSessionModeMetadata:     "always",
+		namedSessionModeMetadata:     "on_demand",
 		"started_config_hash":        runtime.CoreFingerprint(oldRuntime),
 		"started_live_hash":          runtime.LiveFingerprint(oldRuntime),
 	})
@@ -235,8 +247,12 @@ func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T
 	if err != nil {
 		t.Fatalf("Get(%s) after deferral limit: %v", session.ID, err)
 	}
-	if got.Metadata["state"] != "active" {
-		t.Fatalf("state = %q, want active after bounded recent-activity restart", got.Metadata["state"])
+	// Bounded deferral expired → restart-in-place fired. The on_demand restart
+	// wakes the session into a live running state ("awake" here, with no
+	// MaxActiveSessions cap to immediately mark it "active"); the point is that
+	// the deferral ended in a restart rather than hiding the drift forever.
+	if st := got.Metadata["state"]; st != "active" && st != "awake" {
+		t.Fatalf("state = %q, want a live running state (active/awake) after bounded recent-activity restart", st)
 	}
 	if got.Metadata[namedSessionConfigDriftDeferredAtMetadata] != "" {
 		t.Fatalf("deferred timestamp = %q, want cleared after restart", got.Metadata[namedSessionConfigDriftDeferredAtMetadata])
@@ -244,8 +260,12 @@ func TestPhase0ConfigDrift_NamedSessionBoundsRecentActivityDeferral(t *testing.T
 }
 
 func TestPhase0ConfigDrift_NamedSessionDrainsWhenStaleActivity(t *testing.T) {
-	// When a named session has stale activity (beyond threshold) and
+	// When an on_demand named session has stale activity (beyond threshold) and
 	// is not attached, config-drift should proceed.
+	//
+	// NOTE: mode is on_demand. always-mode named sessions are now protected and
+	// are NOT restarted on drift even with stale activity (covered by
+	// TestIdleUnpinnedAlwaysNamedSessionNotResetOutOfBand).
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -255,7 +275,7 @@ func TestPhase0ConfigDrift_NamedSessionDrainsWhenStaleActivity(t *testing.T) {
 		}},
 		NamedSessions: []config.NamedSession{{
 			Template: "worker",
-			Mode:     "always",
+			Mode:     "on_demand",
 		}},
 	}
 
@@ -266,7 +286,7 @@ func TestPhase0ConfigDrift_NamedSessionDrainsWhenStaleActivity(t *testing.T) {
 		Alias:                   "worker",
 		Command:                 "new-cmd",
 		ConfiguredNamedIdentity: "worker",
-		ConfiguredNamedMode:     "always",
+		ConfiguredNamedMode:     "on_demand",
 	}
 
 	oldRuntime := runtime.Config{Command: "old-cmd"}
@@ -281,7 +301,7 @@ func TestPhase0ConfigDrift_NamedSessionDrainsWhenStaleActivity(t *testing.T) {
 	env.setSessionMetadata(&session, map[string]string{
 		namedSessionMetadataKey:      "true",
 		namedSessionIdentityMetadata: "worker",
-		namedSessionModeMetadata:     "always",
+		namedSessionModeMetadata:     "on_demand",
 		"started_config_hash":        runtime.CoreFingerprint(oldRuntime),
 		"started_live_hash":          runtime.LiveFingerprint(oldRuntime),
 	})
@@ -783,7 +803,12 @@ func TestConfigDrift_AttachedSessionSurvivesTransientFalseNegative(t *testing.T)
 
 func TestConfigDrift_DetachAllowsDriftToResume(t *testing.T) {
 	// After an attached session detaches, config-drift should proceed
-	// with restart-in-place for named sessions.
+	// with restart-in-place for on_demand named sessions.
+	//
+	// NOTE: mode is on_demand. always-mode named sessions are now protected
+	// regardless of attach/detach state (covered by
+	// TestIdleUnpinnedAlwaysNamedSessionNotResetOutOfBand); the detach→resume
+	// restart path still applies to on_demand named sessions.
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -794,7 +819,7 @@ func TestConfigDrift_DetachAllowsDriftToResume(t *testing.T) {
 		}},
 		NamedSessions: []config.NamedSession{{
 			Template: "worker",
-			Mode:     "always",
+			Mode:     "on_demand",
 		}},
 	}
 
@@ -805,7 +830,7 @@ func TestConfigDrift_DetachAllowsDriftToResume(t *testing.T) {
 		Alias:                   "worker",
 		Command:                 "new-cmd",
 		ConfiguredNamedIdentity: "worker",
-		ConfiguredNamedMode:     "always",
+		ConfiguredNamedMode:     "on_demand",
 	}
 
 	oldRuntime := runtime.Config{Command: "old-cmd"}
@@ -819,7 +844,7 @@ func TestConfigDrift_DetachAllowsDriftToResume(t *testing.T) {
 	env.setSessionMetadata(&session, map[string]string{
 		namedSessionMetadataKey:      "true",
 		namedSessionIdentityMetadata: "worker",
-		namedSessionModeMetadata:     "always",
+		namedSessionModeMetadata:     "on_demand",
 		"session_key":                "old-provider-conversation",
 		"started_config_hash":        runtime.CoreFingerprint(oldRuntime),
 		"started_live_hash":          runtime.LiveFingerprint(oldRuntime),

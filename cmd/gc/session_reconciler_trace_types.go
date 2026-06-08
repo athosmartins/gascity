@@ -192,6 +192,14 @@ const (
 	// current FingerprintVersion (older or future binary). No drain, no
 	// event.
 	TraceOutcomeRebaselinedVersionMismatch TraceOutcomeCode = "rebaselined_version_mismatch"
+	// TraceOutcomeAcceptedProtected marks a config-drift that reached the
+	// reconciler's drift-reset decision out-of-band (i.e. not on the
+	// configChanged tick that runs the protected-drift acceptance pass) for a
+	// session that sessionProtectedFromConfigDrift reports as protected —
+	// notably an always-on named session (mode="always"). Instead of
+	// draining/restarting it, the reconciler soft-accepts the drift in place
+	// (silent hash rebaseline). No drain, no re-prime, no event.
+	TraceOutcomeAcceptedProtected TraceOutcomeCode = "accepted_protected"
 )
 
 type TraceCompletionStatus string

@@ -1158,6 +1158,19 @@ func (cr *CityRuntime) tick(
 		phaseStart = time.Now()
 		sessionBeads = cr.loadSessionBeadSnapshot()
 		recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_soft_reload", phaseStart, traceSessionSnapshotFields(sessionBeads))
+	} else if configChanged {
+		// Internal config-watch reload (source="watch") and plain `gc reload`
+		// without --soft: never disrupt attached/pinned/active sessions. Accept
+		// their config drift in place BEFORE the reconciler evaluates drift, so
+		// the human's attached session and live/pinned crew cannot be drained,
+		// re-primed, or restarted by a config edit. Idle/unattached sessions are
+		// left untouched and reconcile normally below.
+		phaseStart = time.Now()
+		cr.applyProtectedConfigDriftAcceptance(result.State, sessionBeads)
+		recordPhase(TraceSiteConfigReload, "apply_protected_config_drift_acceptance", phaseStart, nil)
+		phaseStart = time.Now()
+		sessionBeads = cr.loadSessionBeadSnapshot()
+		recordPhase(TraceSiteSessionSnapshot, "load_session_snapshot.after_protected_drift_acceptance", phaseStart, traceSessionSnapshotFields(sessionBeads))
 	}
 
 	// Bead-driven reconciliation (requires bead store / drain tracker).
@@ -1842,6 +1855,29 @@ func (cr *CityRuntime) applySoftReloadAcceptance(
 		fmt.Fprintf(cr.stderr, "%s: warning: %s\n", cr.logPrefix, warning) //nolint:errcheck // best-effort stderr
 	}
 	fmt.Fprintf(cr.stdout, "%s: soft reload: accepted config drift on %d session(s)\n", cr.logPrefix, result.Updated) //nolint:errcheck // best-effort stdout
+}
+
+// applyProtectedConfigDriftAcceptance soft-accepts config drift in place for
+// attached/pinned/active sessions on a config-changed tick that is NOT an
+// explicit `gc reload --soft`. This is the durable guarantee that an internal
+// config-watch reload (source="watch") — fired whenever a watched config file,
+// including a town-deltas pack asset, changes — never drains, re-primes, or
+// restarts the human's attached session or live/pinned crew. Idle/unattached
+// sessions are untouched and reconcile normally on the same tick.
+func (cr *CityRuntime) applyProtectedConfigDriftAcceptance(
+	desired map[string]TemplateParams,
+	sessionBeads *sessionBeadSnapshot,
+) {
+	result := acceptConfigDriftForProtectedSessions(
+		cr.cityBeadStore(), desired, sessionBeads, cr.sp, cr.sessionDrains,
+		cr.cityPath, cr.cfg, clock.Real{}, cr.stderr,
+	)
+	if result.Updated > 0 {
+		fmt.Fprintf(cr.stdout, "%s: config reload: accepted drift in place on %d attached/pinned/active session(s)\n", cr.logPrefix, result.Updated) //nolint:errcheck // best-effort stdout
+	}
+	if result.Failed > 0 {
+		fmt.Fprintf(cr.stderr, "%s: warning: config reload: failed to accept config drift on %d protected session(s) (%s); they may still drain\n", cr.logPrefix, result.Failed, formatSoftReloadFailedSessions(result.FailedSessions)) //nolint:errcheck // best-effort stderr
+	}
 }
 
 func lockedConfigName(cfg *config.City, cityPath string) string {

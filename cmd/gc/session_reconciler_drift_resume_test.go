@@ -118,6 +118,11 @@ func TestResetConfiguredNamedSessionForConfigDrift_PreservesSessionKeyOnContinua
 }
 
 func TestReconcileSessionBeads_PreservesSessionKeyWhenNamedRestartDeferred(t *testing.T) {
+	// NOTE: mode is on_demand. always-mode named sessions are now protected from
+	// config-drift restart (sessionProtectedFromConfigDrift always-named clause +
+	// reconciler short-circuit), so they never reach the deferred-restart path
+	// this test exercises. The resume-continuity contract (preserve session_key,
+	// --resume not --session-id) still applies to on_demand named sessions.
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -134,7 +139,7 @@ func TestReconcileSessionBeads_PreservesSessionKeyWhenNamedRestartDeferred(t *te
 			{Name: "worker", Provider: "resume-provider", DependsOn: []string{"db"}},
 			{Name: "db"},
 		},
-		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "on_demand"}},
 	}
 	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
 	tp := TemplateParams{
@@ -144,7 +149,7 @@ func TestReconcileSessionBeads_PreservesSessionKeyWhenNamedRestartDeferred(t *te
 		InstanceName:            "worker",
 		Alias:                   "worker",
 		ConfiguredNamedIdentity: "worker",
-		ConfiguredNamedMode:     "always",
+		ConfiguredNamedMode:     "on_demand",
 		ResolvedProvider: &config.ResolvedProvider{
 			Name:          "resume-provider",
 			Command:       "true",
@@ -170,7 +175,7 @@ func TestReconcileSessionBeads_PreservesSessionKeyWhenNamedRestartDeferred(t *te
 	env.setSessionMetadata(&session, map[string]string{
 		namedSessionMetadataKey:      "true",
 		namedSessionIdentityMetadata: "worker",
-		namedSessionModeMetadata:     "always",
+		namedSessionModeMetadata:     "on_demand",
 		"session_key":                priorSessionKey,
 		"started_config_hash":        priorStartedConfigHash,
 		"started_live_hash":          runtime.LiveFingerprint(oldRuntime),

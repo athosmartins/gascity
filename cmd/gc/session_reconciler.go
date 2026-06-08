@@ -1872,6 +1872,47 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								}
 								continue
 							}
+							// OUT-OF-BAND PROTECTION for always-on named sessions
+							// (probe-independent). The configChanged-tick acceptance
+							// pass (acceptConfigDriftForProtectedSessions,
+							// city_runtime.go) only runs when this tick observed a
+							// config change (dirty.Swap(false)). A drift that surfaces
+							// on a steady-state tick — a stale started_config_hash
+							// carried in from session start, or drift that only became
+							// actionable after an idle/detach transition — reaches this
+							// reset WITHOUT passing through that acceptance, and on the
+							// unpatched code kills + re-primes the session: exactly the
+							// recurring bug that restarted the human's idle, unpinned
+							// Mayor on a config-revision bump.
+							//
+							// Scope is deliberately the always-on named clause ONLY,
+							// not the full sessionProtectedFromConfigDrift predicate.
+							// The other protected cases are already handled before this
+							// point and must NOT be re-handled here:
+							//   - attached / pinned → deferred at the attach check above
+							//     (sessionAttachedForConfigDrift), never reach here.
+							//   - pending interaction / recent activity → handled by the
+							//     BOUNDED shouldDeferNamedSessionConfigDrift above. Re-
+							//     running the predicate's UNBOUNDED activity clause here
+							//     would let a busy session loop hide one config-drift
+							//     episode forever, regressing the bounded-deferral
+							//     guarantee (the "live process loop" guard). So only the
+							//     always-on, probe-independent signal short-circuits the
+							//     reset. Idle, non-"always" named sessions still restart
+							//     in place.
+							if sessionIsAlwaysOnNamed(*session) {
+								if err := silentRebaselineSessionHashes(session, store, agentCfg); err != nil {
+									fmt.Fprintf(stderr, "session reconciler: accepting always-on named config drift in place for %s: %v\n", name, err) //nolint:errcheck
+								} else {
+									fmt.Fprintf(stderr, "config-drift %s: accepted in place (always-on named session never restarted on drift); stored=%s current=%s\n", name, truncateHashForLog(storedHash), truncateHashForLog(currentHash)) //nolint:errcheck
+								}
+								if trace != nil {
+									trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeAcceptedProtected), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+										"active_reason": "always_named",
+									}), nil, "")
+								}
+								continue
+							}
 							resetConfiguredNamedSessionForConfigDrift(session, store, sp, name, alive, string(sessionpkg.StateStartPending), clk.Now().UTC(), stderr)
 							if trace != nil {
 								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", "restart_in_place", configDriftTracePayload(storedHash, currentHash, driftedFields, nil), nil, "")
@@ -1926,6 +1967,37 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 									}), nil, "")
 								}
 								fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': live assigned work found\n", name) //nolint:errcheck
+								continue
+							}
+							// Gate-reviewer sessions are mid-review work the
+							// assignee-keyed probe above can never see: the
+							// quality-gate dispatcher creates the reviewer's
+							// verdict bead UNASSIGNED (it correlates session to
+							// verdict by ordered arrays, delivering the bead ID
+							// via a nudge), so sessionHasOpenAssignedWork returns
+							// false for an actively-reviewing reviewer. Draining
+							// it mid-review costs the gate run a verdict → 3/3
+							// never reached → TIMEOUT → the story sticks
+							// "in flight" (ga-lsgte). Recognize the same
+							// "live work in flight, defer the drain" condition
+							// via the verdict bead's verdict:pending label and
+							// skip the drain, exactly as the dog path does. The
+							// next tick drains naturally once no verdict is
+							// pending (the dispatcher's verdict timeout
+							// terminalizes any straggler, so this cannot pin a
+							// genuinely-stale reviewer indefinitely).
+							deliveringVerdict, verdictErr := sessionIsReviewerDeliveringVerdict(cityPath, cfg, store, rigStores, *session)
+							if verdictErr != nil {
+								fmt.Fprintf(stderr, "session reconciler: checking pending verdict before config-drift drain for %s: %v\n", name, verdictErr) //nolint:errcheck
+								continue
+							}
+							if deliveringVerdict {
+								if trace != nil {
+									trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredActive), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+										"active_reason": "live_reviewer_verdict",
+									}), nil, "")
+								}
+								fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': gate-reviewer mid-review (pending verdict)\n", name) //nolint:errcheck
 								continue
 							}
 							ddt := driftDrainTimeout
