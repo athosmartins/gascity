@@ -1,8 +1,12 @@
 package config
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/builtinpacks"
 )
 
 func TestIsRemoteInclude(t *testing.T) {
@@ -252,4 +256,50 @@ func TestIncludeCacheName(t *testing.T) {
 	if a == c {
 		t.Errorf("collision: %q == %q for different sources", a, c)
 	}
+}
+
+// TestRepoCacheKeyIncludesSyntheticContentComponent pins the durable fix for
+// the citywide pack-cache wedge (ga-s9p): two gc binaries with different
+// embedded pack content must resolve to different synthetic cache directories,
+// so a binary built from one revision cannot re-materialize the cache out from
+// under a binary built from another. The synthetic cache key therefore folds in
+// the running binary's content hash; the legacy namespace+source+commit key did
+// not, so both binaries collided on one directory and ping-ponged its marker.
+func TestRepoCacheKeyIncludesSyntheticContentComponent(t *testing.T) {
+	source := builtinpacks.MustSource("core")
+	const commit = "abc123"
+
+	component := builtinpacks.SyntheticCacheKeyComponent()
+	if component == "" {
+		t.Fatal("expected non-empty synthetic cache key component for a valid binary")
+	}
+
+	normalized := NormalizeRemoteSource(source)
+	withComponent := repoCacheKeyTestSum(builtinpacks.SyntheticCacheNamespace + "\x00" + normalized + "\x00" + commit + "\x00" + component)
+	legacy := repoCacheKeyTestSum(builtinpacks.SyntheticCacheNamespace + "\x00" + normalized + "\x00" + commit)
+
+	got := RepoCacheKey(source, commit)
+	if got != withComponent {
+		t.Fatalf("RepoCacheKey(synthetic) = %q, want content-component key %q", got, withComponent)
+	}
+	if got == legacy {
+		t.Fatalf("RepoCacheKey(synthetic) %q must differ from legacy namespace-only key %q", got, legacy)
+	}
+}
+
+// TestRepoCacheKeyUnchangedForNonSyntheticSources guards that the fix is scoped
+// to bundled synthetic sources: real git-checkout caches keep their existing
+// source+commit key so deployed caches are not relocated.
+func TestRepoCacheKeyUnchangedForNonSyntheticSources(t *testing.T) {
+	const source = "https://github.com/org/repo.git"
+	const commit = "def456"
+	want := repoCacheKeyTestSum(NormalizeRemoteSource(source) + commit)
+	if got := RepoCacheKey(source, commit); got != want {
+		t.Fatalf("RepoCacheKey(non-synthetic) = %q, want %q", got, want)
+	}
+}
+
+func repoCacheKeyTestSum(identity string) string {
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%x", sum[:])
 }
