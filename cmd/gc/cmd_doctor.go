@@ -250,6 +250,9 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewBinaryCheck("jq", "", exec.LookPath))
 	register(doctor.NewBinaryCheck("pgrep", "", exec.LookPath))
 	register(doctor.NewBinaryCheck("lsof", "", exec.LookPath))
+	// Advisory: surface drift between the standalone bd binary and the beads
+	// library gc embeds. Silent skew here causes a downstream outage class.
+	register(newBDVersionSkewCheck())
 	// beads.role must be set before any bd command runs; check it here so
 	// the missing-role error appears before the downstream data/Dolt checks
 	// that will all fail for the same root cause.

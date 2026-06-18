@@ -85,6 +85,14 @@ type ListQuery struct {
 	// caller does not need labels for change detection. Stores that cannot
 	// omit labels may ignore it.
 	SkipLabels bool
+	// SkipBody tells backing stores the caller does not need the large body
+	// columns (design, acceptance_criteria, notes). Stores that can narrow
+	// the projection NULL-fill them; stores that cannot may ignore it. Set by
+	// the cache reconcile path (ga-ftmci): gc's Bead never carries those
+	// fields and change-detection never reads them, so streaming them from
+	// the DB on every full-table scan is pure waste. Ignoring it stays
+	// correct — the store just returns the full body.
+	SkipBody bool
 	// Live bypasses CachingStore and reads from the backing store. Other Store
 	// implementations ignore it. Use it only for lifecycle gates that must
 	// observe external mutations immediately.

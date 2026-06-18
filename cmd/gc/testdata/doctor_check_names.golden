@@ -41,6 +41,7 @@ git-binary
 jq-binary
 pgrep-binary
 lsof-binary
+bd-gc-version-skew
 beads-role
 controller
 agent-sessions

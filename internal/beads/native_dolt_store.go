@@ -1304,6 +1304,12 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		MetadataFields:      query.Metadata,
 		CreatedBefore:       zeroTimePtr(query.CreatedBefore),
 		IncludeDependencies: true,
+		// ga-ftmci: when the caller (cache reconcile) does not need the large
+		// body columns, narrow the projection so the DB engine stops streaming
+		// design/acceptance_criteria/notes for every row on every full scan.
+		// beadFromNativeIssue never reads those fields, so this is invisible to
+		// the cache and to change detection.
+		SkipBody: query.SkipBody,
 	}
 	switch query.TierMode {
 	case TierWisps:

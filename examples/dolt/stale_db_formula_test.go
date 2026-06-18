@@ -43,8 +43,8 @@ func TestStaleDBFormulaRuntimeContract(t *testing.T) {
 		`gc event emit mol-dog-stale-db.escalate`,
 		`if [ "$APPLIED" -eq 1 ] && [ "$MISSED_PURGE_BYTES" -gt 0 ]; then`,
 		`leaving work bead open`,
-		`gc session nudge deacon "WARN: $ORPHAN_TOTAL Dolt orphan(s) seen this scan`,
-		`gc session nudge deacon "DOG_DONE: stale-db - orphans: ${ORPHAN_TOTAL}, applied: ${APPLIED}, escalated: ${ESCALATED}" || true`,
+		`gc session nudge deacon/ "WARN: $ORPHAN_TOTAL Dolt orphan(s) seen this scan`,
+		`gc session nudge deacon/ "DOG_DONE: stale-db - orphans: ${ORPHAN_TOTAL}, applied: ${APPLIED}, escalated: ${ESCALATED}" || true`,
 		`escalated=${ESCALATED}`,
 	} {
 		if !strings.Contains(desc, want) {
@@ -54,6 +54,8 @@ func TestStaleDBFormulaRuntimeContract(t *testing.T) {
 	for _, bad := range []string{
 		`/tmp/dolt-cleanup`,
 		`gc nudge deacon`,
+		`gc session nudge deacon "`,
+		`date -Is`,
 		`GC_BEAD_ID:-<work-bead>`,
 		`Dolt orphan(s) detected`,
 	} {

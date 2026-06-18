@@ -1163,9 +1163,37 @@ func defaultScaleCheckTargetForAgent(
 	return target
 }
 
+// poolDemandInFlightLabels are funnel labels stamped on a source bead by the
+// on-disk dispatchers (Pilot / pool-autoscale-watchdog) once it has been handed
+// to a builder. A bead carrying either label is already being worked, so it
+// must not be re-counted as fresh, unassigned pool demand — otherwise a bead
+// that still carries gc.routed_to while in flight inflates scale_check demand
+// and a surplus dog can spawn and re-claim it (double-dispatch). This is the
+// engine-side, consumer-half mirror of the on-disk get_pool_demand exclusion
+// (ga-inbc6) and the producer-side gc.routed_to unset (ga-ms1jm); see ga-lx7om.
+//
+// These are plain string literals (not shared constants) because the labels are
+// owned by the funnel layer, not the engine — the engine only needs to defend
+// against them, never to write them.
+var poolDemandInFlightLabels = []string{"story:in-flight", "pilot:dispatched"}
+
+// poolDemandBeadInFlight reports whether a bead carries any funnel label that
+// marks it as already-being-worked, so the default scale_check demand probes
+// can skip it the same way they skip assigned beads.
+func poolDemandBeadInFlight(b beads.Bead) bool {
+	for _, label := range poolDemandInFlightLabels {
+		if hasBeadLabel(b.Labels, label) {
+			return true
+		}
+	}
+	return false
+}
+
 // defaultScaleCheckCounts reports ready, unassigned, routed work as fresh
 // generic pool demand. Assigned beads are handled by assigned-work collection
-// and named-session demand so they are intentionally excluded here.
+// and named-session demand so they are intentionally excluded here. Beads
+// already in flight (story:in-flight / pilot:dispatched) are likewise excluded
+// so an in-flight bead can never be re-counted as fresh demand (ga-lx7om).
 func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int, map[string]bool, []error) {
 	counts := make(map[string]int, len(targets))
 	if len(targets) == 0 {
@@ -1233,6 +1261,9 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
+			if poolDemandBeadInFlight(b) {
+				continue
+			}
 			template := controllerDemandRouteTarget(b, group.templates)
 			if _, ok := group.templates[template]; !ok {
 				continue
@@ -1286,6 +1317,9 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 				continue
 			}
 			if beads.IsDeferred(b, now) {
+				continue
+			}
+			if poolDemandBeadInFlight(b) {
 				continue
 			}
 			template := controllerDemandRouteTarget(b, group.templates)
@@ -2872,6 +2906,28 @@ func claimDesiredPoolSlot(cfg *config.City, cfgAgent *config.Agent, sessionBead 
 		return 0
 	}
 	return claimPoolSlotWithConfig(cfg, cfgAgent, sessionBead, used)
+}
+
+// retryOnBadConn runs fn and retries it EXACTLY ONCE if the first error is a
+// transient bad-connection error (driver.ErrBadConn / "invalid connection" /
+// "connection reset"); otherwise it returns fn's result unchanged. Validated by
+// TestRetryOnBadConn_RetriesExactlyOnce.
+//
+// RECONSTRUCTED (ga-17nts) after the original uncommitted badconn WIP (ga-aov9u)
+// was accidentally lost via `git checkout --`. This restores the FUNCTION so the
+// source compiles, but the original WIP also WRAPPED the supervisor
+// controller-demand queries with it (the call sites, ~ the ready/scale_check
+// probes); that call-site wrapping was NOT recovered here. The live binary
+// gc-patched-b4moa retains the full original; the other badconn layers
+// (ConnMaxIdleTime=20s pool tuning, third_party withRetry on CLI write paths)
+// are intact. Re-add the call-site wrapping from b4moa before the next engine
+// build/deploy — see ga-17nts.
+func retryOnBadConn[T any](fn func() (T, error)) (T, error) {
+	v, err := fn()
+	if err != nil && beads.IsBadConnError(err) {
+		return fn()
+	}
+	return v, err
 }
 
 func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, template string, bead beads.Bead, used map[string]bool) bool {

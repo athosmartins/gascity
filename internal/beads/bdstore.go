@@ -1660,6 +1660,11 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if query.SkipLabels && serverQuery.Label == "" {
 		args = append(args, "--skip-labels")
 	}
+	// ga-ftmci: subprocess path mirrors the native projection narrowing so a
+	// fallback to the bd CLI also skips the large body columns during reconcile.
+	if query.SkipBody {
+		args = append(args, "--skip-body")
+	}
 
 	out, err := s.runner(s.dir, "bd", args...)
 	if err != nil {

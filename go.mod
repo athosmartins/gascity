@@ -244,3 +244,9 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+// gc-aov9u: local patch of beads — adds SetConnMaxIdleTime(20s) to the
+// long-lived daemon Dolt pool so idle conns are retired before the server
+// reaps them (30s), eliminating "invalid connection" failures. Byte-identical
+// to v1.0.5 except internal/storage/dolt/store.go applyPoolLimits + defaults.
+replace github.com/steveyegge/beads => ./third_party/beads

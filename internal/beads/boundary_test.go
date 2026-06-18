@@ -53,7 +53,12 @@ func TestNoBdExecOutsideBeads(t *testing.T) {
 		}
 		if info.IsDir() {
 			base := filepath.Base(path)
-			if base == ".git" || base == "vendor" || base == ".claude" || strings.HasPrefix(base, ".beads-src") {
+			// third_party holds vendored upstream modules (e.g. the locally
+			// patched github.com/steveyegge/beads — gc-aov9u). They are a
+			// separate Go module reached via a go.mod replace, not gascity's
+			// own code, so the bd-subprocess boundary rule does not apply to
+			// them — same rationale as the vendor/ skip.
+			if base == ".git" || base == "vendor" || base == "third_party" || base == ".claude" || strings.HasPrefix(base, ".beads-src") {
 				return filepath.SkipDir
 			}
 			return nil

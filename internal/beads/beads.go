@@ -4,7 +4,9 @@ package beads
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -22,6 +24,29 @@ var ErrStoreClosed = errors.New("bead store closed")
 // ErrParentProjectionSuperseded reports that a parent update was overtaken by a
 // concurrent reparent before the caller's projection wait could converge.
 var ErrParentProjectionSuperseded = errors.New("parent projection superseded by concurrent update")
+
+// IsBadConnError reports whether err is a stale/dead pooled-connection error —
+// the failure mode where a long-lived daemon's pooled MySQL connection to the
+// Dolt server was reaped server-side (Dolt's 30s idle timeout) before the Go
+// pool retired it, so the next query inherits a killed socket. Callers that run
+// on the supervisor's long-lived pool (drain-protection demand query, cache
+// reconciler) use this to trigger ONE retry, which pulls a fresh connection
+// from the pool. Matches both the typed driver.ErrBadConn and the string forms
+// surfaced by the MySQL driver / Dolt ("invalid connection", "bad connection").
+// gc-aov9u.
+func IsBadConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid connection") ||
+		strings.Contains(msg, "bad connection") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "broken pipe")
+}
 
 // Bead is a single unit of work in Gas City. Everything is a bead: tasks,
 // mail, molecules, convoys.

@@ -292,6 +292,27 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		agentEnv["GC_BEADS_SCOPE_ROOT"] = rigRoot
 	}
 
+	// Step 8b: Name the Claude Code Remote Control session after the agent so
+	// named crews (mila, thies, digo, ...) show up identifiably in the Claude
+	// mobile app instead of an auto-generated "host-adjective-animal" title
+	// (ga-mhyz2). We set CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX rather than
+	// passing claude's `--remote-control <name>` flag: the env var only takes
+	// effect when Remote Control is actually active and is a harmless no-op
+	// otherwise, whereas the launch flag can hard-fail session boot when Remote
+	// Control is unavailable (no claude.ai login / disabled by policy /
+	// offline). The prefix yields e.g. "mila-graceful-unicorn" — the agent
+	// name is front-and-recognizable without risking the crew launch. Gated to
+	// single-session named crews so dog/adhoc/reviewer/polecat pools keep their
+	// auto-generated names, and to the claude provider family that reads this
+	// env var.
+	if prefix := strings.TrimSpace(agentBase); prefix != "" &&
+		!cfgAgent.SupportsMultipleSessions() &&
+		resolvedProviderLaunchFamily(resolved) == "claude" {
+		if _, set := agentEnv["CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX"]; !set {
+			agentEnv["CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX"] = prefix
+		}
+	}
+
 	// Step 9: Render prompt with beacon.
 	var prompt string
 	// Merge fragment sources: V1 global_fragments + inject_fragments,

@@ -76,6 +76,18 @@ while IFS= read -r bead; do
         continue
     fi
 
+    # ga-jhyu: quality-gate run/marker/verdict wisps are high-volume and
+    # self-documenting via their own comments; the gate decision is enacted on
+    # the SOURCE bead, not these tracking wisps. Once CLOSED (terminal) they must
+    # be DELETED, not promoted — otherwise comment_count>0 converts every terminal
+    # gate bead into a persistent orphan (the real city-DB bloat driver). Only
+    # CLOSED ones are carved out, so an in-flight gate bead is never deleted.
+    if [ "$status" = "closed" ] && echo "$labels" | grep -qE '^type:quality-gate-(run|marker|verdict)$'; then
+        bd delete "$id" --force 2>/dev/null || true
+        DELETED=$((DELETED + 1))
+        continue
+    fi
+
     # Promote if has comments, keep label, or non-closed.
     if [ "$comment_count" -gt 0 ] || echo "$labels" | grep -q '^keep$' || [ "$status" != "closed" ]; then
         REASON="proven value"

@@ -477,7 +477,7 @@ func TestDerivePoolSessionName(t *testing.T) {
 			beadID:   "gc-1",
 			alias:    "",
 			snapshot: nil,
-			want:     "claude-gc-1",
+			want:     "claude-gc1",
 		},
 		{
 			name:     "whitespace-only alias falls back to PoolSessionName",
@@ -485,7 +485,7 @@ func TestDerivePoolSessionName(t *testing.T) {
 			beadID:   "gc-1",
 			alias:    "   ",
 			snapshot: nil,
-			want:     "claude-gc-1",
+			want:     "claude-gc1",
 		},
 		{
 			name:     "resolved alias wins when no collision",

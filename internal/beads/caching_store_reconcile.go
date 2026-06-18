@@ -256,7 +256,21 @@ func (c *CachingStore) runReconciliation() {
 	c.mu.RUnlock()
 
 	bdStart := time.Now()
-	fresh, err := c.backing.List(ListQuery{AllowScan: true, SkipLabels: true, TierMode: TierBoth})
+	// ga-ftmci: SkipBody drops the three large LONGTEXT body columns
+	// (design, acceptance_criteria, notes) from the per-cycle full-table
+	// hydration scan. The reconcile diff (beadChanged) never inspects them and
+	// gc's Bead does not carry them, so hydrating them was pure CPU/IO waste
+	// that drove Dolt :52756 to sustained high CPU and stalled reviewer boots.
+	reconcileQuery := ListQuery{AllowScan: true, SkipLabels: true, SkipBody: true, TierMode: TierBoth}
+	fresh, err := c.backing.List(reconcileQuery)
+	// gc-aov9u: the reconciler runs on the supervisor's long-lived Dolt pool.
+	// If an idle pooled connection was reaped server-side (Dolt 30s timeout)
+	// before the Go pool retired it, the first List inherits a dead socket and
+	// fails with "invalid connection". Retry ONCE — the retry pulls a fresh
+	// connection — so a single stale socket doesn't flip the cache to degraded.
+	if err != nil && IsBadConnError(err) {
+		fresh, err = c.backing.List(reconcileQuery)
+	}
 	bdLatency := time.Since(bdStart)
 	if err != nil {
 		c.mu.Lock()
