@@ -499,9 +499,10 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 	if usesPostgres, err := scopeUsesPostgresBackendForInit(cityPath, dir); err != nil {
 		return err
 	} else if usesPostgres {
-		if err := installBeadHooks(dir, cityPath); err != nil {
-			return fmt.Errorf("install hooks at %s: %w", dir, err)
-		}
+		// Non-fatal: hooks are convenience (event forwarding), not critical.
+		// The Postgres path has the same .beads/hooks immutability risk as the
+		// Dolt path — locked hooks must not wedge init (same as ga-rfq1j/ga-1sv0x).
+		installBeadHooksNonFatal(dir, cityPath)
 		return nil
 	}
 	doltDatabase := canonicalScopeDoltDatabase(cityPath, dir, prefix)

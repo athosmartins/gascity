@@ -616,23 +616,30 @@ func TestInstallBeadHooksRigAddIntegration(t *testing.T) {
 // strict installBeadHooks returns an error, but installBeadHooksNonFatal — used
 // by initAndHookDir — MUST swallow it so config reloads/inits never abort.
 func TestInstallBeadHooksNonFatalSwallowsUnwritableDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// Root bypasses DAC write-permission checks, so chmod cannot force
+		// the EACCES/EPERM error path that this test exercises. Skip rather
+		// than pass vacuously. In CI, run tests as a non-root user.
+		t.Skip("test requires non-root — root bypasses DAC checks, chmod cannot force an error")
+	}
+
 	dir := t.TempDir()
 	hooksDir := filepath.Join(dir, ".beads", "hooks")
 	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Make the hooks dir non-writable so the atomic temp-file write fails,
-	// mirroring the EPERM seen against a chflags-immutable directory.
+	// Make the hooks dir non-writable. This approximates the production EPERM
+	// (chflags uchg immutable) with an EACCES from chmod — both cause the
+	// atomic temp-file write to fail. The non-fatal wrapper must swallow either.
 	if err := os.Chmod(hooksDir, 0o555); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(hooksDir, 0o755) })
 
-	// Precondition: the strict installer must actually fail here. If it does
-	// not (e.g. running as root, which bypasses directory permissions), the
-	// non-fatal path cannot be exercised — skip rather than pass vacuously.
+	// Precondition: the strict installer must fail. We asserted non-root
+	// above, so chmod should reliably deny the write. Fail loudly if not.
 	if err := installBeadHooks(dir, dir); err == nil {
-		t.Skip("hooks dir write unexpectedly succeeded (running as root?) — cannot exercise failure path")
+		t.Fatal("precondition failed: hooks dir write succeeded despite 0555 mode — cannot exercise failure path")
 	}
 
 	// The fix: the non-fatal wrapper must return nil despite the write failure.
