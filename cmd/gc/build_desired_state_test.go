@@ -3141,6 +3141,63 @@ func TestBuildDesiredState_MaxOneManualAssignedWorkPreservesManualIdentity(t *te
 	}
 }
 
+// TestBuildDesiredState_MaxOneMinOneManualSingletonResolvesToOneNoTwin is the
+// full-pipeline batista-ps reset-churn regression. A canonical singleton with
+// min=max=1 (no scale_check) whose only live session is session_origin=MANUAL
+// must resolve to EXACTLY ONE desired session — the manual one — and mint NO
+// pool twin. Before the min-floor-credit fix the min-fill loop minted an extra
+// canonical pool session beside the preserved manual session; the twin could
+// not claim the held canonical alias, so its lease expired and re-minted
+// (~12min churn).
+func TestBuildDesiredState_MaxOneMinOneManualSingletonResolvesToOneNoTwin(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	manual, err := store.Create(beads.Bead{
+		Title:  "property_scrapers/batista-ps",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:property_scrapers/batista-ps", "template:property_scrapers/batista-ps"},
+		Metadata: map[string]string{
+			"template":       "property_scrapers/batista-ps",
+			"agent_name":     "property_scrapers/batista-ps",
+			"alias":          "property_scrapers/batista-ps",
+			"session_name":   "s-batista-manual",
+			"state":          "awake",
+			"session_origin": "manual",
+			"manual_session": "true",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "batista-ps",
+			Dir:               "property_scrapers",
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(1),
+			MinActiveSessions: intPtr(1),
+		}},
+	}
+
+	var stderr bytes.Buffer
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
+
+	if len(dsResult.State) != 1 {
+		t.Fatalf("desired sessions = %d, want exactly 1 (manual singleton satisfies min=1, no twin); keys=%v stderr=%q", len(dsResult.State), mapKeys(dsResult.State), stderr.String())
+	}
+	manualTP, ok := dsResult.State[manual.Metadata["session_name"]]
+	if !ok {
+		t.Fatalf("desired state missing the live manual singleton %q; keys=%v", manual.Metadata["session_name"], mapKeys(dsResult.State))
+	}
+	if !manualTP.ManualSession {
+		t.Fatal("manual singleton ManualSession = false, want true (preserved, not reused)")
+	}
+	if manualTP.Alias != "property_scrapers/batista-ps" {
+		t.Fatalf("manual singleton Alias = %q, want preserved canonical identity", manualTP.Alias)
+	}
+}
+
 func TestBuildDesiredState_MaxOneAgentSkipsCanonicalDuplicateWhenStaleAssignedWorkWinsCap(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()

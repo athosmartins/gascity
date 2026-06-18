@@ -249,7 +249,80 @@ func computePoolDesiredStates(
 		}
 	}
 
-	return applyNestedCaps(cfg, allRequests, trace)
+	// A live MANUAL session whose identity is the canonical singleton for a
+	// min=max=1 template already satisfies that template's min floor: the user
+	// owns the one allowed session and it holds the canonical alias. The
+	// min-fill loop must NOT mint a pool twin beside it — the twin can never
+	// claim the held alias, so its lease expires and re-mints (~12min reset
+	// churn; batista-ps). We COUNT the manual session toward min here without
+	// routing it through any reuse path: reusablePoolSessionBead still excludes
+	// manual sessions, so the preserve-manual invariant stays intact, and the
+	// manual session itself is materialized by the open-session recovery loop,
+	// not by a pool request. These credits only relax the min FLOOR; genuine
+	// scale_check demand (handled above) is unaffected, so a manual session
+	// still does not get reused for real new demand.
+	minFloorCredits := manualCanonicalSingletonMinCredits(cfg, sessionBeads)
+
+	return applyNestedCaps(cfg, allRequests, minFloorCredits, trace)
+}
+
+// manualCanonicalSingletonMinCredits counts, per template, live manual sessions
+// whose identity is the canonical singleton for a template that uses the
+// canonical-singleton pool identity (max_active_sessions=1, no namepool).
+// "Live" means non-closed, non-drained, non-failed-create, and not asleep —
+// i.e. actively holding the canonical alias. The count is the credit applied
+// against that template's min floor in applyNestedCaps.
+func manualCanonicalSingletonMinCredits(cfg *config.City, sessionBeads []beads.Bead) map[string]int {
+	if cfg == nil || len(sessionBeads) == 0 {
+		return nil
+	}
+	var credits map[string]int
+	for i := range cfg.Agents {
+		agent := &cfg.Agents[i]
+		if agent.Suspended || !agent.SupportsGenericEphemeralSessions() {
+			continue
+		}
+		if !agent.UsesCanonicalSingletonPoolIdentity() {
+			continue
+		}
+		template := agent.QualifiedName()
+		for _, sb := range sessionBeads {
+			if sb.Status == "closed" {
+				continue
+			}
+			if !isManualSessionBeadForAgent(sb, agent) {
+				continue
+			}
+			if !isLiveCanonicalSingletonSessionBead(sb) {
+				continue
+			}
+			if normalizedSessionTemplate(sb, cfg) != template {
+				continue
+			}
+			if credits == nil {
+				credits = make(map[string]int)
+			}
+			credits[template]++
+		}
+	}
+	return credits
+}
+
+// isLiveCanonicalSingletonSessionBead reports whether a session bead is in a
+// state that actively holds its canonical alias and therefore satisfies a min
+// floor: non-drained, non-failed-create, and not asleep. A bead coming up
+// (creating / start-pending) still counts — it is claiming the alias.
+func isLiveCanonicalSingletonSessionBead(sb beads.Bead) bool {
+	if isDrainedSessionBead(sb) {
+		return false
+	}
+	if isFailedCreateSessionBead(sb) {
+		return false
+	}
+	if strings.TrimSpace(sb.Metadata["state"]) == "asleep" {
+		return false
+	}
+	return true
 }
 
 func poolInFlightNewRequests(cfg *config.City, sessionBeads []beads.Bead, resumeSessionBeadIDs map[string]struct{}) map[string][]SessionRequest {
@@ -306,7 +379,15 @@ func poolSessionConsumesNewDemand(session beads.Bead) bool {
 
 // applyNestedCaps enforces workspace, rig, and agent max_active_sessions caps.
 // Accepts requests in priority order, rejecting any that would exceed a cap.
-func applyNestedCaps(cfg *config.City, requests []SessionRequest, trace *sessionReconcilerTraceCycle) []PoolDesiredState {
+//
+// minFloorCredits[template] counts live sessions that already satisfy a
+// template's min floor but are not represented by a SessionRequest (e.g. a
+// live manual canonical singleton, preserved by the open-session recovery loop
+// rather than a pool request). These credits relax ONLY the min-fill floor —
+// they never reject genuine accepted demand — so the min-fill mints no twin
+// beside a session the controller already keeps alive. Pass nil when there are
+// none.
+func applyNestedCaps(cfg *config.City, requests []SessionRequest, minFloorCredits map[string]int, trace *sessionReconcilerTraceCycle) []PoolDesiredState {
 	// Sort by priority DESC, resume tier first within same priority.
 	sort.SliceStable(requests, func(i, j int) bool {
 		if requests[i].BeadPriority != requests[j].BeadPriority {
@@ -355,7 +436,22 @@ func applyNestedCaps(cfg *config.City, requests []SessionRequest, trace *session
 		}
 		template := agent.QualifiedName()
 		minSess := agent.EffectiveMinActiveSessions()
-		for usage.agentCount[template] < minSess {
+		// A live manual canonical singleton (or any credited preserved session)
+		// already occupies a min slot the controller keeps alive without a pool
+		// request; lower the floor by that credit so we don't mint a twin that
+		// can never claim the held canonical alias.
+		floor := minSess - minFloorCredits[template]
+		if floor < 0 {
+			floor = 0
+		}
+		if minFloorCredits[template] > 0 && trace != nil {
+			trace.recordDecision("reconciler.pool.min_fill", template, "", "min_floor_credit", "accepted", traceRecordPayload{
+				"min":    minSess,
+				"credit": minFloorCredits[template],
+				"floor":  floor,
+			}, nil, "")
+		}
+		for usage.agentCount[template] < floor {
 			req := SessionRequest{
 				Template: template,
 				Tier:     "new",
@@ -367,6 +463,7 @@ func applyNestedCaps(cfg *config.City, requests []SessionRequest, trace *session
 			if trace != nil {
 				trace.recordDecision("reconciler.pool.min_fill", template, "", "min_fill", "accepted", traceRecordPayload{
 					"min":     minSess,
+					"floor":   floor,
 					"current": usage.agentCount[template],
 					"tier":    "new",
 				}, nil, "")

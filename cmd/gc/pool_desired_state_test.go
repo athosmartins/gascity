@@ -1221,7 +1221,7 @@ func TestApplyNestedCaps_DedupsConcreteSessionRequestsAcrossTiers(t *testing.T) 
 		{Template: "claude", Tier: "new", SessionBeadID: "sess-2"},
 	}
 
-	result := applyNestedCaps(cfg, requests, nil)
+	result := applyNestedCaps(cfg, requests, nil, nil)
 
 	if len(result) != 1 {
 		t.Fatalf("len(result) = %d, want 1", len(result))
@@ -1355,5 +1355,100 @@ func TestComputePoolDesiredStates_RoutedRigScopedDoesNotSpawnNew(t *testing.T) {
 	}
 	if total != 0 {
 		t.Fatalf("total requests = %d, want 0", total)
+	}
+}
+
+// manualSingletonSessionBead builds a live MANUAL session bead whose identity is
+// the canonical singleton identity for the given template (the batista-ps
+// shape: a user `gc session new` against a min=max=1 crew agent).
+func manualSingletonSessionBead(id, template, sessionName string) beads.Bead {
+	return beads.Bead{
+		ID:     id,
+		Status: "open",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:" + template, "template:" + template},
+		Metadata: map[string]string{
+			"template":       template,
+			"agent_name":     template,
+			"alias":          template,
+			"session_name":   sessionName,
+			"state":          "awake",
+			"session_origin": "manual",
+			"manual_session": "true",
+		},
+	}
+}
+
+// TestComputePoolDesiredStates_ManualSingletonSatisfiesMinFillNoTwin is the
+// batista-ps reset-churn regression. batista-ps is a canonical singleton
+// (min=max=1, no scale_check). When its only live session is session_origin=
+// MANUAL, the min-fill floor must treat that live manual session as satisfying
+// min=1 and mint NO twin pool request. A twin can't claim the canonical alias
+// (the manual session holds it) so its lease expires and re-mints → ~12min
+// churn.
+//
+// FAILS on the batista-fix-wip base (min-fill mints 1 anonymous "new" twin
+// because usage.agentCount never counts the manual session). PASSES with the
+// count-not-reuse fix.
+func TestComputePoolDesiredStates_ManualSingletonSatisfiesMinFillNoTwin(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("batista-ps", "property_scrapers", intPtr(1), 1)},
+	}
+	manual := manualSingletonSessionBead("manual-batista", "property_scrapers/batista-ps", "s-batista-manual")
+
+	// No assigned work, no scale_check demand — only the live manual session.
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{manual}, nil)
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 0 {
+		t.Fatalf("total pool requests = %d, want 0 (live manual singleton satisfies min=1; minting a twin causes batista-ps reset churn)", total)
+	}
+}
+
+// TestComputePoolDesiredStates_PoolManagedSingletonStillFillsMin guards against
+// over-suppressing the floor: a canonical singleton whose live session is
+// POOL-MANAGED (not manual) and is already counted as in-flight new demand must
+// still resolve to exactly one session and not get double-counted or churned.
+func TestComputePoolDesiredStates_PoolManagedSingletonStillFillsMin(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(1), 1)},
+	}
+	// A pool-managed creating session already occupies the singleton slot
+	// (in-flight new demand). With min=1 it should resolve to exactly 1.
+	pooled := pendingPoolSessionBead("pool-claude")
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{pooled}, map[string]int{"claude": 1})
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 1 {
+		t.Fatalf("total pool requests = %d, want exactly 1 (one pool-managed singleton, no double-count/twin)", total)
+	}
+}
+
+// TestComputePoolDesiredStates_ManualSingletonZeroMinNoDemandNoTwin verifies the
+// min-fill suppression does not also suppress genuine demand decisions: with
+// min=0 and the manual session present (no scale_check), there is no demand and
+// nothing should be minted. Pins the no-min baseline so the fix can't regress
+// it into spawning anything.
+func TestComputePoolDesiredStates_ManualSingletonZeroMinNoDemandNoTwin(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("batista-ps", "property_scrapers", intPtr(1), 0)},
+	}
+	manual := manualSingletonSessionBead("manual-batista", "property_scrapers/batista-ps", "s-batista-manual")
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{manual}, nil)
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 0 {
+		t.Fatalf("total pool requests = %d, want 0 (no min floor, no scale_check demand)", total)
 	}
 }

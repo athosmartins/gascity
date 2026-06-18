@@ -1586,12 +1586,18 @@ func sortedStringSet(values map[string]struct{}) []string {
 }
 
 func listBothTiersForControllerDemand(store beads.Store, query beads.ListQuery) ([]beads.Bead, error) {
-	handles := beads.HandlesFor(store)
-	rows, err := handles.Cached.List(query)
-	if errors.Is(err, beads.ErrCacheUnavailable) {
-		return handles.Live.List(query)
-	}
-	return rows, err
+	// Retry once on a transient bad/stale pooled connection (ga-aov9u): the
+	// supervisor's long-lived Dolt pool can hand out a socket the server
+	// already reaped, so the first query fails "invalid connection" and the
+	// retry pulls a fresh connection. Non-bad-conn errors are NOT retried.
+	return retryOnBadConn(func() ([]beads.Bead, error) {
+		handles := beads.HandlesFor(store)
+		rows, err := handles.Cached.List(query)
+		if errors.Is(err, beads.ErrCacheUnavailable) {
+			return handles.Live.List(query)
+		}
+		return rows, err
+	})
 }
 
 func readyForControllerDemand(store beads.Store) ([]beads.Bead, error) {
@@ -1610,8 +1616,12 @@ func readyForControllerDemandQuery(store beads.Store, query beads.ReadyQuery) ([
 
 func liveReadyForControllerDemandQuery(store beads.Store, query beads.ReadyQuery) ([]beads.Bead, error) {
 	query.TierMode = beads.TierBoth
-	handles := beads.HandlesFor(store)
-	return handles.Live.Ready(query)
+	// Retry once on a transient bad/stale pooled connection (ga-aov9u); see
+	// listBothTiersForControllerDemand. Non-bad-conn errors are NOT retried.
+	return retryOnBadConn(func() ([]beads.Bead, error) {
+		handles := beads.HandlesFor(store)
+		return handles.Live.Ready(query)
+	})
 }
 
 // mergeNamedSessionDemand ensures that named-session assignee demand is
