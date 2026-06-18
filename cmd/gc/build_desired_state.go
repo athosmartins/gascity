@@ -2919,22 +2919,20 @@ func claimDesiredPoolSlot(cfg *config.City, cfgAgent *config.Agent, sessionBead 
 }
 
 // retryOnBadConn runs fn and retries it EXACTLY ONCE if the first error is a
-// transient bad-connection error (driver.ErrBadConn / "invalid connection" /
-// "connection reset"); otherwise it returns fn's result unchanged. Validated by
-// TestRetryOnBadConn_RetriesExactlyOnce.
+// transient Dolt error — a stale bad connection (driver.ErrBadConn / "invalid
+// connection" / "connection reset") OR an i/o-timeout / deadline-exceeded storm
+// (ga-f8r9e); otherwise it returns fn's result unchanged. Validated by
+// TestRetryOnBadConn_RetriesExactlyOnce and TestRetryOnBadConn_RetriesIOTimeout.
 //
-// RECONSTRUCTED (ga-17nts) after the original uncommitted badconn WIP (ga-aov9u)
-// was accidentally lost via `git checkout --`. This restores the FUNCTION so the
-// source compiles, but the original WIP also WRAPPED the supervisor
-// controller-demand queries with it (the call sites, ~ the ready/scale_check
-// probes); that call-site wrapping was NOT recovered here. The live binary
-// gc-patched-b4moa retains the full original; the other badconn layers
-// (ConnMaxIdleTime=20s pool tuning, third_party withRetry on CLI write paths)
-// are intact. Re-add the call-site wrapping from b4moa before the next engine
-// build/deploy — see ga-17nts.
+// Widened from IsBadConnError to IsTransientDoltError (ga-f8r9e): the original
+// classifier did NOT match "i/o timeout", so a Dolt i/o-timeout storm aborted
+// the wrapped supervisor controller-demand / ready / scale_check probes
+// un-retried, which (together with the un-retried start-path bead read) wedged
+// the session start-queue and starved op=start. The retry is still EXACTLY
+// ONCE — a fresh pooled connection clears the transient socket error.
 func retryOnBadConn[T any](fn func() (T, error)) (T, error) {
 	v, err := fn()
-	if err != nil && beads.IsBadConnError(err) {
+	if err != nil && beads.IsTransientDoltError(err) {
 		return fn()
 	}
 	return v, err

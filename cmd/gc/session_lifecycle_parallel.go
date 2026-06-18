@@ -1381,7 +1381,15 @@ func refreshAsyncStartResult(result startResult, store beads.Store, stderr io.Wr
 	if store == nil || session == nil || strings.TrimSpace(session.ID) == "" {
 		return result, true, false, false
 	}
+	// Retry the refresh read EXACTLY ONCE on a transient Dolt error (ga-f8r9e):
+	// this Get runs on the async-start commit path and an un-retried "i/o
+	// timeout" here discards an otherwise-successful spawn as
+	// "async_start_refresh_failed", leaving the bead stuck in create/config so
+	// op=start never commits. A single retry pulls a fresh pooled connection.
 	current, err := store.Get(session.ID)
+	if err != nil && beads.IsTransientDoltError(err) {
+		current, err = store.Get(session.ID)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "session reconciler: refreshing async start %s: %v\n", result.prepared.candidate.name(), err) //nolint:errcheck
 		return result, false, false, true

@@ -48,6 +48,37 @@ func IsBadConnError(err error) bool {
 		strings.Contains(msg, "broken pipe")
 }
 
+// IsTransientDoltError reports whether err is a transient, retry-eligible
+// failure of a Dolt query — a SUPERSET of IsBadConnError that also covers the
+// socket-level i/o-timeout / deadline-exceeded storm (ga-f8r9e). When the Dolt
+// server is under i/o-timeout pressure, a pooled query aborts after the
+// driver's read deadline with "read tcp ...->127.0.0.1:52756: i/o timeout"
+// (or "context deadline exceeded" when a ctx deadline trips first). These are
+// NOT stale-connection errors, so IsBadConnError does not match them, yet they
+// are just as transient: the next attempt on a fresh connection usually
+// succeeds once the storm passes. Long-lived supervisor read paths (the
+// controller-demand / ready / scale_check probes, and the session-manager
+// start-path bead read that gates op=start) use this to trigger ONE retry so a
+// single i/o-timeout does not abort the reconcile cycle and wedge the session
+// start-queue. Mirrors the transient set already used by isBdAmbiguousWriteError
+// (bd write paths) and IsTransientControllerError (dispatch control). ga-f8r9e.
+func IsTransientDoltError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsBadConnError(err) {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "timed out after")
+}
+
 // Bead is a single unit of work in Gas City. Everything is a bead: tasks,
 // mail, molecules, convoys.
 type Bead struct {

@@ -292,7 +292,17 @@ func sessionName(id string, b beads.Bead) string {
 }
 
 func (m *Manager) loadSessionBead(id string, allowClosed bool) (beads.Bead, string, error) {
+	// Retry the bead read EXACTLY ONCE on a transient Dolt error (ga-f8r9e).
+	// This Get gates the async session-start path: StartRuntimeOnly →
+	// sessionBead → loadSessionBead runs inside the start worker goroutine, so
+	// an un-retried "i/o timeout" here aborts the launch before op=start ever
+	// logs, wedging the supervisor start-queue during a Dolt i/o-timeout storm.
+	// A single retry pulls a fresh pooled connection; the read is idempotent so
+	// retrying is safe for every loadSessionBead caller (start, send, stop, …).
 	b, err := m.store.Get(id)
+	if err != nil && beads.IsTransientDoltError(err) {
+		b, err = m.store.Get(id)
+	}
 	if err != nil {
 		return beads.Bead{}, "", fmt.Errorf("getting session: %w", err)
 	}
