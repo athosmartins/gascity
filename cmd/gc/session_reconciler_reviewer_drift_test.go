@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -175,6 +176,98 @@ func TestReconcileSessionBeads_ConfigDriftStillDrainsNonReviewerDespitePendingVe
 	ds := env.dt.get(session.ID)
 	if ds == nil {
 		t.Fatalf("non-reviewer worker must still drain on config drift despite an unrelated pending verdict; stderr=%s",
+			env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// TestReconcileSessionBeads_ConfigDriftDeferredOnGateReviewerFreshCreating is
+// the stale_async_start race regression test: a gate-reviewer session in
+// state=creating (within staleCreatingStateTimeout = 60 s) must NOT be drained
+// on config drift, even when no verdict bead exists yet. This is the startup
+// window before the dispatcher nudges the reviewer with its verdict bead ID;
+// the existing deliveringVerdict guard cannot fire here because the verdict
+// correlation has not yet happened.
+func TestReconcileSessionBeads_ConfigDriftDeferredOnGateReviewerFreshCreating(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: gateReviewerTemplateName}}}
+	env.addRunningGateReviewerDesiredWithNewConfig("gate-reviewer-adhoc-fresh")
+	session := env.createSessionBead("gate-reviewer-adhoc-fresh", gateReviewerTemplateName)
+	started, _ := driftHashes(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": started,
+	})
+
+	// State=creating, freshly created (CreatedAt just now → isStaleCreating=false).
+	// No pending verdict bead — the dispatcher has not yet nudged the reviewer.
+	env.markSessionCreating(&session)
+
+	env.reconcile([]beads.Bead{session})
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("stale_async_start race: gate-reviewer in fresh creating state must NOT be drained on config drift; got drain=%+v stderr=%s",
+			ds, env.stderr.String())
+	}
+}
+
+// TestReconcileSessionBeads_ConfigDriftDrainsGateReviewerStaleCreating confirms
+// the self-limiting property of the new exemption: once isStaleCreating fires
+// (pending_create_started_at > staleCreatingStateTimeout ago), the async-start
+// guard stops applying and the session drains normally. This prevents a
+// genuinely-stuck reviewer from being pinned forever.
+func TestReconcileSessionBeads_ConfigDriftDrainsGateReviewerStaleCreating(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: gateReviewerTemplateName}}}
+	env.addRunningGateReviewerDesiredWithNewConfig("gate-reviewer-adhoc-stale")
+	session := env.createSessionBead("gate-reviewer-adhoc-stale", gateReviewerTemplateName)
+	started, _ := driftHashes(t)
+	// Push pending_create_started_at into the past so isStaleCreating=true.
+	stalePast := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash":       started,
+		"pending_create_started_at": stalePast,
+	})
+
+	// State=creating, but stale — exemption must not apply.
+	env.markSessionCreating(&session)
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("stale creating gate-reviewer SHOULD drain on config drift (exemption must not pin stale sessions); stderr=%s",
+			env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// TestReconcileSessionBeads_ConfigDriftStillDrainsNonReviewerFreshCreating
+// confirms the async-start exemption is scoped exclusively to the gate-reviewer
+// template: a non-reviewer session in fresh creating state still drains on
+// config drift. This prevents the guard from leaking protection to the whole
+// town.
+func TestReconcileSessionBeads_ConfigDriftStillDrainsNonReviewerFreshCreating(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addRunningWorkerDesiredWithNewConfig()
+	session := env.createSessionBead("worker", "worker")
+	started, _ := driftHashes(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": started,
+	})
+
+	// State=creating, freshly created — but non-reviewer, so exempt must not fire.
+	env.markSessionCreating(&session)
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("non-reviewer worker in creating state must still drain on config drift; stderr=%s",
 			env.stderr.String())
 	}
 	if ds.reason != "config-drift" {

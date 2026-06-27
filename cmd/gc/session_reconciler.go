@@ -2000,6 +2000,38 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': gate-reviewer mid-review (pending verdict)\n", name) //nolint:errcheck
 								continue
 							}
+							// Gate-reviewer sessions in their async-start window
+							// (state=creating before this tick's healState, not yet
+							// stale) match neither of the two exemptions above: the
+							// verdict bead is not yet correlated to the session (it
+							// may not exist yet, or exists unassigned waiting for
+							// the nudge), so deliveringVerdict is false; and the
+							// reviewer has no assigned work bead, so
+							// hasAssignedWork is false. A config-drift during this
+							// narrow startup window drains the reviewer before it
+							// reaches active and can take on a verdict — the
+							// "stale_async_start race". Guard it the same way:
+							// skip the drain while the create is fresh. The next
+							// tick re-evaluates; once the reviewer is active the
+							// deliveringVerdict guard takes over, and once
+							// isStaleCreating fires this exemption stops applying
+							// so a genuinely-stuck reviewer is not pinned.
+							// Note: use stateBeforeHeal (the state as it was at the
+							// start of this reconcile tick), not the post-heal
+							// session.Metadata["state"] — healStateWithRollback
+							// advances creating→awake when alive=true, so the
+							// post-heal state no longer reflects the startup window.
+							isGateReviewer := sessionIsGateReviewerTemplate(*session, cfg)
+							wasCreating := stateBeforeHeal == sessionpkg.StateCreating
+							if isGateReviewer && wasCreating && !isStaleCreating(*session) {
+								if trace != nil {
+									trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredActive), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+										"active_reason": "reviewer_async_start",
+									}), nil, "")
+								}
+								fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': gate-reviewer in async-start (fresh creating)\n", name) //nolint:errcheck
+								continue
+							}
 							ddt := driftDrainTimeout
 							if ddt <= 0 {
 								ddt = defaultDrainTimeout
