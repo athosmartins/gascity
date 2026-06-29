@@ -245,12 +245,13 @@ func TestReconcileSessionBeads_ConfigDriftDrainsGateReviewerStaleCreating(t *tes
 	}
 }
 
-// TestReconcileSessionBeads_ConfigDriftStillDrainsNonReviewerFreshCreating
-// confirms the async-start exemption is scoped exclusively to the gate-reviewer
-// template: a non-reviewer session in fresh creating state still drains on
-// config drift. This prevents the guard from leaking protection to the whole
-// town.
-func TestReconcileSessionBeads_ConfigDriftStillDrainsNonReviewerFreshCreating(t *testing.T) {
+// TestReconcileSessionBeads_ConfigDriftStillDrainsResumeWakeWorkerFreshCreating
+// confirms the async-start exemption applies to wake_mode=fresh agents ONLY:
+// a resume-wake session (no wake_mode set → EffectiveWakeMode()="resume") in
+// fresh creating state still drains on config drift. This prevents the guard
+// from leaking protection to always-on named sessions that should restart
+// promptly when their config changes.
+func TestReconcileSessionBeads_ConfigDriftStillDrainsResumeWakeWorkerFreshCreating(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addRunningWorkerDesiredWithNewConfig()
@@ -260,14 +261,94 @@ func TestReconcileSessionBeads_ConfigDriftStillDrainsNonReviewerFreshCreating(t 
 		"started_config_hash": started,
 	})
 
-	// State=creating, freshly created — but non-reviewer, so exempt must not fire.
+	// State=creating, freshly created — but wake_mode=resume, so exempt must not fire.
 	env.markSessionCreating(&session)
 
 	env.reconcile([]beads.Bead{session})
 
 	ds := env.dt.get(session.ID)
 	if ds == nil {
-		t.Fatalf("non-reviewer worker in creating state must still drain on config drift; stderr=%s",
+		t.Fatalf("resume-wake worker in creating state must still drain on config drift; stderr=%s",
+			env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// TestReconcileSessionBeads_ConfigDriftDeferredOnFreshWakePoolWorkerCreating is
+// the ga-v3o6i regression test: a wa-worker (or any wake_mode=fresh pool agent)
+// in state=creating (within staleCreatingStateTimeout = 60 s) must NOT be
+// drained on config drift. These workers have no assigned work yet at spawn
+// time (they self-claim via RoutedPoolQuery at startup), so the
+// hasAssignedWork exemption cannot fire. A config drift during this startup
+// window drains the worker before it reaches active — the same
+// stale_async_start race that gate-reviewer had, now fixed for all
+// wake_mode=fresh ephemeral workers.
+func TestReconcileSessionBeads_ConfigDriftDeferredOnFreshWakePoolWorkerCreating(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{
+		Name:     "wa-worker",
+		WakeMode: "fresh",
+	}}}
+	tp := TemplateParams{
+		Command:      "new-cmd",
+		SessionName:  "wa-worker-adhoc-test",
+		TemplateName: "wa-worker",
+	}
+	env.desiredState["wa-worker-adhoc-test"] = tp
+	_ = env.sp.Start(context.Background(), "wa-worker-adhoc-test", runtime.Config{Command: "new-cmd"})
+	session := env.createSessionBead("wa-worker-adhoc-test", "wa-worker")
+	started, _ := driftHashes(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": started,
+	})
+
+	// State=creating, freshly created (CreatedAt just now → isStaleCreating=false).
+	// No assigned work bead — the worker has not yet self-claimed via RoutedPoolQuery.
+	env.markSessionCreating(&session)
+
+	env.reconcile([]beads.Bead{session})
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("ga-v3o6i: wa-worker (wake_mode=fresh) in fresh creating state must NOT be drained on config drift; got drain=%+v stderr=%s",
+			ds, env.stderr.String())
+	}
+}
+
+// TestReconcileSessionBeads_ConfigDriftDrainsFreshWakePoolWorkerStaleCreating
+// confirms the self-limiting property: once isStaleCreating fires (>
+// staleCreatingStateTimeout ago), the async-start guard stops applying for
+// fresh-wake workers too, preventing a genuinely-stuck worker from being pinned.
+func TestReconcileSessionBeads_ConfigDriftDrainsFreshWakePoolWorkerStaleCreating(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{{
+		Name:     "wa-worker",
+		WakeMode: "fresh",
+	}}}
+	tp := TemplateParams{
+		Command:      "new-cmd",
+		SessionName:  "wa-worker-adhoc-stale",
+		TemplateName: "wa-worker",
+	}
+	env.desiredState["wa-worker-adhoc-stale"] = tp
+	_ = env.sp.Start(context.Background(), "wa-worker-adhoc-stale", runtime.Config{Command: "new-cmd"})
+	session := env.createSessionBead("wa-worker-adhoc-stale", "wa-worker")
+	started, _ := driftHashes(t)
+	stalePast := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash":       started,
+		"pending_create_started_at": stalePast,
+	})
+
+	// State=creating, but stale — exemption must not apply.
+	env.markSessionCreating(&session)
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("stale creating wa-worker SHOULD drain on config drift (exemption must not pin stale workers); stderr=%s",
 			env.stderr.String())
 	}
 	if ds.reason != "config-drift" {
