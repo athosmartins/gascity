@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -335,5 +336,174 @@ func TestReconcileDefersCloseWhenGetReturnsWrongID(t *testing.T) {
 	}
 	if stats.ReconcileCloseDeferrals != 1 {
 		t.Fatalf("ReconcileCloseDeferrals = %d, want 1", stats.ReconcileCloseDeferrals)
+	}
+}
+
+// recordingListStore records every List query it receives so a test can assert
+// the exact query shape the reconciler uses to hydrate the cache. All other
+// Store methods delegate to the embedded backing.
+type recordingListStore struct {
+	Store
+	mu      sync.Mutex
+	queries []ListQuery
+}
+
+func (s *recordingListStore) List(query ListQuery) ([]Bead, error) {
+	s.mu.Lock()
+	s.queries = append(s.queries, query)
+	s.mu.Unlock()
+	return s.Store.List(query)
+}
+
+func (s *recordingListStore) reset() {
+	s.mu.Lock()
+	s.queries = nil
+	s.mu.Unlock()
+}
+
+func (s *recordingListStore) snapshot() []ListQuery {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ListQuery, len(s.queries))
+	copy(out, s.queries)
+	return out
+}
+
+// TestReconcileHydrationScopesToNonClosed pins the reconcile hydration scan to a
+// non-closed scope at its construction site. The per-cycle full-table hydration
+// must never request closed beads: on a production store that is ~97% closed,
+// hydrating closed rows streams tens of thousands of rows every reconcile cycle
+// per rig and is the dominant driver of chronic Dolt CPU. The scoping is
+// load-bearing for that cost AND coupled to close detection (a bead leaving the
+// non-closed set is precisely what signals a close). If a future edit flips
+// IncludeClosed or pins Status on the reconcile query, the reconciler would
+// hydrate closed rows and this test fails.
+func TestReconcileHydrationScopesToNonClosed(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	if _, err := mem.Create(Bead{Title: "open work"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	backing := &recordingListStore{Store: mem}
+	cache := NewCachingStoreForTest(backing, func(string, string, json.RawMessage) {})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	backing.reset()
+	cache.runReconciliation()
+
+	var scan *ListQuery
+	for _, q := range backing.snapshot() {
+		if q.AllowScan && q.SkipBody && q.TierMode == TierBoth {
+			hit := q
+			scan = &hit
+			break
+		}
+	}
+	if scan == nil {
+		t.Fatalf("reconcile issued no full-table hydration scan; queries=%+v", backing.snapshot())
+	}
+	if scan.IncludeClosed {
+		t.Fatalf("reconcile hydration set IncludeClosed=true — it would hydrate every closed row each cycle")
+	}
+	if scan.Status != "" {
+		t.Fatalf("reconcile hydration pinned Status=%q; want empty so the scope is exactly non-closed", scan.Status)
+	}
+	// Matches encodes the scope the SQL builders translate to WHERE status !=
+	// 'closed': it must reject a closed bead and accept an open one.
+	if scan.Matches(Bead{ID: "c", Status: "closed"}) {
+		t.Fatalf("reconcile hydration query Matches a closed bead; non-closed scoping regressed")
+	}
+	if !scan.Matches(Bead{ID: "o", Status: "open"}) {
+		t.Fatalf("reconcile hydration query rejects an open bead; scoping is too narrow and would drop live work")
+	}
+}
+
+// TestReconcileOpenOnlyHydrationDetectsCloseInMajorityClosedStore proves the
+// safety property that makes non-closed hydration correct. The store is seeded
+// mostly-closed to mirror production, and the test asserts both halves: closed
+// rows are never hydrated into the cache (the optimization), AND a bead that was
+// open last cycle and is now closed — therefore absent from the open-only scan —
+// still emits bead.closed via the recoverMissingFromList → Get → confirmedClosed
+// path (the guarantee). A handful of newly-missing beads per cycle take the Get
+// path; there is no Get storm and no spurious close deferral.
+func TestReconcileOpenOnlyHydrationDetectsCloseInMajorityClosedStore(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	closedIDs := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		b, err := mem.Create(Bead{Title: fmt.Sprintf("archived-%d", i)})
+		if err != nil {
+			t.Fatalf("Create archived-%d: %v", i, err)
+		}
+		if err := mem.Close(b.ID); err != nil {
+			t.Fatalf("Close archived-%d: %v", i, err)
+		}
+		closedIDs = append(closedIDs, b.ID)
+	}
+	staysOpen, err := mem.Create(Bead{Title: "stays open"})
+	if err != nil {
+		t.Fatalf("Create staysOpen: %v", err)
+	}
+	willClose, err := mem.Create(Bead{Title: "will close"})
+	if err != nil {
+		t.Fatalf("Create willClose: %v", err)
+	}
+
+	var events []string
+	cache := NewCachingStoreForTest(mem, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// Optimization: only the two non-closed beads are hydrated; the 20 closed
+	// rows never enter the cache.
+	cache.mu.RLock()
+	hydrated := len(cache.beads)
+	_, hasStaysOpen := cache.beads[staysOpen.ID]
+	_, hasWillClose := cache.beads[willClose.ID]
+	cache.mu.RUnlock()
+	if hydrated != 2 {
+		t.Fatalf("cache hydrated %d beads; want 2 (closed rows must not be hydrated)", hydrated)
+	}
+	if !hasStaysOpen || !hasWillClose {
+		t.Fatalf("cache missing an open bead after prime (staysOpen=%v willClose=%v)", hasStaysOpen, hasWillClose)
+	}
+	for _, id := range closedIDs {
+		assertNotCached(t, cache, id)
+	}
+
+	// Guarantee: close one open bead. The open-only scan no longer returns it,
+	// so close detection must run through recoverMissingFromList.
+	events = events[:0]
+	if err := mem.Close(willClose.ID); err != nil {
+		t.Fatalf("Close willClose: %v", err)
+	}
+	cache.runReconciliation()
+
+	want := "bead.closed:" + willClose.ID
+	found := false
+	for _, e := range events {
+		if e == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("events = %v, want %s under open-only hydration", events, want)
+	}
+	assertNotCached(t, cache, willClose.ID)
+	if _, err := cache.Get(staysOpen.ID); err != nil {
+		t.Fatalf("Get(staysOpen) after reconcile: %v", err)
+	}
+	stats := cache.Stats()
+	if stats.ReconcileCloseDeferrals != 0 {
+		t.Fatalf("ReconcileCloseDeferrals = %d, want 0 (close was confirmed, not deferred)", stats.ReconcileCloseDeferrals)
 	}
 }
