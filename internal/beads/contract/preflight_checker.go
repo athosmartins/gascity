@@ -285,7 +285,12 @@ func beadsModuleVersion() string {
 	}
 	for _, dep := range info.Deps {
 		if dep.Path == "github.com/steveyegge/beads" {
-			if dep.Replace != nil && dep.Replace.Version != "" {
+			// A local-path replace (replace => ./third_party/beads) stamps the module
+			// version as Go's "(devel)" placeholder, which the version_compat preflight
+			// then can't confirm → fails closed → native store disabled city-wide. This is
+			// a FALSE NEGATIVE: the vendored beads IS the require-line version. Ignore the
+			// "(devel)" placeholder and fall back to dep.Version (the require line, v1.0.5).
+			if dep.Replace != nil && dep.Replace.Version != "" && dep.Replace.Version != "(devel)" {
 				return dep.Replace.Version
 			}
 			return dep.Version
