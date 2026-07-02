@@ -399,7 +399,18 @@ func (m *Manager) createAliasedNamedWithTransport(ctx context.Context, alias, ex
 			return err
 		}
 		if err := ensureSessionNameAvailableForSelfAndOwner(m.store, explicitName, "", aliasOwner); err != nil {
-			return err
+			// See the identical guard in createAliasedBeadOnlyNamed: aliasOwner
+			// and explicitName are always resolved together from the same
+			// NamedSessionSpec, so a non-empty aliasOwner is by construction
+			// the rightful owner of explicitName here. A closed bead
+			// squatting explicitName without the configured_named_session
+			// tag was interrupted before the creation pipeline reached that
+			// tagging step and must not permanently block re-materialization
+			// once nothing live conflicts.
+			if aliasOwner == "" || !errors.Is(err, ErrSessionNameExists) ||
+				!noLiveSessionNameCollisions(m.store, explicitName, "", aliasOwner) {
+				return err
+			}
 		}
 
 		// Generate session key only when the provider supports Generate & Pass
@@ -667,7 +678,23 @@ func (m *Manager) createAliasedBeadOnlyNamed(alias, explicitName, template, titl
 			return err
 		}
 		if err := ensureSessionNameAvailableForSelfAndOwner(m.store, explicitName, "", aliasOwner); err != nil {
-			return err
+			// aliasOwner and explicitName are always resolved together from
+			// the same NamedSessionSpec (never supplied independently), so
+			// a non-empty aliasOwner is by construction the rightful owner
+			// of explicitName here — unlike the generic
+			// ensureSessionNameAvailableForSelfAndOwner contract, no
+			// separate ownership check against config is needed at this
+			// call site. A closed bead squatting explicitName without the
+			// configured_named_session tag was interrupted before the
+			// creation pipeline reached that tagging step (e.g. the
+			// reconciler aborted a pending-create because the agent was
+			// suspended in city config mid-materialization) and must not
+			// permanently block re-materialization once nothing live
+			// conflicts.
+			if aliasOwner == "" || !errors.Is(err, ErrSessionNameExists) ||
+				!noLiveSessionNameCollisions(m.store, explicitName, "", aliasOwner) {
+				return err
+			}
 		}
 
 		var sessionKey string

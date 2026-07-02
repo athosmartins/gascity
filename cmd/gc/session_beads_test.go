@@ -4409,6 +4409,113 @@ func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
 	}
 }
 
+// TestCloseBeadSuspendedBackfillsConfiguredNamedSession reproduces ga-etwg:
+// a session bead created for a configured identity via a path with no
+// [[named_session]]/Suspended awareness (session_name_explicit=true, no
+// configured_named_session tag) that the reconciler closes as "suspended".
+// Without the backfill, this bead permanently squats its session_name —
+// names.go's closed-bead exemption never fires because
+// configured_named_session is never "true".
+func TestCloseBeadSuspendedBackfillsConfiguredNamedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	now := time.Date(2026, 7, 2, 16, 49, 43, 0, time.UTC)
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title: "gastown.deacon",
+		Type:  sessionBeadType,
+		Metadata: map[string]string{
+			"alias":                 "gastown.deacon",
+			"session_name":          "gastown__deacon",
+			"session_name_explicit": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	if !closeBead(store, sessionBead.ID, "suspended", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	got, err := store.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("get session bead: %v", err)
+	}
+	if got.Metadata["configured_named_session"] != "true" {
+		t.Errorf("configured_named_session = %q, want %q", got.Metadata["configured_named_session"], "true")
+	}
+	if got.Metadata["configured_named_identity"] != "gastown.deacon" {
+		t.Errorf("configured_named_identity = %q, want %q", got.Metadata["configured_named_identity"], "gastown.deacon")
+	}
+}
+
+func TestCloseBeadSuspendedDoesNotOverwriteExistingConfiguredNamedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	now := time.Date(2026, 7, 2, 16, 49, 43, 0, time.UTC)
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title: "gastown.mayor",
+		Type:  sessionBeadType,
+		Metadata: map[string]string{
+			"alias":                     "gastown.mayor",
+			"session_name":              "gastown__mayor",
+			"session_name_explicit":     "true",
+			"configured_named_session":  "true",
+			"configured_named_identity": "gastown.mayor",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	if !closeBead(store, sessionBead.ID, "suspended", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	got, err := store.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("get session bead: %v", err)
+	}
+	if got.Metadata["configured_named_identity"] != "gastown.mayor" {
+		t.Errorf("configured_named_identity = %q, want unchanged %q", got.Metadata["configured_named_identity"], "gastown.mayor")
+	}
+}
+
+// TestCloseBeadOrphanedDoesNotBackfillConfiguredNamedSession confirms the
+// backfill is scoped strictly to reason=="suspended". An "orphaned" close
+// means the agent was removed from config entirely — there's no config
+// entry left to reopen against, so the permanent-name-squat there is the
+// intended behavior, not a bug.
+func TestCloseBeadOrphanedDoesNotBackfillConfiguredNamedSession(t *testing.T) {
+	store := beads.NewMemStore()
+	now := time.Date(2026, 7, 2, 16, 49, 43, 0, time.UTC)
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title: "gastown.retired-role",
+		Type:  sessionBeadType,
+		Metadata: map[string]string{
+			"alias":                 "gastown.retired-role",
+			"session_name":          "gastown__retired-role",
+			"session_name_explicit": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	if !closeBead(store, sessionBead.ID, "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	got, err := store.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("get session bead: %v", err)
+	}
+	if got.Metadata["configured_named_session"] == "true" {
+		t.Error("configured_named_session backfilled on non-suspended close, want untouched")
+	}
+}
+
 func TestCloseBeadLeavesUnrelatedWorkAlone(t *testing.T) {
 	store := beads.NewMemStore()
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)

@@ -2280,7 +2280,11 @@ func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Wr
 	if reason == string(session.StateFailedCreate) {
 		return closeFailedCreateBead(store, id, now, stderr)
 	}
-	if setMetaBatch(store, id, session.ClosePatch(now, reason), stderr) != nil {
+	patch := session.ClosePatch(now, reason)
+	if reason == "suspended" && snapshotErr == nil {
+		patch = canonicalizeSuspendedClosePatch(snapshot, patch)
+	}
+	if setMetaBatch(store, id, patch, stderr) != nil {
 		return false
 	}
 	if err := store.Close(id); err != nil {
@@ -2297,6 +2301,38 @@ func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Wr
 		releaseWorkFromClosedSessionBead(store, snapshot, stderr)
 	}
 	return true
+}
+
+// canonicalizeSuspendedClosePatch backfills configured_named_session and
+// configured_named_identity when closing a bead with reason "suspended"
+// that holds a permanent explicit name (session_name_explicit=true) but was
+// never tagged as a configured named session. This happens when a session
+// for a configured identity is created via a path with no
+// [[named_session]]/Suspended awareness (e.g. the ad-hoc "new session by
+// agent name" API/CLI surface), and the reconciler's next tick closes it as
+// suspended before any config-aware creator ever sets the tag. Without the
+// backfill, the closed-bead exemption in names.go's
+// ensureSessionNameAvailableForSelfAndOwner never applies and the
+// session_name is squatted forever, permanently blocking
+// re-materialization of that identity even once it's un-suspended. See
+// ga-etwg.
+func canonicalizeSuspendedClosePatch(b beads.Bead, patch session.MetadataPatch) session.MetadataPatch {
+	if strings.TrimSpace(b.Metadata["configured_named_session"]) == "true" {
+		return patch
+	}
+	if strings.TrimSpace(b.Metadata["session_name_explicit"]) != "true" {
+		return patch
+	}
+	identity := strings.TrimSpace(b.Metadata["alias"])
+	if identity == "" {
+		identity = strings.TrimSpace(b.Metadata["agent_name"])
+	}
+	if identity == "" {
+		return patch
+	}
+	patch["configured_named_session"] = "true"
+	patch["configured_named_identity"] = identity
+	return patch
 }
 
 // releaseWorkFromClosedSessionBead clears the assignee on every non-closed
