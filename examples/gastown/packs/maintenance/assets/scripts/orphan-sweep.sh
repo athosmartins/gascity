@@ -8,6 +8,18 @@
 #
 # Does NOT do worktree salvage — that's the witness's job.
 #
+# ga-u0vzx: a bead's single orphan-candidate snapshot is not trusted on its
+# own — see the CONFIRM_THRESHOLD ledger in Step 3. A live worker (dog-gaxfpyg,
+# continuously state=awake per the session-reconciler trace) had its claim on
+# ga-beikk reset by this order 25s after its last bd update, even though
+# is_known_agent()'s multi-field live_session_match() should have protected
+# it; the exact transient (a single `gc session list --json` read racing or
+# momentarily missing that session) was not reproducible, but the design gap
+# was clear either way: this order, unlike its sibling
+# scripts/inflight-reclaim-guard.py (25min continuous-stranding hysteresis
+# before any reclaim), acted destructively on ONE point-in-time snapshot with
+# no cross-cycle confirmation. Hysteresis closes that gap the same way.
+#
 # Runs as an exec order (no LLM, no agent, no wisp).
 set -euo pipefail
 
@@ -20,6 +32,18 @@ esac
 . "$__SCRIPT_DIR/_bd_trace.sh" "orphan-sweep"
 
 CITY="${GC_CITY:-.}"
+
+# ga-u0vzx: hysteresis ledger. A bead must be seen as an orphan-candidate on
+# CONFIRM_THRESHOLD *consecutive* sweeps (default 2, i.e. spans one full
+# cooldown interval — ~5-10min given the order's 5m cooldown) before it is
+# actually reset. Mirrors the state-file convention used by the sibling
+# spawn-storm-detect.sh order. A bead that drops out of the candidate set on
+# any intervening sweep (session came back, bead reassigned/closed, or the
+# prior read was a transient blip) has its counter pruned immediately, so
+# only a *sustained* orphan condition ever triggers a reset.
+PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/maintenance}"
+LEDGER="$PACK_STATE_DIR/orphan-sweep-counts.json"
+CONFIRM_THRESHOLD="${ORPHAN_SWEEP_CONFIRM_THRESHOLD:-2}"
 
 # Step 1: Collect in-progress beads from HQ and every rig whose session
 # liveness can be determined.
@@ -199,17 +223,47 @@ is_known_agent() {
     return 1
 }
 
+# ga-u0vzx: load the hysteresis ledger. Any read/parse failure is treated as
+# an empty ledger (fail-open toward "needs re-confirmation", never toward
+# "skip confirmation and reset immediately") — a corrupt or missing ledger
+# must never make this order MORE aggressive than its designed default.
+mkdir -p "$PACK_STATE_DIR" 2>/dev/null || true
+[ -f "$LEDGER" ] || echo '{}' > "$LEDGER" 2>/dev/null || true
+COUNTS=$(cat "$LEDGER" 2>/dev/null) || COUNTS='{}'
+echo "$COUNTS" | jq -e 'type == "object"' >/dev/null 2>&1 || COUNTS='{}'
+
 ORPHANED=0
+CANDIDATES='{}'
 # Process substitution (not a pipe) keeps the loop body in the parent
-# shell so $ORPHANED survives for the summary message below.
+# shell so $ORPHANED/$COUNTS/$CANDIDATES survive for the code below.
 while IFS=$'\t' read -r bead_id assignee; do
     if ! is_known_agent "$assignee"; then
-        # `gc bd update` auto-resolves the bead's prefix to the right rig
-        # store, so HQ and rig beads update in the correct database.
-        gc bd update "$bead_id" --status=open --assignee="" 2>/dev/null || true
-        ORPHANED=$((ORPHANED + 1))
+        CANDIDATES=$(echo "$CANDIDATES" | jq --arg id "$bead_id" '.[$id] = 1') || CANDIDATES='{}'
+        PREV=$(echo "$COUNTS" | jq -r --arg id "$bead_id" '.[$id] // 0' 2>/dev/null) || PREV=0
+        NEW=$((PREV + 1))
+        if [ "$NEW" -ge "$CONFIRM_THRESHOLD" ]; then
+            # Confirmed orphaned across CONFIRM_THRESHOLD consecutive sweeps —
+            # act. `gc bd update` auto-resolves the bead's prefix to the right
+            # rig store, so HQ and rig beads update in the correct database.
+            gc bd update "$bead_id" --status=open --assignee="" 2>/dev/null || true
+            ORPHANED=$((ORPHANED + 1))
+            COUNTS=$(echo "$COUNTS" | jq --arg id "$bead_id" 'del(.[$id])') || true
+        else
+            # Not yet confirmed — record this sweep's hit and wait for the next.
+            COUNTS=$(echo "$COUNTS" | jq --arg id "$bead_id" --argjson n "$NEW" '.[$id] = $n') || true
+        fi
     fi
 done < <(echo "$IN_PROGRESS" | jq -r '.[] | select(.assignee != null and .assignee != "") | "\(.id)\t\(.assignee)"' 2>/dev/null)
+
+# ga-u0vzx: prune ledger entries for beads that were NOT an orphan-candidate
+# on THIS sweep — the assignee resolved to a known/live agent again (session
+# came back, bead reassigned) or the bead left in_progress entirely. Anything
+# not continuously suspect gets a clean slate rather than accumulating a
+# count across gaps, which is what makes this a *consecutive*-sweeps check
+# rather than a leaky "N-times-ever" counter.
+COUNTS=$(echo "$COUNTS" | jq --argjson keep "$CANDIDATES" \
+    'to_entries | map(select(.key as $k | $keep[$k] != null)) | from_entries' 2>/dev/null) || COUNTS='{}'
+echo "$COUNTS" > "$LEDGER" 2>/dev/null || true
 
 if [ "$ORPHANED" -gt 0 ]; then
     echo "orphan-sweep: reset $ORPHANED orphaned beads"
