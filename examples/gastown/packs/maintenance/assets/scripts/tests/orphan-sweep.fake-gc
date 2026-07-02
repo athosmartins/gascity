@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Fake `gc` shim for orphan-sweep.sh functional testing.
+# Controlled by env vars set by the driver:
+#   FAKE_SESSION_JSON  - what `gc session list --json` prints
+#   FAKE_INPROGRESS_JSON - what `gc bd list --status=in_progress --json --limit=0` prints
+#   FAKE_AGENTS         - newline-separated agent names for `gc config explain`
+#   RESET_LOG           - file to append "<id>" to whenever `gc bd update <id> --status=open --assignee=` is called
+set -euo pipefail
+
+case "$1 $2" in
+    "rig list")
+        echo '{"rigs":[]}'
+        ;;
+    "session list")
+        printf '%s\n' "${FAKE_SESSION_JSON:-EMPTY}" | sed 's/^EMPTY$/{"sessions":[]}/'
+        ;;
+    "bd list")
+        # Distinguish `gc bd list --status=in_progress --json --limit=0` from other bd calls.
+        echo "${FAKE_INPROGRESS_JSON:-[]}"
+        ;;
+    "bd update")
+        # $3 is the bead id: gc bd update <id> --status=open --assignee=
+        echo "$3" >> "${RESET_LOG:?RESET_LOG not set}"
+        echo "updated"
+        ;;
+    "config explain")
+        while IFS= read -r a; do
+            [ -z "$a" ] && continue
+            echo "Agent: $a"
+        done <<< "${FAKE_AGENTS:-}"
+        ;;
+    "config show")
+        echo ""
+        ;;
+    *)
+        echo "fake-gc: unhandled invocation: $*" >&2
+        exit 1
+        ;;
+esac
