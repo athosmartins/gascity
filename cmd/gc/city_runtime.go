@@ -2537,6 +2537,23 @@ func isStaleCreating(bead beads.Bead) bool {
 	return !now.Before(bead.CreatedAt.Add(staleCreatingStateTimeout))
 }
 
+// isStaleForAsyncStartDriftExemption mirrors isStaleCreating but uses the
+// longer asyncStartDriftExemptionTimeout. It gates ONLY the fresh-wake
+// config-drift drain exemption in the session reconciler, so that a Dolt-hot
+// (slow) startup cannot lapse the exemption and let a routine scripts/
+// CopyFiles drift drain a worker before it does any work. Every reap/sweep
+// path deliberately keeps using isStaleCreating (the shorter window).
+func isStaleForAsyncStartDriftExemption(bead beads.Bead) bool {
+	now := time.Now()
+	if started, ok := parseRFC3339Metadata(bead.Metadata["pending_create_started_at"]); ok {
+		return !now.Before(started.Add(asyncStartDriftExemptionTimeout))
+	}
+	if bead.CreatedAt.IsZero() {
+		return true
+	}
+	return !now.Before(bead.CreatedAt.Add(asyncStartDriftExemptionTimeout))
+}
+
 // parseRFC3339Metadata parses an RFC3339 timestamp metadata value. A missing,
 // zero, or unparseable value returns ok=false; the caller treats that as "no
 // per-start marker present" so older beads (pre-creation_complete_at rollout)

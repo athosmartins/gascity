@@ -223,8 +223,9 @@ func TestReconcileSessionBeads_ConfigDriftDrainsGateReviewerStaleCreating(t *tes
 	env.addRunningGateReviewerDesiredWithNewConfig("gate-reviewer-adhoc-stale")
 	session := env.createSessionBead("gate-reviewer-adhoc-stale", gateReviewerTemplateName)
 	started, _ := driftHashes(t)
-	// Push pending_create_started_at into the past so isStaleCreating=true.
-	stalePast := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	// Push pending_create_started_at past asyncStartDriftExemptionTimeout so the
+	// fresh-wake async-start exemption no longer applies and the drain must happen.
+	stalePast := time.Now().Add(-asyncStartDriftExemptionTimeout - time.Minute).UTC().Format(time.RFC3339)
 	env.setSessionMetadata(&session, map[string]string{
 		"started_config_hash":       started,
 		"pending_create_started_at": stalePast,
@@ -335,7 +336,7 @@ func TestReconcileSessionBeads_ConfigDriftDrainsFreshWakePoolWorkerStaleCreating
 	_ = env.sp.Start(context.Background(), "wa-worker-adhoc-stale", runtime.Config{Command: "new-cmd"})
 	session := env.createSessionBead("wa-worker-adhoc-stale", "wa-worker")
 	started, _ := driftHashes(t)
-	stalePast := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	stalePast := time.Now().Add(-asyncStartDriftExemptionTimeout - time.Minute).UTC().Format(time.RFC3339)
 	env.setSessionMetadata(&session, map[string]string{
 		"started_config_hash":       started,
 		"pending_create_started_at": stalePast,

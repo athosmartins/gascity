@@ -2025,7 +2025,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							// (wa-worker, ps-worker) whose spawn-wake-active
 							// lifecycle suffered the same race.
 							wasCreating := stateBeforeHeal == sessionpkg.StateCreating
-							if wasCreating && !isStaleCreating(*session) {
+							// Keyed to the LONGER asyncStartDriftExemptionTimeout (not the
+							// 1-minute staleCreatingStateTimeout that reap/sweep use), so a
+							// Dolt-hot slow startup cannot lapse this exemption mid-spawn and
+							// let a routine scripts/ CopyFiles drift drain the worker before
+							// it does any work. See the const doc in session_reconcile.go.
+							if wasCreating && !isStaleForAsyncStartDriftExemption(*session) {
 								ephemeralTemplate := normalizedSessionTemplate(*session, cfg)
 								ephemeralAgent := findAgentByTemplate(cfg, ephemeralTemplate)
 								isFreshWake := sessionIsGateReviewerTemplate(*session, cfg) ||
