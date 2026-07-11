@@ -636,6 +636,35 @@ func TestProviderDrainOpsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestProviderDrainOpsSetDrainAckPersistsDrainWithoutPriorSetDrain reproduces
+// ga-sm5p: an agent that self-initiates drain-ack (the documented pool-worker
+// shutdown pattern — "execute it, close it, and drain when complete" — never
+// calls "gc runtime drain" first) must see drain-check report draining=true
+// immediately after the ack. Before the fix, setDrainAck wrote only
+// GC_DRAIN_ACK, leaving isDraining (which reads only GC_DRAIN) false —
+// ack succeeded but the drain state did not persist.
+func TestProviderDrainOpsSetDrainAckPersistsDrainWithoutPriorSetDrain(t *testing.T) {
+	sp := runtime.NewFake()
+	_ = sp.Start(context.Background(), "worker", runtime.Config{})
+	dops := newDrainOps(sp)
+
+	if draining, _ := dops.isDraining("worker"); draining {
+		t.Fatal("should not be draining initially")
+	}
+
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatalf("setDrainAck: %v", err)
+	}
+
+	acked, _ := dops.isDrainAcked("worker")
+	if !acked {
+		t.Error("should be acked after setDrainAck")
+	}
+	if draining, _ := dops.isDraining("worker"); !draining {
+		t.Error("should be draining after setDrainAck even without a prior setDrain — ack→check must be consistent")
+	}
+}
+
 func TestProviderDrainOpsReportsMetadataErrors(t *testing.T) {
 	sp := runtime.NewFailFake()
 	dops := newDrainOps(sp)
@@ -721,6 +750,7 @@ func TestProviderDrainOpsSetDrainAckAttemptsAckAfterCleanupErrors(t *testing.T) 
 	}
 	wantSet := []string{
 		reconcilerDrainAckSourceKey,
+		"GC_DRAIN",
 		"GC_DRAIN_ACK",
 	}
 	if !slices.Equal(sp.setKeys, wantSet) {

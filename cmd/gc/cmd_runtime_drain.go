@@ -98,6 +98,12 @@ func (o *providerDrainOps) setDrainAck(sessionName string) error {
 		o.sp.RemoveMeta(sessionName, reconcilerDrainAckReasonKey),
 		o.sp.RemoveMeta(sessionName, reconcilerDrainAckGenerationKey),
 		o.sp.SetMeta(sessionName, reconcilerDrainAckSourceKey, drainAckSourceAgentValue),
+		// Persist the drain intent atomically with the ack: agents commonly
+		// call drain-ack directly (self-initiated "I'm done" signal) without
+		// a preceding "gc runtime drain", so GC_DRAIN may never otherwise get
+		// set. isDraining (and thus drain-check) reads only GC_DRAIN — without
+		// this, ack succeeds but a subsequent drain-check reports not-draining.
+		o.sp.SetMeta(sessionName, "GC_DRAIN", strconv.FormatInt(time.Now().Unix(), 10)),
 		o.sp.SetMeta(sessionName, "GC_DRAIN_ACK", "1"),
 	)
 }
