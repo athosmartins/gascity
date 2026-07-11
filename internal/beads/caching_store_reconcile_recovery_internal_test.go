@@ -7,7 +7,107 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
+
+// assertEvent fails the test unless want appears in events.
+func assertEvent(t *testing.T, events []string, want string) {
+	t.Helper()
+	for _, e := range events {
+		if e == want {
+			return
+		}
+	}
+	t.Fatalf("events = %v, want %s", events, want)
+}
+
+// sleepPastSecondBoundary blocks until the wall clock crosses into the next
+// whole second, so a row created (or reconciled) before the call has a strictly
+// smaller second-resolution timestamp than one after it. Used to place a
+// "settled" row in a second strictly below the reconcile watermark, so the
+// second-boundary re-hydration cohort (ga-ftmci Fix 2) provably does not include
+// it.
+func sleepPastSecondBoundary() {
+	now := time.Now()
+	next := now.Truncate(time.Second).Add(time.Second)
+	time.Sleep(next.Sub(now) + 5*time.Millisecond)
+}
+
+// depBundlingStore is a test backing whose List/Get bundle each bead's
+// dependencies into the returned bead's .Dependencies field and which reports
+// listIncludesCompleteDependencies()==true — mirroring the PRODUCTION
+// NativeDoltStore path (the OPPOSITE branch from MemStore, which fetches deps
+// per-ID). It can also override a bead's returned description to simulate a
+// content write that does not advance updated_at (same-second write). Every
+// List query is recorded for query-shape assertions.
+type depBundlingStore struct {
+	*MemStore
+	mu        sync.Mutex
+	queries   []ListQuery
+	forceDesc map[string]string
+}
+
+func newDepBundlingStore() *depBundlingStore {
+	return &depBundlingStore{MemStore: NewMemStore(), forceDesc: map[string]string{}}
+}
+
+func (s *depBundlingStore) listIncludesCompleteDependencies() bool { return true }
+
+func (s *depBundlingStore) List(query ListQuery) ([]Bead, error) {
+	s.mu.Lock()
+	s.queries = append(s.queries, query)
+	s.mu.Unlock()
+	beads, err := s.MemStore.List(query)
+	if err != nil {
+		return beads, err
+	}
+	for i := range beads {
+		beads[i] = s.decorate(beads[i])
+	}
+	return beads, nil
+}
+
+func (s *depBundlingStore) Get(id string) (Bead, error) {
+	b, err := s.MemStore.Get(id)
+	if err != nil {
+		return b, err
+	}
+	return s.decorate(b), nil
+}
+
+// decorate bundles fresh deps (from the separate dep table) into .Dependencies
+// and applies any forced-description override. It never touches UpdatedAt, so a
+// forced description simulates a same-second content write.
+func (s *depBundlingStore) decorate(b Bead) Bead {
+	deps, _ := s.MemStore.DepList(b.ID, "down")
+	b.Dependencies = deps
+	s.mu.Lock()
+	if d, ok := s.forceDesc[b.ID]; ok {
+		b.Description = d
+	}
+	s.mu.Unlock()
+	return b
+}
+
+func (s *depBundlingStore) setForceDesc(id, desc string) {
+	s.mu.Lock()
+	s.forceDesc[id] = desc
+	s.mu.Unlock()
+}
+
+func (s *depBundlingStore) recordedQueries() []ListQuery {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ListQuery, len(s.queries))
+	copy(out, s.queries)
+	return out
+}
+
+func (s *depBundlingStore) resetQueries() {
+	s.mu.Lock()
+	s.queries = nil
+	s.mu.Unlock()
+}
 
 // droppingListStore wraps a Store and silently omits selected bead IDs from
 // List results, simulating a cleanly parsed but incomplete List under backend
@@ -506,4 +606,333 @@ func TestReconcileOpenOnlyHydrationDetectsCloseInMajorityClosedStore(t *testing.
 	if stats.ReconcileCloseDeferrals != 0 {
 		t.Fatalf("ReconcileCloseDeferrals = %d, want 0 (close was confirmed, not deferred)", stats.ReconcileCloseDeferrals)
 	}
+}
+
+// TestReconcileIncrementalHydrationOnlyHydratesChangedRows is the corpus-safety
+// gate for ga-ftmci incremental hydration. After a steady-state reconcile
+// establishes the DB-clock watermark, exactly one open row's content is mutated
+// (bumping updated_at) and a different row is closed. The test asserts, via the
+// recordingListStore that captures every ListQuery, that:
+//   (a) the reconcile issues an updated_at-scoped hydration scan (not a full
+//       scan) that selects ONLY the bumped row — the unchanged row is not
+//       re-hydrated; AND
+//   (b) change detection is preserved end to end: the bumped row emits
+//       bead.updated with fresh content, the closed row still emits bead.closed
+//       (via the complete-scan absence → recoverMissingFromList path), and the
+//       untouched row emits nothing.
+// A naive `updated_at > watermark` filter on the reconcile scan would drop every
+// unchanged open row from the diff and synthesize bead.closed for the whole
+// corpus; the two-query shape (cheap complete scan for the ID set, watermark
+// scan only for hydration) is what this test pins.
+func TestReconcileIncrementalHydrationOnlyHydratesChangedRows(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	staysOpen, err := mem.Create(Bead{Title: "stays open"})
+	if err != nil {
+		t.Fatalf("Create staysOpen: %v", err)
+	}
+	// Put staysOpen in a second strictly below the watermark so the second-
+	// boundary re-hydration cohort (Fix 2) provably excludes it — otherwise a
+	// row created in the same second as the frontier is correctly re-hydrated.
+	sleepPastSecondBoundary()
+	willBump, err := mem.Create(Bead{Title: "will bump"})
+	if err != nil {
+		t.Fatalf("Create willBump: %v", err)
+	}
+	willClose, err := mem.Create(Bead{Title: "will close"})
+	if err != nil {
+		t.Fatalf("Create willClose: %v", err)
+	}
+
+	backing := &recordingListStore{Store: mem}
+	var events []string
+	cache := NewCachingStoreForTest(backing, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// First reconcile establishes the hydration watermark (boot: full hydrate).
+	cache.runReconciliation()
+
+	backing.reset()
+	events = events[:0]
+
+	// Mutate exactly one open row's content (bumps updated_at strictly past the
+	// watermark) and close another.
+	time.Sleep(2 * time.Millisecond)
+	newTitle := "will bump (edited)"
+	if err := mem.Update(willBump.ID, UpdateOpts{Title: &newTitle}); err != nil {
+		t.Fatalf("Update willBump: %v", err)
+	}
+	if err := mem.Close(willClose.ID); err != nil {
+		t.Fatalf("Close willClose: %v", err)
+	}
+
+	cache.runReconciliation()
+
+	// (a) An updated_at-scoped hydration scan AND a cheap complete scan were
+	// issued. A naive full-scan reconcile issues neither and fails here.
+	var hydrationQ *ListQuery
+	var cheapCompleteQ *ListQuery
+	for _, q := range backing.snapshot() {
+		qq := q
+		if !qq.UpdatedAfter.IsZero() {
+			hydrationQ = &qq
+		}
+		if qq.SkipDescription && qq.UpdatedAfter.IsZero() && qq.AllowScan {
+			cheapCompleteQ = &qq
+		}
+	}
+	if hydrationQ == nil {
+		t.Fatalf("reconcile issued no updated_at-scoped hydration scan; queries=%+v", backing.snapshot())
+	}
+	if cheapCompleteQ == nil {
+		t.Fatalf("reconcile issued no cheap complete (SkipDescription) scan; queries=%+v", backing.snapshot())
+	}
+
+	// The hydration scan, evaluated against the store, returns ONLY the bumped
+	// row: staysOpen (unchanged, updated_at <= watermark) and willClose (closed)
+	// are excluded.
+	hydratedRows, err := mem.List(*hydrationQ)
+	if err != nil {
+		t.Fatalf("evaluate hydration query: %v", err)
+	}
+	hydratedIDs := make(map[string]bool, len(hydratedRows))
+	for _, b := range hydratedRows {
+		hydratedIDs[b.ID] = true
+	}
+	if !hydratedIDs[willBump.ID] {
+		t.Fatalf("hydration scan omitted the updated_at-bumped row %s; got %v", willBump.ID, hydratedIDs)
+	}
+	if hydratedIDs[staysOpen.ID] {
+		t.Fatalf("hydration scan re-hydrated the unchanged row %s; incremental hydration regressed", staysOpen.ID)
+	}
+
+	// (b) Change detection preserved.
+	assertEvent(t, events, "bead.updated:"+willBump.ID)
+	assertEvent(t, events, "bead.closed:"+willClose.ID)
+	for _, e := range events {
+		if e == "bead.updated:"+staysOpen.ID {
+			t.Fatalf("unchanged row %s emitted bead.updated; events=%v", staysOpen.ID, events)
+		}
+	}
+	assertNotCached(t, cache, willClose.ID)
+	if _, err := cache.Get(staysOpen.ID); err != nil {
+		t.Fatalf("Get(staysOpen) after reconcile: %v", err)
+	}
+	got, err := cache.Get(willBump.ID)
+	if err != nil {
+		t.Fatalf("Get(willBump): %v", err)
+	}
+	if got.Title != newTitle {
+		t.Fatalf("willBump title = %q, want %q (hydration did not refresh content)", got.Title, newTitle)
+	}
+}
+
+// TestReconcileIncrementalHydrationDetectsDepOnlyChangeWithoutUpdatedAtBump pins
+// the dep-only footgun the runbook flags: adding a dependency does NOT bump the
+// source issue's updated_at (deps live in a separate table), so hydration
+// selection keyed on updated_at will not content-hydrate the source. The
+// reconcile must still detect the dependency change, because deps are refreshed
+// for the COMPLETE open set every cycle (fetchDepsForBeads over freshByID),
+// independent of the updated_at hydration decision.
+func TestReconcileIncrementalHydrationDetectsDepOnlyChangeWithoutUpdatedAtBump(t *testing.T) {
+	t.Parallel()
+
+	mem := NewMemStore()
+	src, err := mem.Create(Bead{Title: "dep source"})
+	if err != nil {
+		t.Fatalf("Create src: %v", err)
+	}
+	target, err := mem.Create(Bead{Title: "dep target"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	var events []string
+	cache := NewCachingStoreForTest(mem, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	cache.runReconciliation() // establish watermark
+	events = events[:0]
+
+	before, err := mem.Get(src.ID)
+	if err != nil {
+		t.Fatalf("Get src before dep: %v", err)
+	}
+	if err := mem.DepAdd(src.ID, target.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+	after, err := mem.Get(src.ID)
+	if err != nil {
+		t.Fatalf("Get src after dep: %v", err)
+	}
+	// Precondition: the dep add did NOT bump updated_at (else the test no longer
+	// exercises the footgun and would pass trivially via content hydration).
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("precondition failed: DepAdd bumped src UpdatedAt (%s → %s); test no longer covers the dep-only-no-bump case",
+			before.UpdatedAt, after.UpdatedAt)
+	}
+
+	cache.runReconciliation()
+
+	assertEvent(t, events, "bead.updated:"+src.ID)
+	deps, err := cache.DepList(src.ID, "down")
+	if err != nil {
+		t.Fatalf("DepList(src): %v", err)
+	}
+	if len(deps) != 1 || deps[0].DependsOnID != target.ID {
+		t.Fatalf("cache deps for src = %+v, want exactly one dep on %s", deps, target.ID)
+	}
+}
+
+// TestReconcileIncrementalHydrationRefreshesDepsOnCompleteDepsBacking is the
+// regression test for Fix 1 on the PRODUCTION native path
+// (listIncludesCompleteDependencies()==true, so reconcile deps are derived from
+// each bead's carried .Dependencies field — NOT the per-ID DepList path MemStore
+// uses). A dep add does not bump issues.updated_at, so the source bead is
+// carried forward unchanged. Its cached .Dependencies would be STALE unless the
+// carry-forward path refreshes deps from the cheap complete scan (which already
+// hydrates them). The source is placed a full second below the watermark so it
+// is genuinely carried forward (not re-hydrated by the second-boundary cohort),
+// isolating the carry-forward dep-overlay fix. FAILS before Fix 1 (no
+// bead.updated; DepList stays empty); PASSES after.
+func TestReconcileIncrementalHydrationRefreshesDepsOnCompleteDepsBacking(t *testing.T) {
+	t.Parallel()
+
+	backing := newDepBundlingStore()
+	src, err := backing.Create(Bead{Title: "dep source"})
+	if err != nil {
+		t.Fatalf("Create src: %v", err)
+	}
+	target, err := backing.Create(Bead{Title: "dep target"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	// Advance a full second, then create a pacer so the watermark second is
+	// strictly greater than src's second: src is then carried forward, never in
+	// the boundary re-hydration cohort.
+	sleepPastSecondBoundary()
+	if _, err := backing.Create(Bead{Title: "pacer"}); err != nil {
+		t.Fatalf("Create pacer: %v", err)
+	}
+
+	var events []string
+	cache := NewCachingStoreForTest(backing, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	cache.runReconciliation() // establish watermark (> src's second)
+	backing.resetQueries()
+	events = events[:0]
+
+	before, err := backing.Get(src.ID)
+	if err != nil {
+		t.Fatalf("Get src before dep: %v", err)
+	}
+	if err := backing.DepAdd(src.ID, target.ID, "blocks"); err != nil {
+		t.Fatalf("DepAdd: %v", err)
+	}
+	after, err := backing.Get(src.ID)
+	if err != nil {
+		t.Fatalf("Get src after dep: %v", err)
+	}
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("precondition failed: DepAdd bumped src UpdatedAt (%s → %s)", before.UpdatedAt, after.UpdatedAt)
+	}
+
+	cache.runReconciliation()
+
+	// src is carried forward (below the watermark second): the hydration scan
+	// must NOT return it, proving the dep refresh came from the carry-forward
+	// overlay, not from re-hydration.
+	var hydrationQ *ListQuery
+	for _, q := range backing.recordedQueries() {
+		qq := q
+		if !qq.UpdatedAfter.IsZero() {
+			hydrationQ = &qq
+		}
+	}
+	if hydrationQ == nil {
+		t.Fatalf("no updated_at-scoped hydration scan issued")
+	}
+	if hydrationQ.Matches(after) {
+		t.Fatalf("hydration scan would re-hydrate src (%s); test no longer isolates the carry-forward dep overlay", src.ID)
+	}
+
+	assertEvent(t, events, "bead.updated:"+src.ID)
+	deps, err := cache.DepList(src.ID, "down")
+	if err != nil {
+		t.Fatalf("DepList(src): %v", err)
+	}
+	if len(deps) != 1 || deps[0].DependsOnID != target.ID {
+		t.Fatalf("cache deps for carried-forward src = %+v, want exactly one dep on %s (stale carried deps = Fix 1 regression)", deps, target.ID)
+	}
+}
+
+// TestReconcileIncrementalHydrationCatchesSameSecondContentWrite is the
+// regression test for Fix 2: issues.updated_at is DATETIME (second resolution),
+// so a content write in the same wall-clock second as the last observed change
+// does NOT advance updated_at. Keyed purely on `updated_at.After(cached)`, that
+// second write is carried-forward-stale permanently. The fix re-hydrates the
+// boundary-second cohort each cycle. Here the frontier bead's description is
+// changed WITHOUT touching updated_at (depBundlingStore.forceDesc); the reconcile
+// must still pick up the new content. FAILS before Fix 2 (cache keeps "v1");
+// PASSES after ("v2").
+func TestReconcileIncrementalHydrationCatchesSameSecondContentWrite(t *testing.T) {
+	t.Parallel()
+
+	backing := newDepBundlingStore()
+	x, err := backing.Create(Bead{Title: "frontier", Description: "v1"})
+	if err != nil {
+		t.Fatalf("Create x: %v", err)
+	}
+
+	var events []string
+	cache := NewCachingStoreForTest(backing, func(eventType, beadID string, _ json.RawMessage) {
+		events = append(events, eventType+":"+beadID)
+	})
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+	cache.runReconciliation() // establish watermark == x's second
+	events = events[:0]
+
+	got, err := cache.Get(x.ID)
+	if err != nil {
+		t.Fatalf("Get x after first reconcile: %v", err)
+	}
+	if got.Description != "v1" {
+		t.Fatalf("precondition: cached description = %q, want v1", got.Description)
+	}
+
+	// Same-second content write: change the returned description WITHOUT bumping
+	// updated_at (forceDesc leaves UpdatedAt untouched).
+	backing.setForceDesc(x.ID, "v2")
+	reGot, err := backing.Get(x.ID)
+	if err != nil {
+		t.Fatalf("Get x after forceDesc: %v", err)
+	}
+	if !reGot.UpdatedAt.Equal(got.UpdatedAt) {
+		t.Fatalf("precondition failed: forceDesc changed UpdatedAt (%s → %s); test no longer exercises the same-second race", got.UpdatedAt, reGot.UpdatedAt)
+	}
+
+	cache.runReconciliation()
+
+	final, err := cache.Get(x.ID)
+	if err != nil {
+		t.Fatalf("Get x after second reconcile: %v", err)
+	}
+	if final.Description != "v2" {
+		t.Fatalf("cache description = %q, want v2 — same-second content write was dropped (Fix 2 regression)", final.Description)
+	}
+	assertEvent(t, events, "bead.updated:"+x.ID)
 }

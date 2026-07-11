@@ -1298,6 +1298,16 @@ type IssueFilter struct {
 	// NOT set this on any path that recomputes ComputeContentHash from the
 	// returned Issue; the body fields feed the hash. Read/diff paths are safe.
 	SkipBody bool
+
+	// SkipDescription additionally suppresses the `description` column (implies
+	// SkipBody-level narrowing). The projection NULL-fills description so
+	// Issue.Description is returned empty. The gc supervisor's cache reconcile
+	// (ga-ftmci) sets this on its CHEAP COMPLETE scan, which only needs
+	// id/status/updated_at to drive the ID-set / close / delete diff: after
+	// SkipBody dropped the LONGTEXT body columns, streaming `description` for
+	// every open row every cycle was the remaining dominant CPU cost. Same
+	// WARNING as SkipBody: never set on a ComputeContentHash path.
+	SkipDescription bool
 }
 
 // SortPolicy determines how ready work is ordered

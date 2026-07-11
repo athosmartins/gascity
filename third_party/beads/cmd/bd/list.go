@@ -873,6 +873,12 @@ var listCmd = &cobra.Command{
 			// do not need body text (e.g. the gc reconcile subprocess path).
 			filter.SkipBody = true
 		}
+		if skipDescription, _ := cmd.Flags().GetBool("skip-description"); skipDescription {
+			// ga-ftmci: the gc reconcile CHEAP COMPLETE scan needs only
+			// id/status/updated_at, so drop `description` too (the last large
+			// streamed column after --skip-body). Output shows description empty.
+			filter.SkipDescription = true
+		}
 
 		// Priority ranges
 		if cmd.Flags().Changed("priority-min") {
@@ -1279,6 +1285,14 @@ func init() {
 		"Skip hydration of the large body columns (design, acceptance_criteria, notes). "+
 			"Those fields in output will be empty. Use only when the caller does not "+
 			"depend on body text; narrows the DB projection for cheaper full scans.")
+
+	// Description hydration toggle (ga-ftmci). Also drops `description` — the
+	// last large streamed column after --skip-body — for id/status/updated_at
+	// scans like the gc reconcile cheap complete scan.
+	listCmd.Flags().Bool("skip-description", false,
+		"Skip hydration of the description column too (implies --skip-body-level narrowing). "+
+			"The description field in output will be empty. Use only when the caller needs "+
+			"just id/status/updated_at; narrows the DB projection further for cheap complete scans.")
 
 	// Priority ranges
 	listCmd.Flags().String("priority-min", "", "Filter by minimum priority (inclusive, 0-4 or P0-P4)")

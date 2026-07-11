@@ -113,7 +113,7 @@ func searchTableInTx(ctx context.Context, tx *sql.Tx, query string, filter types
 	}
 	//nolint:gosec // G201: SQL fragments are built from fixed table/column names and parameterized filters.
 	querySQL := fmt.Sprintf(`%s%s FROM %s %s ORDER BY priority ASC, created_at DESC, id ASC %s`,
-		selectSQL, issueSelectColumns(filter.SkipBody), fromSQL, whereSQL, limitSQL)
+		selectSQL, issueSelectColumns(filter.SkipBody, filter.SkipDescription), fromSQL, whereSQL, limitSQL)
 
 	rows, err := tx.QueryContext(ctx, querySQL, args...)
 	if err != nil {
@@ -190,7 +190,7 @@ func searchTablePatternB(ctx context.Context, tx *sql.Tx, fromSQL, whereSQL stri
 	}
 	//nolint:gosec // G201: table name is a fixed constant from FilterTables.
 	fetchSQL := fmt.Sprintf(`SELECT %s FROM %s WHERE id IN (%s)`,
-		issueSelectColumns(filter.SkipBody), tables.Main, strings.Join(placeholders, ","))
+		issueSelectColumns(filter.SkipBody, filter.SkipDescription), tables.Main, strings.Join(placeholders, ","))
 
 	fetchRows, err := tx.QueryContext(ctx, fetchSQL, fetchArgs...)
 	if err != nil {

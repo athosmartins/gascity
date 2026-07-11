@@ -1303,6 +1303,7 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		Limit:               limit,
 		MetadataFields:      query.Metadata,
 		CreatedBefore:       zeroTimePtr(query.CreatedBefore),
+		UpdatedAfter:        zeroTimePtr(query.UpdatedAfter),
 		IncludeDependencies: true,
 		// ga-ftmci: when the caller (cache reconcile) does not need the large
 		// body columns, narrow the projection so the DB engine stops streaming
@@ -1310,6 +1311,11 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		// beadFromNativeIssue never reads those fields, so this is invisible to
 		// the cache and to change detection.
 		SkipBody: query.SkipBody,
+		// ga-ftmci: the reconcile cheap complete scan needs only id/status/
+		// updated_at, so drop `description` too. Narrows the projection further;
+		// the cache never treats a SkipDescription result as authoritative body
+		// content (it only reads the ID set + status/updated_at from it).
+		SkipDescription: query.SkipDescription,
 	}
 	switch query.TierMode {
 	case TierWisps:

@@ -62,11 +62,52 @@ func TestIssueSelectColumnsLiteDropsBodyColumns(t *testing.T) {
 }
 
 func TestIssueSelectColumnsSelectorPicksProjection(t *testing.T) {
-	if got := issueSelectColumns(false); got != IssueSelectColumns {
+	if got := issueSelectColumns(false, false); got != IssueSelectColumns {
 		t.Fatalf("skipBody=false should return full projection")
 	}
-	if got := issueSelectColumns(true); got != IssueSelectColumnsLite {
+	if got := issueSelectColumns(true, false); got != IssueSelectColumnsLite {
 		t.Fatalf("skipBody=true should return lite projection")
+	}
+	// ga-ftmci: skipDescription selects the minimal projection and takes
+	// precedence over skipBody (it is strictly narrower).
+	if got := issueSelectColumns(true, true); got != IssueSelectColumnsMinimal {
+		t.Fatalf("skipDescription=true should return minimal projection")
+	}
+	if got := issueSelectColumns(false, true); got != IssueSelectColumnsMinimal {
+		t.Fatalf("skipDescription=true should return minimal projection regardless of skipBody")
+	}
+}
+
+func TestIssueSelectColumnsMinimalMatchesFullArity(t *testing.T) {
+	full := countCols(IssueSelectColumns)
+	minimal := countCols(IssueSelectColumnsMinimal)
+	if full != minimal {
+		t.Fatalf("column count drift: full=%d minimal=%d — ScanIssueFrom requires identical arity/order", full, minimal)
+	}
+}
+
+func TestIssueSelectColumnsMinimalDropsDescriptionAndBody(t *testing.T) {
+	// The minimal projection replaces description AND the three body columns with
+	// empty-string literals; strip the literal aliases, then no raw column may
+	// remain.
+	stripped := IssueSelectColumnsMinimal
+	for _, lit := range []string{"'' AS description", "'' AS design", "'' AS acceptance_criteria", "'' AS notes"} {
+		if !strings.Contains(IssueSelectColumnsMinimal, lit) {
+			t.Fatalf("minimal projection missing literal %q", lit)
+		}
+		stripped = strings.ReplaceAll(stripped, lit, "")
+	}
+	for _, col := range []string{"description", "design", "acceptance_criteria", "notes"} {
+		if strings.Contains(stripped, col) {
+			t.Fatalf("minimal projection still hydrates raw column %q", col)
+		}
+	}
+	// id/status/updated_at/content_hash must remain — the cheap complete scan's
+	// diff needs them.
+	for _, keep := range []string{"id", "content_hash", "status", "updated_at"} {
+		if !strings.Contains(IssueSelectColumnsMinimal, keep) {
+			t.Fatalf("minimal projection dropped required column %q", keep)
+		}
 	}
 }
 
@@ -97,12 +138,14 @@ func TestSearchTablePatternAUsesLiteProjectionWhenSkipBody(t *testing.T) {
 	cols := liteScanColumns()
 
 	cases := []struct {
-		name     string
-		skipBody bool
-		wantCols string
+		name            string
+		skipBody        bool
+		skipDescription bool
+		wantCols        string
 	}{
-		{"full projection when SkipBody off", false, IssueSelectColumns},
-		{"lite projection when SkipBody on", true, IssueSelectColumnsLite},
+		{"full projection when SkipBody off", false, false, IssueSelectColumns},
+		{"lite projection when SkipBody on", true, false, IssueSelectColumnsLite},
+		{"minimal projection when SkipDescription on", true, true, IssueSelectColumnsMinimal},
 	}
 
 	for _, tc := range cases {
@@ -138,7 +181,7 @@ func TestSearchTablePatternAUsesLiteProjectionWhenSkipBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("begin: %v", err)
 			}
-			filter := types.IssueFilter{SkipBody: tc.skipBody}
+			filter := types.IssueFilter{SkipBody: tc.skipBody, SkipDescription: tc.skipDescription}
 			issues, err := searchTableInTx(context.Background(), tx, "", filter, IssuesFilterTables)
 			if err != nil {
 				t.Fatalf("searchTableInTx: %v", err)
@@ -152,6 +195,10 @@ func TestSearchTablePatternAUsesLiteProjectionWhenSkipBody(t *testing.T) {
 						issues[0].Design, issues[0].AcceptanceCriteria, issues[0].Notes)
 				}
 			}
+			// The projection choice itself (minimal drops `description`) is proved
+			// by the scanPat query-pattern match above; sqlmock returns the row we
+			// specify regardless of the SQL projection, so a runtime empty-string
+			// assertion here would be vacuous.
 			if err := mock.ExpectationsWereMet(); err != nil {
 				t.Fatalf("sql expectations: %v", err)
 			}

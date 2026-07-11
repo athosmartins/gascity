@@ -40,10 +40,33 @@ const IssueSelectColumnsLite = `id, content_hash, title, description, '' AS desi
 	       due_at, defer_until,
 	       work_type, source_system, metadata`
 
-// issueSelectColumns returns the lite projection when skipBody is set, else the
-// full canonical projection. Centralizes the choice so every scan site stays
-// consistent.
-func issueSelectColumns(skipBody bool) string {
+// IssueSelectColumnsMinimal is IssueSelectColumnsLite with the `description`
+// column ALSO replaced by an empty-string literal. The column count, order, and
+// types remain identical to IssueSelectColumns, so ScanIssueFrom scans it
+// unchanged; design, acceptance_criteria, notes AND description all come back
+// empty. Used by the SkipDescription escape hatch (ga-ftmci): the gc supervisor
+// reconcile's CHEAP COMPLETE scan only reads id/status/updated_at, so streaming
+// description for every open row every cycle — the last large streamed column
+// after SkipBody — is pure waste.
+const IssueSelectColumnsMinimal = `id, content_hash, title, '' AS description, '' AS design, '' AS acceptance_criteria, '' AS notes,
+	       status, priority, issue_type, assignee, estimated_minutes,
+	       created_at, created_by, owner, updated_at, started_at, closed_at, external_ref, spec_id,
+	       compaction_level, compacted_at, compacted_at_commit, original_size, source_repo, close_reason,
+	       sender, ephemeral, no_history, wisp_type, pinned, is_template,
+	       await_type, await_id, timeout_ns, waiters,
+	       mol_type,
+	       event_kind, actor, target, payload,
+	       due_at, defer_until,
+	       work_type, source_system, metadata`
+
+// issueSelectColumns returns the narrowest projection the flags permit:
+// minimal (also drops description) when skipDescription is set, lite (drops the
+// LONGTEXT body columns) when only skipBody is set, else the full canonical
+// projection. Centralizes the choice so every scan site stays consistent.
+func issueSelectColumns(skipBody, skipDescription bool) string {
+	if skipDescription {
+		return IssueSelectColumnsMinimal
+	}
 	if skipBody {
 		return IssueSelectColumnsLite
 	}

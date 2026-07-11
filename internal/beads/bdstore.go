@@ -1639,6 +1639,10 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if !serverQuery.CreatedBefore.IsZero() {
 		args = append(args, "--created-before", serverQuery.CreatedBefore.Format(time.RFC3339Nano))
 	}
+	// ga-ftmci: the reconcile hydration scan bounds by `updated_at > watermark`.
+	if !serverQuery.UpdatedAfter.IsZero() {
+		args = append(args, "--updated-after", serverQuery.UpdatedAfter.Format(time.RFC3339Nano))
+	}
 	args = append(args, "--include-infra", "--include-gates")
 	if bdListShouldIncludeTemplates(query) {
 		args = append(args, "--include-templates")
@@ -1664,6 +1668,11 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	// fallback to the bd CLI also skips the large body columns during reconcile.
 	if query.SkipBody {
 		args = append(args, "--skip-body")
+	}
+	// ga-ftmci: the cheap complete scan drops `description` too (id/status/
+	// updated_at only) so the per-cycle full-corpus scan stops streaming it.
+	if query.SkipDescription {
+		args = append(args, "--skip-description")
 	}
 
 	out, err := s.runner(s.dir, "bd", args...)
@@ -1697,7 +1706,7 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if serverQuery.Sort == SortCreatedAsc || clientFilteredAssignees {
 		return true
 	}
-	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
+	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() || !serverQuery.UpdatedAfter.IsZero() {
 		return true
 	}
 	return false
