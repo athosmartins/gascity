@@ -94,18 +94,26 @@ func (o *providerDrainOps) drainStartTime(sessionName string) (time.Time, error)
 }
 
 func (o *providerDrainOps) setDrainAck(sessionName string) error {
-	return errors.Join(
-		o.sp.RemoveMeta(sessionName, reconcilerDrainAckReasonKey),
-		o.sp.RemoveMeta(sessionName, reconcilerDrainAckGenerationKey),
-		o.sp.SetMeta(sessionName, reconcilerDrainAckSourceKey, drainAckSourceAgentValue),
-		// Persist the drain intent atomically with the ack: agents commonly
-		// call drain-ack directly (self-initiated "I'm done" signal) without
-		// a preceding "gc runtime drain", so GC_DRAIN may never otherwise get
-		// set. isDraining (and thus drain-check) reads only GC_DRAIN — without
-		// this, ack succeeds but a subsequent drain-check reports not-draining.
-		o.sp.SetMeta(sessionName, "GC_DRAIN", strconv.FormatInt(time.Now().Unix(), 10)),
-		o.sp.SetMeta(sessionName, "GC_DRAIN_ACK", "1"),
-	)
+	errReason := o.sp.RemoveMeta(sessionName, reconcilerDrainAckReasonKey)
+	errGeneration := o.sp.RemoveMeta(sessionName, reconcilerDrainAckGenerationKey)
+	errSource := o.sp.SetMeta(sessionName, reconcilerDrainAckSourceKey, drainAckSourceAgentValue)
+	// Persist the drain intent atomically with the ack: agents commonly call
+	// drain-ack directly (self-initiated "I'm done" signal) without a preceding
+	// "gc runtime drain", so GC_DRAIN may never otherwise get set. isDraining
+	// (and thus drain-check) reads only GC_DRAIN — without this, ack succeeds
+	// but a subsequent drain-check reports not-draining.
+	//
+	// Set-if-absent: when the controller has ALREADY begun draining, GC_DRAIN
+	// already holds its original T0. Preserve that timestamp — overwriting it
+	// with time.Now() would reset drainStartTime and let a slow drain restart
+	// its deadline on every ack (ga-sm5p). Only seed GC_DRAIN when it is unset
+	// (or unreadable, failing safe toward "draining").
+	var errDrain error
+	if cur, err := o.sp.GetMeta(sessionName, "GC_DRAIN"); err != nil || cur == "" {
+		errDrain = o.sp.SetMeta(sessionName, "GC_DRAIN", strconv.FormatInt(time.Now().Unix(), 10))
+	}
+	errAck := o.sp.SetMeta(sessionName, "GC_DRAIN_ACK", "1")
+	return errors.Join(errReason, errGeneration, errSource, errDrain, errAck)
 }
 
 func (o *providerDrainOps) isDrainAcked(sessionName string) (bool, error) {
