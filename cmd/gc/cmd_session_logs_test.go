@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -19,9 +20,7 @@ import (
 
 func writeTestSession(t *testing.T, searchBase, workDir string, lines ...string) {
 	t.Helper()
-	slug := strings.ReplaceAll(workDir, "/", "-")
-	slug = strings.ReplaceAll(slug, ".", "-")
-	dir := filepath.Join(searchBase, slug)
+	dir := filepath.Join(searchBase, sessionlog.ProjectSlug(workDir))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -34,9 +33,7 @@ func writeTestSession(t *testing.T, searchBase, workDir string, lines ...string)
 
 func writeNamedTestSession(t *testing.T, searchBase, workDir, fileName string, lines ...string) string {
 	t.Helper()
-	slug := strings.ReplaceAll(workDir, "/", "-")
-	slug = strings.ReplaceAll(slug, ".", "-")
-	dir := filepath.Join(searchBase, slug)
+	dir := filepath.Join(searchBase, sessionlog.ProjectSlug(workDir))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -327,6 +324,102 @@ func TestResolveSessionLogPathFallsBackWhenSessionKeyFileMissing(t *testing.T) {
 	})
 	if got != want {
 		t.Fatalf("resolveSessionLogPath() = %q, want %q", got, want)
+	}
+}
+
+// claudeSlugForTest independently re-implements Claude Code's project-slug
+// convention (every non-alphanumeric character -> "-") via regexp rather
+// than calling sessionlog.ProjectSlug. Deliberately a second, differently
+// -written implementation so the tests below catch a regression in the
+// algorithm itself, not merely confirm resolution is wired to whatever
+// ProjectSlug currently happens to compute.
+func claudeSlugForTest(t *testing.T, path string) string {
+	t.Helper()
+	return regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(path, "-")
+}
+
+// writeSessionAtIndependentSlug places a transcript fixture using
+// claudeSlugForTest (not the shared writeNamedTestSession helper, which
+// delegates to sessionlog.ProjectSlug) so the fixture location is computed
+// independently of the code under test.
+func writeSessionAtIndependentSlug(t *testing.T, searchBase, workDir, fileName string, lines ...string) string {
+	t.Helper()
+	dir := filepath.Join(searchBase, claudeSlugForTest(t, workDir))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, fileName)
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// ga-l2d2: crew sessions root under rig paths containing "_"
+// (whatsapp_automation, property_scrapers) rather than under the HQ path
+// (which contains only "/" and "."). Pre-fix, ProjectSlug preserved "_",
+// so every crew transcript was permanently unresolvable while Mayor/dog
+// sessions (no "_" in their path) resolved fine — this proves parity
+// through the real resolveSessionLogPath -> worker.Factory ->
+// sessionlog.ProjectSlug chain, not a stubbed shortcut.
+func TestResolveSessionLogPathResolvesCrewShapedWorkDirWithUnderscore(t *testing.T) {
+	searchBase := t.TempDir()
+	workDir := filepath.Join(t.TempDir(), "whatsapp_automation", "crew", "digo")
+	want := writeSessionAtIndependentSlug(t, searchBase, workDir, "known-session.jsonl",
+		`{"uuid":"1","parentUuid":"","type":"user","message":{"role":"user","content":"hello"},"timestamp":"2025-01-01T00:00:00Z"}`,
+	)
+
+	got := resolveSessionLogPath([]string{searchBase}, sessionLogContext{
+		workDir:    workDir,
+		sessionKey: "known-session",
+		provider:   "claude",
+	})
+	if got != want {
+		t.Fatalf("resolveSessionLogPath() = %q, want %q (underscore in work_dir must mangle to \"-\", matching Claude Code's own project-slug convention)", got, want)
+	}
+}
+
+// ga-l2d2: same parity proof as above, but through the full store-backed
+// path resolveStoredSessionLogSource() uses in production (the function
+// cmdSessionLogs actually calls first) — a bead with underscore-bearing
+// work_dir metadata, a real transcript file named by its exact
+// session_key, resolved by alias identifier "digo-wa" the way a live
+// crew session really looks (confirmed live against digo-wa/batista-ps
+// while diagnosing this bug).
+func TestResolveStoredSessionLogSource_ResolvesCrewShapedWorkDirWithUnderscore(t *testing.T) {
+	store := beads.NewMemStore()
+	searchBase := t.TempDir()
+	workDir := filepath.Join(t.TempDir(), "whatsapp_automation", "crew", "digo")
+	want := writeSessionAtIndependentSlug(t, searchBase, workDir, "7be7a93e-5b8b-4ddb-ac14-530e9047089b.jsonl",
+		`{"uuid":"1","parentUuid":"","type":"user","message":{"role":"user","content":"hello"},"timestamp":"2025-01-01T00:00:00Z"}`,
+	)
+
+	_, _ = store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "digo-wa",
+			"provider":     "claude",
+			"session_key":  "7be7a93e-5b8b-4ddb-ac14-530e9047089b",
+			"session_name": "digo-wa-ga6vtf",
+			"state":        "active",
+			"work_dir":     workDir,
+		},
+	})
+
+	got, provider, ok, diagnostic := resolveStoredSessionLogSource("", nil, store, "digo-wa", []string{searchBase})
+	if !ok {
+		t.Fatal("resolveStoredSessionLogSource() = not found, want found")
+	}
+	if diagnostic != "" {
+		t.Fatalf("resolveStoredSessionLogSource() diagnostic = %q, want empty", diagnostic)
+	}
+	if provider != "claude" {
+		t.Fatalf("resolveStoredSessionLogSource() provider = %q, want %q", provider, "claude")
+	}
+	if got != want {
+		t.Fatalf("resolveStoredSessionLogSource() path = %q, want %q", got, want)
 	}
 }
 
