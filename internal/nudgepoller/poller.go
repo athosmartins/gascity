@@ -4,20 +4,69 @@ package nudgepoller
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/pidutil"
 )
 
 const (
-	cityFlag    = "--city"
-	sessionFlag = "--session"
+	cityFlag     = "--city"
+	sessionFlag  = "--session"
+	intervalFlag = "--interval"
+
+	// PollIntervalEnv overrides the poller's 2s default poll interval.
+	//
+	// ga-yxuab: one `gc nudge poll` process per LIVE SESSION queries the data
+	// plane every 2s, which measures as the single largest consumer of Dolt —
+	// 48.1% of connection-samples in a 20-cycle attribution run on 2026-08-05
+	// (independently reproducing the 44/47/52% of the original report). That
+	// keeps ambient Dolt CPU above the quality gate's GATE_DOLT_CPU_WARM=100
+	// threshold essentially always, which pins the gate's dynamic ceiling to a
+	// single run and stalls the review queue (38 markers queued at the time of
+	// measurement).
+	//
+	// Deliberately an ENV KNOB and not a changed constant: with the variable
+	// unset, CommandArgs emits byte-identical argv to the pre-change build, so
+	// deploying this binary is a no-op and the behavior change is a config
+	// value that can be set or reverted without another rebuild. Nudge latency
+	// degrades to at most the chosen interval, which is bounded and far below
+	// the 120s patrol-tick fallback that supervisor mode was willing to accept.
+	PollIntervalEnv = "GC_NUDGE_POLL_INTERVAL"
 )
 
+// pollIntervalOverride returns a validated duration string for PollIntervalEnv,
+// or "" when unset/invalid. Fail-soft by design: a malformed value must fall
+// back to the compiled default rather than propagate a bad flag into every
+// poller argv in the city (and, via CmdlineMatcher, risk poller identification).
+func pollIntervalOverride() string {
+	raw := strings.TrimSpace(os.Getenv(PollIntervalEnv))
+	if raw == "" {
+		return ""
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return ""
+	}
+	return d.String()
+}
+
 // CommandArgs returns the argv tail for a nudge poller.
+//
+// When PollIntervalEnv is set to a valid positive duration, an explicit
+// --interval flag is inserted. CmdlineMatcher/argvHasPollTarget already skip
+// --interval and its value when locating the trailing agent positional, so the
+// added flag does not disturb poller identification.
 func CommandArgs(cityPath, sessionName, agentName string) []string {
-	return []string{"nudge", "poll", cityFlag, cityPath, sessionFlag, sessionName, agentName}
+	args := make([]string, 0, 9)
+	args = append(args, "nudge", "poll")
+	if iv := pollIntervalOverride(); iv != "" {
+		args = append(args, intervalFlag, iv)
+	}
+	args = append(args, cityFlag, cityPath, sessionFlag, sessionName, agentName)
+	return args
 }
 
 // CmdlineMatcher returns a predicate that recognizes the nudge poller command
