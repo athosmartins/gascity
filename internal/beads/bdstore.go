@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -221,6 +222,52 @@ type BdStore struct {
 }
 
 const bdTransientWriteAttempts = 3
+
+// bdFlagSupport caches, per (subcommand, flag), whether the INSTALLED bd
+// advertises that flag. Populated lazily from `bd <sub> --help`.
+//
+// ga-9ae7o: exists because bd's CLI surface drifts between releases and gc
+// shells out to whatever bd is on PATH — a pairing that has now broken three
+// times (--skip-description renamed to --skip-body, then --skip-body removed in
+// bd 1.1.0). Probing converts "hard failure of the entire call" into "we skip an
+// optimization", which is the difference between the supervisor getting NOTHING
+// and getting slower-but-correct results.
+var (
+	bdFlagSupport   = map[string]bool{}
+	bdFlagSupportMu sync.Mutex
+)
+
+// bdSupportsFlag reports whether the installed bd advertises flag for sub.
+//
+// FAIL-CLOSED ON PURPOSE: if the probe itself fails (bd missing, help output
+// unreadable, timeout), we answer FALSE — omit the flag. Omitting a projection
+// flag makes the query slower; passing one bd does not know makes the query FAIL
+// ENTIRELY. Given an unknown, choose the outcome that still returns data.
+func (s *BdStore) bdSupportsFlag(sub, flag string) bool {
+	key := sub + " " + flag
+	bdFlagSupportMu.Lock()
+	defer bdFlagSupportMu.Unlock()
+	if v, ok := bdFlagSupport[key]; ok {
+		return v
+	}
+	supported := false
+	if out, err := s.runner(s.dir, "bd", sub, "--help"); err == nil {
+		// Match the flag as a whole token: a bare Contains would let "--skip"
+		// match "--skip-labels" and re-introduce the exact class this prevents.
+		for _, line := range strings.Split(string(out), "\n") {
+			f := strings.TrimSpace(line)
+			if strings.HasPrefix(f, flag) {
+				rest := f[len(flag):]
+				if rest == "" || strings.HasPrefix(rest, " ") || strings.HasPrefix(rest, "\t") || strings.HasPrefix(rest, "=") {
+					supported = true
+					break
+				}
+			}
+		}
+	}
+	bdFlagSupport[key] = supported
+	return supported
+}
 
 // NewBdStore creates a BdStore rooted at dir using the given runner.
 func NewBdStore(dir string, runner CommandRunner) *BdStore {
@@ -1666,13 +1713,30 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	}
 	// ga-ftmci: subprocess path mirrors the native projection narrowing so a
 	// fallback to the bd CLI also skips the large body columns during reconcile.
-	if query.SkipBody {
-		args = append(args, "--skip-body")
-	}
-	// ga-ftmci: the cheap complete scan drops `description` too (id/status/
-	// updated_at only) so the per-cycle full-corpus scan stops streaming it.
-	if query.SkipDescription {
-		args = append(args, "--skip-description")
+	//
+	// ga-9ae7o (Mayor 2026-08-07): this is now CAPABILITY-PROBED instead of
+	// hardcoded, and that change is the point — not the flag name.
+	//
+	// THIS IS THE THIRD TIME a hardcoded projection flag broke here. The comment
+	// below records the second (ga-c30ak: bd renamed --skip-description →
+	// --skip-body). The third was bd 1.1.0 REMOVING --skip-body outright, measured
+	// in ~/.gc/supervisor.log the day it landed:
+	//     2066x  Error: unknown flag: --skip-description
+	//      878x  Error: unknown flag: --skip-body
+	//     1470x  collectAllOpenSessionBeads: PARTIAL
+	// The failure mode is what makes it expensive: an unknown flag makes the WHOLE
+	// `bd list` exit non-zero, so the caller gets NOTHING — not "slower results".
+	// Session enumeration went PARTIAL, the dog pool never spawned, and dispatches
+	// were counted as delivered while producing no builder at all.
+	//
+	// Renaming the constant again would only buy time until bd's next release. So:
+	// ask the installed bd what it supports, and pass the flag only if it does. An
+	// unsupported projection costs a slower query; an unsupported FLAG costs the
+	// entire call. Those must never again be the same failure.
+	if query.SkipBody || query.SkipDescription {
+		if s.bdSupportsFlag("list", "--skip-body") {
+			args = append(args, "--skip-body")
+		}
 	}
 
 	out, err := s.runner(s.dir, "bd", args...)
