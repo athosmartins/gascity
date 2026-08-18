@@ -4,6 +4,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -2134,6 +2135,21 @@ type DaemonConfig struct {
 	// Nil (unset) defaults to 5. Values <= 0 are treated as the default — set a
 	// positive integer to override.
 	MaxWakesPerTick *int `toml:"max_wakes_per_tick,omitempty" jsonschema:"default=5"`
+	// SessionSpawnStagger is the minimum delay the async session-start
+	// reconciler waits between launching consecutive spawn goroutines
+	// within a single wake wave (see enqueuePreparedStartWaveForCity in
+	// cmd/gc/session_lifecycle_parallel.go, ga-ih4ma). Duration string
+	// (e.g., "4s", "500ms"). Empty/unset defaults to
+	// DefaultSessionSpawnStagger; an explicit "0" or "0s" disables
+	// staggering entirely (spawns launch back-to-back, the pre-ga-ih4ma
+	// behavior). Overridable per-invocation via the GC_SESSION_SPAWN_STAGGER
+	// env var (same duration-string format), which takes precedence over
+	// this field when set to a valid, non-negative duration — an
+	// operational escape hatch mirroring GATE_SPAWN_STAGGER_SECS in
+	// packs/town-deltas/assets/quality-gate-dispatcher.sh. This knob is
+	// orthogonal to max_wakes_per_tick: that caps how many sessions start
+	// per tick, this controls how spread out their launches are.
+	SessionSpawnStagger string `toml:"session_spawn_stagger,omitempty" jsonschema:"default=4s"`
 	// NudgeDispatcher selects how queued nudges get delivered to running
 	// sessions. "legacy" (default) auto-spawns a per-session `gc nudge poll`
 	// process that polls the file-backed queue every 2s. "supervisor" runs
@@ -2413,6 +2429,55 @@ func (d *DaemonConfig) MaxWakesPerTickOrDefault() int {
 		return DefaultMaxWakesPerTick
 	}
 	return *d.MaxWakesPerTick
+}
+
+// DefaultSessionSpawnStagger is the built-in delay between consecutive
+// session-start goroutine launches within a reconciler wake wave, used
+// when neither the GC_SESSION_SPAWN_STAGGER env var nor
+// [daemon].session_spawn_stagger override it (ga-ih4ma).
+//
+// Sizing rationale: this is deliberately larger than
+// quality-gate-dispatcher.sh's GATE_SPAWN_STAGGER_SECS default of 3s.
+// That default is tuned for gate-reviewer boot, a lighter, shorter-lived
+// process. Measured crew session boot cost (ga-nawd3 incident) is
+// materially heavier: ~13s for the provider Start call plus ~8-12s for
+// the Dolt-heavy PostStartObserve phase (worker liveness/bead lookups),
+// ~22-25s wall time end to end. The goal of the stagger is only to keep
+// concurrently-spawned sessions' Dolt-heavy phases from landing in the
+// same instant — not to fully serialize the wave. 4s is enough offset
+// that 5 sessions spaced 4s apart finish enqueuing within 16s, comfortably
+// inside a single session's own ~22-25s lifecycle, so a wave of 5 still
+// completes in roughly one session's wall time instead of stacking to
+// 5x — while no longer presenting Dolt with 5 simultaneous heavy queries.
+const DefaultSessionSpawnStagger = 4 * time.Second
+
+// sessionSpawnStaggerEnvVar is the operational override for
+// SessionSpawnStaggerDuration, checked before the city.toml field. A
+// duration string (e.g., "4s", "0s"); invalid or negative values are
+// ignored and resolution falls through to the config field / default.
+const sessionSpawnStaggerEnvVar = "GC_SESSION_SPAWN_STAGGER"
+
+// SessionSpawnStaggerDuration returns the minimum delay between
+// consecutive session-start goroutine launches within a reconciler wake
+// wave (ga-ih4ma). Resolution order: GC_SESSION_SPAWN_STAGGER env var
+// (when set to a valid, non-negative duration) takes precedence over
+// [daemon].session_spawn_stagger, which takes precedence over
+// DefaultSessionSpawnStagger. An explicit zero duration ("0" / "0s") from
+// either the env var or the config field disables staggering (spawns
+// launch back-to-back). Unparseable or negative values are treated as
+// absent and resolution continues to the next source.
+func (d *DaemonConfig) SessionSpawnStaggerDuration() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(sessionSpawnStaggerEnvVar)); raw != "" {
+		if dur, err := time.ParseDuration(raw); err == nil && dur >= 0 {
+			return dur
+		}
+	}
+	if d != nil && strings.TrimSpace(d.SessionSpawnStagger) != "" {
+		if dur, err := time.ParseDuration(strings.TrimSpace(d.SessionSpawnStagger)); err == nil && dur >= 0 {
+			return dur
+		}
+	}
+	return DefaultSessionSpawnStagger
 }
 
 // DriftDrainTimeoutDuration returns the drift drain timeout as a time.Duration.
@@ -3142,8 +3207,110 @@ func bdReadyIncludeEphemeralArg(includeEphemeralReady bool) string {
 	return ""
 }
 
+// bdReadyPoolDemandShell emits the canonical routed-pool predicate.
+//
+// ga-g7yt: the exact-match exclusions live here; the PREFIX ones cannot (bd's
+// --exclude-label is exact — "Exclude issues that have ANY of these labels"), so
+// pool:refused:* and pilot:held* are handled by poolDemandLabelFilterJQ, which
+// EVERY caller must apply. Without them a parked bead stays in the pool's
+// candidate set forever: the worker claims it, refuses it, releases it, and the
+// next incarnation repeats — measured at ~17 dog sessions in 11h on ga-66wc, with
+// a second independent case (ga-vne2) re-claimed by the SAME session 7min after
+// refusing it. wa-worker/ps-worker already carry this filter hardcoded in their
+// prompt templates (ga-y8qh, ga-en2s); the dog's probe is generated HERE, which is
+// the only reason it was left out.
 func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string {
-	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json ` + limitFlag
+	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic` + bdReadyPoolDemandExcludeLabelArgs() + ` --json ` + limitFlag
+}
+
+// bdReadyPoolDemandExcludeLabelArgs returns the EXACT-match label exclusions.
+// Keep in sync with poolDemandLabelFilterJQ (the prefix half) — together they are
+// the whole predicate. Mirrors agents/wa-worker/prompt.template.md Step 1b3.
+//
+// ga-nf4x5: story:needs-approval is the Athos MERIT/legal sign-off gate
+// (refino-gate-dispatcher.sh applies it once code-gate passed but a human
+// decision on merit/risk is still pending — e.g. wa-6xn82, a real LAI legal
+// filing dispatched to the wa-worker pool with "No human review required"
+// before a worker happened to read the comment and refuse by hand). Distinct
+// from story:needs-human (an INFO-GAP) but excluded the same way: a human
+// decision gate, not a code-quality gate that gate-done can ever clear.
+// Appended AFTER ctx:thin (not inserted between the pre-existing flags) so the
+// original "story:needs-human" ... "ctx:thin" contiguous substring several
+// tests hardcode stays intact.
+//
+// ga-7ha7g: story:epic is appended last for the same reason. --exclude-type=epic
+// only checks issue_type, but bead authors routinely label a bead story:epic
+// (or title it "EPIC:"/"ÉPICO:", the text-only half of this same gap — see
+// poolDemandLabelFilterJQ) without ever setting issue_type=epic. Confirmed
+// live: ga-9pyg2 (issue_type=task, label story:epic, title "ÉPICO: migração
+// v55 do engine..." — required a Mayor-coordinated engine rebuild, exactly
+// the class of work a pool worker must never execute off its own hook per
+// ga-vhyd).
+//
+// ga-5huvs: needs:engine-window, pilot:no-auto-dispatch, and story:blocked
+// are appended last of all — the remaining exact-match park labels
+// context_check_is_parked() already recognizes (ga-7mbry) but this function
+// did not. Live-reproduced on ga-9kjzz: a bead whose fix was fully written,
+// tested, committed, pushed, and labeled needs:engine-window still
+// re-surfaced as unassigned/ready dog-pool work four separate times over the
+// next 5h20m, each occurrence costing a full dog session's re-investigation.
+// The PREFIX half of this same park-label set (blocked:<reason>,
+// pilot:refused-reason:<slug>, gate:needs-human(:<reason>)) is handled in
+// poolDemandLabelFilterJQ below, for the same reason pool:refused:*/
+// pilot:held* are: --exclude-label cannot express a prefix match.
+func bdReadyPoolDemandExcludeLabelArgs() string {
+	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"`
+}
+
+// poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
+// part bd's exact-match --exclude-label cannot express. It takes a bd-ready JSON
+// array on stdin and returns the survivors (unlimited; callers slice).
+//
+// Ported verbatim in behaviour from wa-worker/ps-worker Step 1b3 so all three
+// pools read the same demand shape. Two subtleties that are easy to get wrong and
+// are load-bearing:
+//
+//   - pool:refused:* is a PREFIX (pool:refused:engine-rebuild-required, etc.), so
+//     it needs startswith, not equality.
+//   - "held" must be decided by the ABSENCE OF ALL pilot:held* labels first; only
+//     then is the expiry branch reachable. And pilot:held-until:<epoch> labels
+//     ACCUMULATE (nothing prunes them), so the bead is still held iff its LATEST
+//     stamp is in the future — use max, never .[0] (ga-4aree).
+//
+// ga-7ha7g: also excludes titles starting with "EPIC:"/"EPIC "/"ÉPICO:"/"ÉPICO "
+// (case-insensitive) — the title-text half of the epic-authoring-mismatch gap
+// that story:epic (an exact label, handled in bdReadyPoolDemandExcludeLabelArgs)
+// cannot catch alone. Two confirmed live instances carried the mismatch in only
+// one of the two signals — ga-9pyg2 had both label and title; gh-ai2 had the
+// title only ("EPIC: migrar crew GT...", no story:epic label) — so both checks
+// are required, neither is redundant. Anchored at the start with a colon/
+// whitespace delimiter so a title that merely mentions "epic" mid-sentence
+// (e.g. a bug report about this exact gap) is never over-matched.
+//
+// ga-5huvs: also excludes blocked:<reason>, pilot:refused-reason:<slug>, and
+// gate:needs-human(:<reason>) — the PREFIX half of the same park-label parity
+// gap bdReadyPoolDemandExcludeLabelArgs closes above for the exact-match half
+// (needs:engine-window/pilot:no-auto-dispatch/story:blocked). All three are
+// already-established park signals context_check_is_parked() recognizes
+// (ga-7mbry). blocked:<reason> is deliberately colon-only — NOT a "blocked-*"
+// glob — so an unrelated dependency-pointer label like blocked-by:<id> (a
+// different label family: what blocks a bead, not "this bead IS blocked")
+// cannot false-positive through here, mirroring context-check-dispatcher.sh's
+// own guard. gate:needs-human matches both the bare label and every
+// colon-suffixed sub-reason (:technical, :partial-delivery, :refused, etc.)
+// via a single startswith, since the bare string is itself a prefix of every
+// suffixed variant.
+func poolDemandLabelFilterJQ() string {
+	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
+		`[ .[] `+
+			`| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) `+
+			`| select((((.labels // []) | map(select(startswith("pilot:held"))) | length) == 0) `+
+			`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) `+
+			`| if length > 0 then (max < $now_ts) else false end)) `+
+			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) `+
+			`| select(((.labels // []) | map(select(startswith("blocked:"))) | length) == 0) `+
+			`| select(((.labels // []) | map(select(startswith("pilot:refused-reason:"))) | length) == 0) `+
+			`| select(((.labels // []) | map(select(startswith("gate:needs-human"))) | length) == 0) ]`)
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
@@ -3211,6 +3378,18 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 // reads the first ready, unassigned, routed bead for the supplied target,
 // prints it, and exits 0. The caller appends a terminal fallthrough
 // (printf "[]") for the empty case.
+//
+// ga-zgfxx / ga-avvu2 AC1: the PRIMARY tier (routedReadyTierCommand) applies
+// poolDemandLabelFilterJQ, but until this fix the two LEGACY fallback tiers
+// below it did not — a bead already refused via pool:refused:<reason> (or
+// held via pilot:held*, or EPIC-titled) that only surfaces through
+// gc.run_target migration or the ephemeral-wisp query kept coming back to
+// the same worker that had just refused it. Both legacy tiers now request an
+// UNSLICED survivor set, run it through poolDemandLabelFilterJQ, and only
+// THEN take the first row — same "filter-then-slice, not slice-then-filter"
+// shape already used for the primary tier (ga-g7yt) and the assigned
+// in-progress tiers (ga-ael6v), for the same reason: slicing before the
+// prefix filter can hide a real candidate behind a filtered-out head.
 func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
@@ -3218,10 +3397,10 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
-		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(1) + ` 2>/dev/null); ` +
+		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
-		`r=$(printf "%s" "$legacy_ephemeral_candidates" | jq '.[0:1]' 2>/dev/null); ` +
+		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`return 1; ` +
 		`}; `
@@ -3230,7 +3409,31 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// The shared predicate stays order-free so the count-form does no wasted
 	// sorting; the worker first-row path asks bd for the oldest candidate.
-	return bdReadyPoolDemandShell("--sort oldest --limit=1", includeEphemeralReady) + ` 2>/dev/null`
+	//
+	// ga-g7yt: --limit=1 followed by a post-filter is a TRAP — if the oldest
+	// candidate is the one being filtered out (parked or still held), real work
+	// sitting right behind it becomes invisible and the session drains empty
+	// believing the pool had nothing. A dog hit exactly this and only found the
+	// real bead by re-running the query by hand with a wider limit. So: ask for a
+	// WINDOW and take the first SURVIVOR, never the first row.
+	//
+	// ga-w4k2z: taking .[0:1] straight off the created_at-sorted survivor list
+	// made a bead that keeps getting reclaimed re-occupy position 0 forever —
+	// reclaim doesn't change created_at, so the SAME poisoned head is offered to
+	// every dog that polls, while every newer bead behind it starves (measured
+	// live: 13 candidates spanning ~36h, only the head ever served). bd's --sort
+	// only knows priority/hybrid/oldest, no updated-at mode, so the re-rank
+	// happens here instead: survivors are re-sorted by updated_at (which every
+	// reclaim DOES bump — label/metadata/status writes all touch it) before
+	// taking the head. A bead nobody has touched since creation still sorts by
+	// its original created_at (unchanged behavior — updated_at == created_at for
+	// anything never reclaimed), but a bead that just cycled through a reclaim
+	// sorts to the BACK of the survivor list instead of re-claiming the front on
+	// the very next poll, so other ready work gets a turn. Deliberately not a
+	// switch to --sort newest (see bead body: that starves the old backlog
+	// instead) and not a new label/state — LRU-by-existing-timestamp is the
+	// minimal change that stops one bead from monopolizing the only slot served.
+	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3245,11 +3448,42 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 // The && chain ensures any non-zero bd exit short-circuits the whole expression
 // (TestEffectiveScaleCheckUsesReadyOnly).
 func poolDemandCountShell(target string, includeEphemeralReady bool) string {
+	// ga-g7yt: the label filter is applied on a SEPARATE line, never as a pipe on
+	// the bd call above. Piping would make $? the JQ exit code, so a failed
+	// `bd ready` would masquerade as "no demand" — exactly the failure this
+	// function's own doc-comment forbids. Capture first, check bd's status, THEN
+	// filter. (Both the reconciler count and the worker probe must apply the same
+	// filter or they disagree: the reconciler would count parked beads as demand
+	// and spawn a pool for work no worker is allowed to claim.)
+	//
+	// ga-zgfxx / ga-avvu2 AC1: the two LEGACY tiers (legacy_json, from the
+	// gc.run_target migration probe, and legacy_ephemeral_json, from the
+	// ephemeral-wisp query) get the same poolDemandLabelFilterJQ pass as
+	// ready_json above, each on its own line for the same $?-preservation
+	// reason. Without this the reconciler counted a pool:refused legacy/
+	// ephemeral bead as demand and kept the pool scaled up for work every
+	// worker had already refused — the count-side half of the same gap
+	// poolDemandFirstRowFunctionScript fixes on the worker-claim side.
+	// legacy_ephemeral_json's OWN capture line (below) skips `|| exit $?`
+	// because legacyEphemeralPoolDemandShell already resolves internally to
+	// `... || printf "[]"` and so always exits 0 — there is no failure left
+	// for `|| exit $?` to catch on that specific line. Its NEW filter stage
+	// is a different command (a plain jq pipe) that has no such built-in
+	// fallback, so per this function's own no-masking doc-comment above it
+	// gets `|| exit $?` like every other filter stage in this script — a
+	// bare `2>/dev/null` here would silently turn a genuine jq failure into
+	// an empty string, i.e. exactly the "masquerade as no demand" this
+	// function exists to prevent (caught live by
+	// TestEffectiveScaleCheckUsesReadyOnly, which asserts the generated
+	// script never contains "2>/dev/null").
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
+		`legacy_json=$(printf "%s" "$legacy_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
+		`legacy_ephemeral_json=$(printf "%s" "$legacy_ephemeral_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
@@ -3267,10 +3501,22 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
+// ga-ael6v: applies poolDemandLabelFilterJQ to the assigned-in-progress tier.
+// A refused bead (pool:refused:<reason>) deliberately keeps status=in_progress
+// and its assignee — refuse doesn't clear either, so inflight-reclaim-guard can
+// still find it as in-flight — but if that assignee later gets reassigned to a
+// FRESH session (the reclaim-guard's own job), the new session's Step 1a saw
+// "assigned in-progress work" and resumed it as if it were live crash-recovery,
+// re-doing (and re-refusing) work a prior incarnation already decided against.
+// Same root as ga-g7yt/ga-y8qh (routed-pool tier): the pool:refused:* prefix
+// can't be expressed by an exact bd flag, so every reader of a pool-owned bead
+// must apply poolDemandLabelFilterJQ, not just the tier that discovers NEW work.
+// --limit=1 widened to 20 for the same reason as routedReadyTierCommand: a
+// filtered-out top row must not hide a real in-progress bead behind it.
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -3290,13 +3536,17 @@ func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
+// ga-ael6v: same fix as standardAssignedInProgressWorkQueryScript, applied to
+// the control-dispatcher/workflow-control legacy identity fallback — same
+// class of bug, same shared bd-list-then-filter shape, so it gets the same
+// treatment rather than leaving a second, differently-named instance behind.
 func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3316,10 +3566,15 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`done; `
 }
 
+// ga-ael6v: filter-then-slice, not slice-then-filter (same reasoning as
+// routedReadyTierCommand) — matches on assignee first, then applies the
+// canonical pool:refused:*/pilot:held* predicate to the matched set before
+// taking the first row, so a refused ephemeral wisp can't shadow a real one.
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
+		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
+		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 

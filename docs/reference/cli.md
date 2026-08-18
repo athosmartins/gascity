@@ -253,9 +253,13 @@ the rig automatically from the --rig flag or by detecting the bead prefix
 in the arguments.
 
 All arguments after "gc bd" are forwarded to bd unchanged, except the
-gc-only "heartbeat &lt;issue-id&gt;" subcommand, which rewrites to
-"update &lt;issue-id&gt; --set-metadata gc.last_heartbeat_at=&lt;RFC3339 UTC now&gt;"
-so long-running workers can signal liveness to the dashboard.
+gc-only "heartbeat &lt;issue-id&gt;" subcommand, which dispatches TWO bd calls:
+bd's own "heartbeat &lt;issue-id&gt;" (refreshes lease_expires_at/heartbeat_at —
+what keeps a long-running worker's claim from being reclaimed as
+abandoned) and, best-effort, "update &lt;issue-id&gt; --set-metadata
+gc.last_heartbeat_at=&lt;RFC3339 UTC now&gt;" (the dashboard liveness signal).
+The command's exit code reflects the lease refresh; a dashboard-stamp
+failure is reported as a warning on stderr but does not change it.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -272,7 +276,7 @@ gc bd --rig my-project list
   gc bd --rig my-project create "New task"
   gc bd show my-project-abc          # auto-detects rig from bead prefix
   gc bd list --rig my-project -s open
-  gc bd heartbeat my-project-abc     # stamp gc.last_heartbeat_at=now
+  gc bd heartbeat my-project-abc     # refresh lease + stamp gc.last_heartbeat_at=now
 ```
 
 ## gc beads

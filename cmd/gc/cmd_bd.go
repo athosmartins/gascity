@@ -77,9 +77,13 @@ the rig automatically from the --rig flag or by detecting the bead prefix
 in the arguments.
 
 All arguments after "gc bd" are forwarded to bd unchanged, except the
-gc-only "heartbeat <issue-id>" subcommand, which rewrites to
-"update <issue-id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC now>"
-so long-running workers can signal liveness to the dashboard.
+gc-only "heartbeat <issue-id>" subcommand, which dispatches TWO bd calls:
+bd's own "heartbeat <issue-id>" (refreshes lease_expires_at/heartbeat_at —
+what keeps a long-running worker's claim from being reclaimed as
+abandoned) and, best-effort, "update <issue-id> --set-metadata
+gc.last_heartbeat_at=<RFC3339 UTC now>" (the dashboard liveness signal).
+The command's exit code reflects the lease refresh; a dashboard-stamp
+failure is reported as a warning on stderr but does not change it.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -88,7 +92,7 @@ auto-export behavior, invoke bd directly.`,
   gc bd --rig my-project create "New task"
   gc bd show my-project-abc          # auto-detects rig from bead prefix
   gc bd list --rig my-project -s open
-  gc bd heartbeat my-project-abc     # stamp gc.last_heartbeat_at=now`,
+  gc bd heartbeat my-project-abc     # refresh lease + stamp gc.last_heartbeat_at=now`,
 		DisableFlagParsing: true,
 		RunE: func(_ *cobra.Command, args []string) error {
 			// Plumb doBd's numeric exit code through exitForCode so the
@@ -153,17 +157,23 @@ func warnExternalBdOverrideDrift(stderr io.Writer, cityPath string, target execS
 	_, _ = fmt.Fprintf(stderr, "gc bd: warning: ignoring ambient Dolt host/port override for external target: %s\n", strings.Join(drift, ", "))
 }
 
-// rewriteBdHeartbeatArgs expands the gc-only `heartbeat <issue-id>`
-// subcommand into the bd command that performs the write:
+// rewriteBdHeartbeatArgs builds the SECONDARY bd command doBd dispatches
+// for a gc-only `heartbeat <issue-id>` call — the dashboard liveness stamp:
 //
 //	update <issue-id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC>
 //
-// Long-running workers call `gc bd heartbeat {{issue}}` periodically so the
-// dashboard can distinguish a live worker from a dead one
-// (gastownhall/gascity#1855). It reuses bd's existing metadata-write path
-// rather than adding a new store method, and leaves the issue id in place so
-// the generic scope resolver still routes the write to the correct rig store.
-// Args that do not begin with "heartbeat" pass through unchanged.
+// It does not touch bead leases; doBd separately dispatches bd's own
+// `heartbeat <issue-id>` (unrewritten) as the PRIMARY command for that
+// (ga-9kjzz — this function alone used to be the entire heartbeat dispatch,
+// which meant `gc bd heartbeat` could never reach bd's identically-named
+// lease-refresh subcommand at all). Long-running workers call
+// `gc bd heartbeat {{issue}}` periodically so the dashboard can distinguish
+// a live worker from a dead one (gastownhall/gascity#1855). This function
+// reuses bd's existing metadata-write path rather than adding a new store
+// method, and leaves the issue id in place so the generic scope resolver
+// still routes the write to the correct rig store. Args that do not begin
+// with "heartbeat" pass through unchanged (also relied on as the ordinary
+// passthrough no-op for every non-heartbeat bd subcommand).
 func rewriteBdHeartbeatArgs(bdArgs []string) ([]string, error) {
 	if len(bdArgs) == 0 || bdArgs[0] != "heartbeat" {
 		return bdArgs, nil
@@ -183,7 +193,17 @@ func rewriteBdHeartbeatArgs(bdArgs []string) ([]string, error) {
 func doBd(args []string, stdout, stderr io.Writer) int {
 	cityName, rigName, bdArgs := extractBdScopeFlags(args)
 
-	bdArgs, err := rewriteBdHeartbeatArgs(bdArgs)
+	// ga-9kjzz: "heartbeat" is the one gc-only verb dispatched as bdArgs[0]
+	// here that is ALSO a real bd subcommand name (bd's own lease-refresh
+	// heartbeat). Detect it up front, before any rewrite, so bdArgs below
+	// keeps carrying the RAW "heartbeat <id>" shape through to bd — that is
+	// now the PRIMARY command this function runs. metadataArgs is the
+	// SECONDARY, best-effort dashboard-stamp command derived from it further
+	// down; for every non-heartbeat call metadataArgs == bdArgs (passthrough
+	// no-op) and isHeartbeat is false, so behavior there is unchanged.
+	isHeartbeat := len(bdArgs) > 0 && bdArgs[0] == "heartbeat"
+
+	metadataArgs, err := rewriteBdHeartbeatArgs(bdArgs)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -206,6 +226,11 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// bdArgs still carries the raw "heartbeat <id>" shape here for a
+	// heartbeat call (see above) — resolveBdScopeTarget's bead-id
+	// auto-detection scans every non-flag token for a known prefix
+	// regardless of the subcommand word, so either shape resolves the same
+	// rig/city target; it does not need to see metadataArgs.
 	target, err := resolveBdScopeTarget(cfg, cityPath, rigName, bdArgs)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -228,8 +253,44 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	env, err := bdCommandEnv(cityPath, cfg, target)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	env = workQueryEnvForDir(env, target.ScopeRoot)
+
+	exitCode := runBdOnce(bdPath, bdArgs, target.ScopeRoot, env, "go:gc-bd-passthrough", stdout, stderr)
+
+	// The lease refresh above is the property callers actually depend on
+	// (it is what keeps the pool reconciler from reclaiming a long-running
+	// worker's bead as abandoned mid-work); the dashboard stamp is a
+	// secondary signal layered on top of it. Only attempt the stamp once
+	// the real refresh has succeeded, and never let the stamp's own outcome
+	// override a successful refresh's exit code — but DO surface a stamp
+	// failure instead of swallowing it: a no-op that looks identical to
+	// success is the exact failure mode ga-9kjzz exists to close, so this
+	// fix cannot reintroduce a smaller copy of it for the secondary call.
+	if isHeartbeat && exitCode == 0 {
+		if metaExit := runBdOnce(bdPath, metadataArgs, target.ScopeRoot, env, "go:gc-bd-heartbeat-dashboard-stamp", stdout, stderr); metaExit != 0 {
+			fmt.Fprintf(stderr, "gc bd: warning: heartbeat lease refresh succeeded, but the dashboard liveness stamp (%s) failed (exit %d)\n", heartbeatMetadataKey, metaExit) //nolint:errcheck // best-effort stderr
+		}
+	}
+
+	return exitCode
+}
+
+// runBdOnce execs bdPath with bdArgs in dir/env and classifies the outcome:
+// bd's own exit code wins; a stderr marker showing bd silently fell back to
+// on-disk auto-import overrides a misleading exit 0 with
+// bdSilentFallbackExitCode; any other launch failure collapses to exit 1.
+// traceLabel is forwarded to beads.TraceBDCall so callers that dispatch more
+// than one bd command per gc-bd invocation (currently only doBd's heartbeat
+// lease-refresh + dashboard-stamp pair, ga-9kjzz) stay distinguishable in
+// the trace log.
+func runBdOnce(bdPath string, bdArgs []string, dir string, env []string, traceLabel string, stdout, stderr io.Writer) int {
 	cmd := exec.Command(bdPath, bdArgs...)
-	cmd.Dir = target.ScopeRoot
+	cmd.Dir = dir
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	// Tee stderr through a bounded head buffer alongside the operator's
@@ -239,12 +300,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// (close path) — both go through this handoff.
 	stderrScan := &headLimitedWriter{limit: bdStderrScanLimit}
 	cmd.Stderr = io.MultiWriter(stderr, stderrScan)
-	env, err := bdCommandEnv(cityPath, cfg, target)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	cmd.Env = workQueryEnvForDir(env, cmd.Dir)
+	cmd.Env = env
 
 	traceStart := time.Now()
 	runErr := cmd.Run()
@@ -257,7 +313,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 			traceExit = -1
 		}
 	}
-	beads.TraceBDCall("go:gc-bd-passthrough", target.ScopeRoot, bdArgs, traceStart, traceExit, runErr)
+	beads.TraceBDCall(traceLabel, dir, bdArgs, traceStart, traceExit, runErr)
 
 	if runErr != nil {
 		if traceExit > 0 {

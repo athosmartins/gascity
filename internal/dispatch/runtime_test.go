@@ -1760,6 +1760,153 @@ func (s *strictCloseStore) Close(id string) error {
 	return s.MemStore.Close(id)
 }
 
+// blockedByLiveDependencyStore enforces the beads store's real "cannot close
+// blocked issue" policy on Update, not just Close. Production reaches this
+// policy through internal/beads.NativeDoltStore.Update -> third_party/beads
+// issueops.UpdateIssueInTx -> EnforceClosePolicyInTx: a generic field update
+// that crosses a bead's status into "closed" answers to the same live-blocker
+// refusal a checked close does. setOutcomeAndClose (runtime.go) always closes
+// through Update, never Close, so strictCloseStore above -- which only
+// guards Close() -- does not exercise this path, and plain beads.MemStore.Update
+// (memstore.go) enforces no policy at all. That gap is exactly why the bug
+// this store reproduces (ga-ex1b4i / ga-3ef27l) shipped without a failing
+// unit test: every pre-existing processWorkflowFinalize test runs against a
+// store that silently allows an out-of-order close.
+type blockedByLiveDependencyStore struct {
+	*beads.MemStore
+}
+
+func (s *blockedByLiveDependencyStore) Update(id string, opts beads.UpdateOpts) error {
+	if opts.Status != nil && *opts.Status == "closed" {
+		current, err := s.Get(id)
+		if err != nil {
+			return err
+		}
+		if current.Status != "closed" {
+			deps, err := s.DepList(id, "down")
+			if err != nil {
+				return err
+			}
+			var openBlockers []string
+			for _, dep := range deps {
+				if dep.Type != "blocks" {
+					continue
+				}
+				blocker, err := s.Get(dep.DependsOnID)
+				if err != nil {
+					return err
+				}
+				if blocker.Status == "open" {
+					openBlockers = append(openBlockers, blocker.ID)
+				}
+			}
+			if len(openBlockers) > 0 {
+				return fmt.Errorf("cannot close blocked issue: %s is blocked by %v", id, openBlockers)
+			}
+		}
+	}
+	return s.MemStore.Update(id, opts)
+}
+
+// TestProcessWorkflowFinalizeRootBlockedByOwnFinalizeStep is the regression
+// test for ga-ex1b4i / ga-3ef27l. internal/formula/compile.go's
+// addWorkflowRootDeps gives a graph.v2 workflow root exactly ONE
+// close-blocking dependency when a workflow-finalize step exists: a "blocks"
+// edge from the root onto that finalize step. processWorkflowFinalize used to
+// close the root BEFORE closing the finalize step itself (this same bead),
+// which is unconditionally still open at that point -- so the root close
+// always lost the beads store's live-blocker guard on the very first
+// attempt. This is not a rare timing race (as the underlying error looked
+// like in production): the blocker IS the bead currently being processed, so
+// the failure is deterministic every time a graph.v2 formula finalizes.
+//
+// Before the fix: ProcessControl returns a non-nil "completing workflow
+// head: ... cannot close blocked issue" error. The workflow root is left
+// open (the Update call failed, no mutation applied), and the finalizer is
+// ALSO left open (its own close sits after the failed root close, which
+// returns early via recordWorkflowFinalizeError) -- exactly the production
+// leak: cmd/gc's control dispatcher (IsTransientControllerError has no
+// "blocked"/"cannot close" needle) treats this as a non-transient error and
+// immediately quarantines+closes the finalizer with
+// gc.final_disposition=control_quarantined, while the root is abandoned
+// open, unassigned, with no park/quarantine label of its own -- a pool probe
+// cannot tell it apart from real ready work.
+//
+// After the fix: processWorkflowFinalize recognizes the live-blocker refusal
+// as self-inflicted (rootCloseBlockedByOwnFinalizer matches the blocked
+// bead's own finalizer ID in the error text), closes the finalizer first
+// (durably clearing the only blocker), retries the root close once, and
+// succeeds -- both beads end up closed with the correct outcome from a
+// single ProcessControl call, with no error and no quarantine trail.
+func TestProcessWorkflowFinalizeRootBlockedByOwnFinalizeStep(t *testing.T) {
+	t.Parallel()
+
+	store := &blockedByLiveDependencyStore{MemStore: beads.NewMemStore()}
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "cleanup",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.outcome": "pass",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+
+	// finalizer "needs" cleanup (its own sinks) -- this is what
+	// resolveFinalizeOutcome reads and is unrelated to what blocks the root.
+	mustDepAdd(t, store, finalizer.ID, cleanup.ID, "blocks")
+	// This is the addWorkflowRootDeps edge under test: the workflow root's
+	// ONLY close-blocking dependency. finalizer.ID is still open here, same
+	// as in production at the instant processWorkflowFinalize starts running
+	// on it (it IS the bead being processed).
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize) = %v, want nil (self-blocked root retry should succeed)", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+
+	rootAfter := mustGetBead(t, store, workflow.ID)
+	if rootAfter.Status != "closed" {
+		t.Fatalf("workflow status = %q, want closed", rootAfter.Status)
+	}
+	if got := rootAfter.Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("workflow outcome = %q, want pass", got)
+	}
+
+	finalizerAfter := mustGetBead(t, store, finalizer.ID)
+	if finalizerAfter.Status != "closed" {
+		t.Fatalf("finalizer status = %q, want closed", finalizerAfter.Status)
+	}
+	if got := finalizerAfter.Metadata["gc.outcome"]; got != "pass" {
+		t.Fatalf("finalizer outcome = %q, want pass", got)
+	}
+	// No error should ever have reached recordWorkflowFinalizeError, so no
+	// failure trail should exist -- confirms a clean success, not a masked
+	// retry-until-quarantine.
+	if got := finalizerAfter.Metadata["gc.last_finalize_error"]; got != "" {
+		t.Fatalf("finalizer gc.last_finalize_error = %q, want empty", got)
+	}
+}
+
 func TestProcessWorkflowFinalizeClosesWorkflow(t *testing.T) {
 	t.Parallel()
 

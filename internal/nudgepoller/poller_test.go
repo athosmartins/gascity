@@ -165,3 +165,52 @@ func TestCmdlineMatcherRequiresNudgePollCommand(t *testing.T) {
 		t.Fatalf("CmdlineMatcher matched non-contiguous nudge poll argv: %v", argv)
 	}
 }
+
+// ga-yxuab: with the knob UNSET the argv must be byte-identical to the
+// pre-change build — that property is what makes deploying the binary a no-op
+// and the behavior change a revertible config value.
+func TestCommandArgsUnsetIsIdenticalToLegacyArgv(t *testing.T) {
+	t.Setenv(PollIntervalEnv, "")
+	got := CommandArgs("/city", "sess", "agent")
+	want := []string{"nudge", "poll", "--city", "/city", "--session", "sess", "agent"}
+	if len(got) != len(want) {
+		t.Fatalf("argv len = %d (%v); want %d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("argv[%d] = %q; want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// The override must still be recognized by CmdlineMatcher — otherwise the city
+// loses track of its own pollers (reuse/ownership checks all go through it).
+func TestCommandArgsWithIntervalStillMatches(t *testing.T) {
+	t.Setenv(PollIntervalEnv, "10s")
+	argv := append([]string{"gc"}, CommandArgs("/city", "sess", "agent")...)
+	if !CmdlineMatcher("/city", "sess", "agent")(argv) {
+		t.Fatalf("CmdlineMatcher did not match argv with --interval: %v", argv)
+	}
+	var sawInterval bool
+	for i, a := range argv {
+		if a == "--interval" && i+1 < len(argv) && argv[i+1] == "10s" {
+			sawInterval = true
+		}
+	}
+	if !sawInterval {
+		t.Fatalf("expected --interval 10s in argv: %v", argv)
+	}
+}
+
+// Fail-soft: garbage or non-positive values fall back to the compiled default
+// rather than emitting a bad flag into every poller in the city.
+func TestCommandArgsIgnoresInvalidInterval(t *testing.T) {
+	for _, bad := range []string{"banana", "0s", "-5s", "   "} {
+		t.Setenv(PollIntervalEnv, bad)
+		for _, a := range CommandArgs("/city", "sess", "agent") {
+			if a == "--interval" {
+				t.Fatalf("invalid interval %q leaked --interval into argv", bad)
+			}
+		}
+	}
+}

@@ -2069,12 +2069,19 @@ func TestHeadLimitedWriter(t *testing.T) {
 	})
 }
 
-// TestGcBdHeartbeatRewritesToMetadataUpdate pins the gastownhall/gascity#1855
-// worker-heartbeat write half: `gc bd heartbeat <id>` must forward to bd as
-// `update <id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC>`. The exact
-// key (with the _at suffix) is what the gas-city-dashboard will read
-// (dashboard #324) to tell a live worker from a dead one, and the stamp must
-// be valid RFC3339 in UTC even when the local clock is in another zone.
+// TestGcBdHeartbeatRewritesToMetadataUpdate pins BOTH halves of the
+// gastownhall/gascity#1855 / ga-9kjzz worker-heartbeat contract: `gc bd
+// heartbeat <id>` must dispatch bd's own, unrewritten `heartbeat <id>`
+// FIRST — the lease refresh long-running workers actually depend on to
+// survive the pool reconciler's abandoned-lease reclaim — and only once
+// that succeeds, `update <id> --set-metadata gc.last_heartbeat_at=<RFC3339
+// UTC>` as a second, dashboard-facing call. Before ga-9kjzz there was only
+// ever the second call: bd's own same-named heartbeat subcommand was
+// shadowed and unreachable through gc, so every caller got a silent no-op
+// dressed as success. The exact metadata key (with the _at suffix) is what
+// the gas-city-dashboard will read (dashboard #324) to tell a live worker
+// from a dead one, and the stamp must be valid RFC3339 in UTC even when the
+// local clock is in another zone.
 func TestGcBdHeartbeatRewritesToMetadataUpdate(t *testing.T) {
 	origNow := bdHeartbeatNow
 	t.Cleanup(func() { bdHeartbeatNow = origNow })
@@ -2082,9 +2089,13 @@ func TestGcBdHeartbeatRewritesToMetadataUpdate(t *testing.T) {
 	fixed := time.Date(2026, 5, 31, 12, 0, 0, 0, time.FixedZone("PST", -8*3600))
 	bdHeartbeatNow = func() time.Time { return fixed }
 
-	// The fake bd captures its forwarded args so the assertion can inspect them.
+	// The fake bd appends each forwarded invocation's args as its own line
+	// (not `>`, which would let a second call silently overwrite the first
+	// and hide a regression back to the pre-fix single-call behavior), so
+	// the assertion can distinguish and order both calls doBd makes for one
+	// "gc bd heartbeat".
 	capture := filepath.Join(t.TempDir(), "gc-bd-args.txt")
-	silentFallbackTestSetup(t, "#!/bin/sh\nprintf '%s' \"$*\" > \"${CAPTURE_PATH}\"\n")
+	silentFallbackTestSetup(t, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${CAPTURE_PATH}\"\n")
 	t.Setenv("CAPTURE_PATH", capture)
 
 	var stdout, stderr bytes.Buffer
@@ -2096,11 +2107,18 @@ func TestGcBdHeartbeatRewritesToMetadataUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("bd invocations = %q, want exactly 2 (real heartbeat, then dashboard stamp)", lines)
+	}
+	if lines[0] != "heartbeat demo-abc" {
+		t.Fatalf("1st bd call = %q, want the unrewritten lease-refresh call %q", lines[0], "heartbeat demo-abc")
+	}
+
 	const prefix = "update demo-abc --set-metadata " + heartbeatMetadataKey + "="
-	gotArgs := string(data)
-	stamp, ok := strings.CutPrefix(gotArgs, prefix)
+	stamp, ok := strings.CutPrefix(lines[1], prefix)
 	if !ok {
-		t.Fatalf("forwarded args = %q, want prefix %q", gotArgs, prefix)
+		t.Fatalf("2nd bd call = %q, want prefix %q", lines[1], prefix)
 	}
 	parsed, err := time.Parse(time.RFC3339, stamp)
 	if err != nil {
@@ -2111,6 +2129,62 @@ func TestGcBdHeartbeatRewritesToMetadataUpdate(t *testing.T) {
 	}
 	if want := fixed.UTC().Format(time.RFC3339); stamp != want {
 		t.Fatalf("heartbeat stamp = %q, want %q", stamp, want)
+	}
+}
+
+// TestDoBdHeartbeatSkipsDashboardStampWhenLeaseRefreshFails pins that a
+// failing lease refresh (bd's real "heartbeat <id>") short-circuits before
+// the dashboard stamp ever runs, and that doBd returns bd's OWN exit code
+// rather than collapsing it to a generic 1 — so a caller can tell "bd
+// refused to refresh this lease" (e.g. no active claim) apart from success.
+func TestDoBdHeartbeatSkipsDashboardStampWhenLeaseRefreshFails(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "gc-bd-args.txt")
+	silentFallbackTestSetup(t, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${CAPTURE_PATH}\"\ncase \"$1\" in\n  heartbeat) exit 7 ;;\nesac\n")
+	t.Setenv("CAPTURE_PATH", capture)
+
+	var stdout, stderr bytes.Buffer
+	if got := doBd([]string{"heartbeat", "demo-abc"}, &stdout, &stderr); got != 7 {
+		t.Fatalf("doBd(heartbeat) = %d, want 7 (bd's own heartbeat exit code)", got)
+	}
+
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 1 || lines[0] != "heartbeat demo-abc" {
+		t.Fatalf("bd invocations = %q, want exactly [%q] — the dashboard stamp must not run after a failed lease refresh", lines, "heartbeat demo-abc")
+	}
+}
+
+// TestDoBdHeartbeatWarnsButSucceedsWhenDashboardStampFails pins the other
+// side of the same contract: a successful lease refresh must not be masked
+// by a failing dashboard stamp (that would make a real, working heartbeat
+// look like a failure to callers branching on doBd's exit code) — but the
+// stamp's own failure must still be observable on stderr, not silently
+// dropped. A no-op that looks like success is the exact failure mode
+// ga-9kjzz was filed against; swallowing the secondary call's failure would
+// reintroduce a smaller copy of it right inside the fix.
+func TestDoBdHeartbeatWarnsButSucceedsWhenDashboardStampFails(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "gc-bd-args.txt")
+	silentFallbackTestSetup(t, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${CAPTURE_PATH}\"\ncase \"$1\" in\n  update) exit 3 ;;\nesac\n")
+	t.Setenv("CAPTURE_PATH", capture)
+
+	var stdout, stderr bytes.Buffer
+	if got := doBd([]string{"heartbeat", "demo-abc"}, &stdout, &stderr); got != 0 {
+		t.Fatalf("doBd(heartbeat) = %d, want 0 — a dashboard-stamp failure must not mask a successful lease refresh", got)
+	}
+	if !strings.Contains(stderr.String(), heartbeatMetadataKey) {
+		t.Fatalf("stderr = %q, want a warning naming the failed dashboard stamp (%s)", stderr.String(), heartbeatMetadataKey)
+	}
+
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 2 || lines[0] != "heartbeat demo-abc" {
+		t.Fatalf("bd invocations = %q, want [%q, \"update ...\"] — the stamp attempt must still run after a successful refresh", lines, "heartbeat demo-abc")
 	}
 }
 

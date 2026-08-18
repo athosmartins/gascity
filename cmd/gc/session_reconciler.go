@@ -1088,10 +1088,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			trace.recordDecision("reconciler.session.pending_create", templateName, name, action, "rollback", nil, nil, "")
 		}
 		if clearClaim {
-			rollbackPendingCreateClearingClaim(session, store, clk.Now().UTC(), stderr)
+			rollbackPendingCreateClearingClaim(session, store, clk.Now().UTC(), stderr, action, detail)
 			return
 		}
-		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
+		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr, action, detail)
 	}
 	phaseStart = time.Now()
 	for i := range ordered {

@@ -2580,6 +2580,69 @@ func TestDoSlingPoolEmptyWarns(t *testing.T) {
 	}
 }
 
+// TestDoSlingImplicitTargetWarns is a regression test for ga-sg0pq8: routing
+// to an auto-synthesized implicit agent (e.g. a bare provider name like
+// "claude-headless" resolved against a rig, which InjectImplicitAgents
+// registers as a real agent for every rig/provider pair) silently wrote
+// gc.routed_to with no signal that the target has no dedicated worker
+// backing it. Implicit agents are a real, valid resolveAgentIdentity match
+// (this is not a "provider mistaken for an agent" validation gap — the
+// agent genuinely exists), so sling must warn rather than refuse.
+func TestDoSlingImplicitTargetWarns(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "claude-headless", Dir: "whatsapp_automation", Implicit: true}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-1")
+	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if !result.TargetImplicit {
+		t.Error("expected TargetImplicit=true for an Implicit agent")
+	}
+}
+
+// TestDoSlingImplicitTargetForceSuppressesWarning mirrors the existing
+// --force behavior for AgentSuspended/PoolEmpty: an operator who explicitly
+// forces the route has already made the call, so the warning should not
+// fire.
+func TestDoSlingImplicitTargetForceSuppressesWarning(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "claude-headless", Dir: "whatsapp_automation", Implicit: true}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-1")
+	opts := testOpts(a, "BL-1")
+	opts.Force = true
+	result, err := DoSling(opts, deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.TargetImplicit {
+		t.Error("expected TargetImplicit=false when --force is set")
+	}
+}
+
+// TestDoSlingExplicitTargetDoesNotWarn is the negative case: a normal,
+// explicitly configured agent (Implicit: false, the common case for every
+// hand-authored pool like wa-worker/ps-worker/dog) must never trip the new
+// warning.
+func TestDoSlingExplicitTargetDoesNotWarn(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	a := config.Agent{Name: "wa-worker", Dir: "whatsapp_automation"}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	deps.Store = seededStore("BL-1")
+	result, err := DoSling(testOpts(a, "BL-1"), deps, nil)
+	if err != nil {
+		t.Fatalf("DoSling: %v", err)
+	}
+	if result.TargetImplicit {
+		t.Error("expected TargetImplicit=false for an explicitly configured agent")
+	}
+}
+
 func TestFinalizeAutoConvoy(t *testing.T) {
 	runner := newFakeRunner()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}

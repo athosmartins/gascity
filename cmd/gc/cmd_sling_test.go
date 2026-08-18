@@ -873,6 +873,51 @@ func TestDoSlingMultiSessionMaxZeroWarns(t *testing.T) {
 	}
 }
 
+// TestDoSlingImplicitTargetWarnsAtCLI is a regression test for ga-sg0pq8:
+// `gc sling <rig>/claude-headless <bead>` (an implicit, provider-derived
+// agent auto-synthesized by InjectImplicitAgents — see config.Agent.Implicit)
+// used to route the bead with gc.routed_to set and zero indication that the
+// target has no dedicated worker backing it. The bead sat routed but
+// unclaimed indefinitely, invisible until someone happened to check
+// `gc session list`. Verifies the CLI now surfaces a warning on stderr.
+func TestDoSlingImplicitTargetWarnsAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "claude-headless", Dir: "whatsapp_automation", Implicit: true}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 (still routes)", code)
+	}
+	if !strings.Contains(stderr.String(), "implicit") {
+		t.Errorf("stderr = %q, want implicit-target warning", stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "whatsapp_automation/claude-headless")
+}
+
+func TestDoSlingImplicitTargetForceSuppressesWarningAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "claude-headless", Dir: "whatsapp_automation", Implicit: true}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	opts.Force = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0", code)
+	}
+	if strings.Contains(stderr.String(), "implicit") {
+		t.Errorf("--force should suppress warning; stderr = %q", stderr.String())
+	}
+}
+
 func TestDoSlingMultiSessionMaxZeroForce(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
@@ -1781,12 +1826,17 @@ dolt.auto-start: false
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// ga-66wc: rig path lives in .gc/site.toml (deployment), not city.toml
+	// (definition) — see legacyRigPathSiteBindingWarningFragment in
+	// internal/config/site_binding.go. A city.toml [[rigs]] entry that still
+	// declares `path` directly makes cmdSling exit 1 with "still declares
+	// path in city.toml; move it to .gc/site.toml (run `gc doctor --fix`)"
+	// before it ever reaches the code this fixture exists to exercise.
 	cityToml := `[workspace]
 name = "demo"
 
 [[rigs]]
 name = "frontend"
-path = "frontend"
 prefix = "FE"
 
 [[agent]]
@@ -1796,6 +1846,7 @@ dir = "frontend"
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
+	writeCatalogFile(t, cityDir, ".gc/site.toml", fmt.Sprintf("[[rig]]\nname = \"frontend\"\npath = %q\n", rigDir))
 	return cityDir, rigDir
 }
 

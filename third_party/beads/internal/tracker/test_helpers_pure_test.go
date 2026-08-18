@@ -24,6 +24,7 @@ type mockTracker struct {
 	updated         map[string]*types.Issue
 	fetchErr        error
 	fetchIssueErr   error
+	fetchCalls      int // number of FetchIssue calls (asserts push fetch short-circuits)
 	createErr       error
 	createFailAfter int // fail after this many successful creates (0 = fail immediately)
 	updateErr       error
@@ -93,6 +94,11 @@ func (m *mockTracker) ExtractIdentifier(ref string) string {
 	return ref
 }
 func (m *mockTracker) BuildExternalRef(issue *TrackerIssue) string {
+	// Mirror the real trackers (notion/linear/github), which all prefer the
+	// issue's canonical URL over a synthesized ref.
+	if issue.URL != "" {
+		return issue.URL
+	}
 	return fmt.Sprintf("https://%s.test/%s", m.name, issue.Identifier)
 }
 
@@ -133,6 +139,7 @@ func (m *mockTracker) FetchIssues(ctx context.Context, opts FetchOptions) ([]Tra
 }
 
 func (m *mockTracker) FetchIssue(_ context.Context, identifier string) (*TrackerIssue, error) {
+	m.fetchCalls++
 	if m.fetchIssueErr != nil {
 		return nil, m.fetchIssueErr
 	}
@@ -216,6 +223,7 @@ func (m *mockMapper) IssueToBeads(ti *TrackerIssue) *IssueConversion {
 
 type pureTestStore struct {
 	storage.Storage
+	storage.IssueLifecycleStore
 	issues        []*types.Issue
 	localMetadata map[string]string
 }

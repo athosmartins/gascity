@@ -1305,17 +1305,29 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		CreatedBefore:       zeroTimePtr(query.CreatedBefore),
 		UpdatedAfter:        zeroTimePtr(query.UpdatedAfter),
 		IncludeDependencies: true,
-		// ga-ftmci: when the caller (cache reconcile) does not need the large
-		// body columns, narrow the projection so the DB engine stops streaming
-		// design/acceptance_criteria/notes for every row on every full scan.
-		// beadFromNativeIssue never reads those fields, so this is invisible to
-		// the cache and to change detection.
-		SkipBody: query.SkipBody,
-		// ga-ftmci: the reconcile cheap complete scan needs only id/status/
-		// updated_at, so drop `description` too. Narrows the projection further;
-		// the cache never treats a SkipDescription result as authoritative body
-		// content (it only reads the ID set + status/updated_at from it).
-		SkipDescription: query.SkipDescription,
+		// ga-9ae7o (Mayor, 2026-08-07): SkipBody/SkipDescription NÃO existem mais.
+		//
+		// O ga-ftmci usava esses dois campos do IssueFilter para estreitar a
+		// projeção no reconcile (parar de streamar design/acceptance_criteria/
+		// notes, e no scan barato também description). O beads 1.1.0 REMOVEU os
+		// dois do IssueFilter — não há equivalente, conferido em
+		// internal/types/types.go. A mesma remoção aconteceu na CLI (--skip-body),
+		// e foi ela que derrubou o supervisor deste dia.
+		//
+		// O QUE SE PERDE: o reconcile volta a trazer as colunas grandes. É uma
+		// regressão real de largura de query.
+		//
+		// O QUE SE GANHA, e por isso a troca compensa MUITO: enquanto o vendor
+		// ficou em 1.0.5 contra um bd 1.1.0, o gate de compatibilidade reprovava
+		// (native_store_unavailable) e TODA chamada caía pro caminho degradado —
+		// um processo `bd` novo por chamada, cada um abrindo conexão própria no
+		// Dolt. Isso empurrava a concorrência de base para o joelho medido (9-15
+		// conexões, ga-7j5vf), e a partir dali spawn de revisor, envio de mail e
+		// criação de sessão falhavam em cascata. Uma query mais larga em processo
+		// custa muito menos que um processo por query.
+		//
+		// Se a projeção voltar a fazer falta, meça ANTES: com o store nativo
+		// ativo, o custo do reconcile é outro e pode nem ser o gargalo.
 	}
 	switch query.TierMode {
 	case TierWisps:

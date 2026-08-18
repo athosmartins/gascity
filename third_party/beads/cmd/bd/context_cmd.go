@@ -2,12 +2,13 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/storage/domain"
 )
 
 // ContextInfo contains the effective backend identity and repository context.
@@ -45,13 +46,31 @@ Examples:
   bd context           # Show context information
   bd context --json    # Output in JSON format
 `,
-	Run: func(cmd *cobra.Command, args []string) {
-		info := ContextInfo{
-			Backend:   configfile.BackendDolt,
-			BdVersion: Version,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("context")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		if usesProxiedServer() {
+			return runContextProxiedServer(cmd, rootCtx)
 		}
 
-		// Resolve repo context (works without DB open)
+		// The direct route reads config files itself rather than through the
+		// contextinfo provider — it must answer in degraded states where no
+		// database can be opened — but it assembles the SAME snapshot the
+		// proxied route gets from the provider, and hands it to the same
+		// view. That is what keeps `bd context` one answer across two routes,
+		// and what puts both of them on the projection GET /v0/beads/context
+		// serves. TestContextRoutesNameOneWorkspaceTheSameWay holds them to it;
+		// until it existed both routes carried their own `Backend: dolt` and
+		// agreed by telling the same lie.
+		snapshot := domain.ContextInfo{BdVersion: Version}
+
 		if selected := selectedNoDBBeadsDir(cmd); selected != "" {
 			prepareSelectedNoDBContext(selected)
 		}
@@ -59,26 +78,25 @@ Examples:
 		rc, err := beads.GetRepoContext()
 		if err != nil {
 			if jsonOutput {
-				outputJSON(map[string]string{"error": fmt.Sprintf("cannot resolve repo context: %v", err)})
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: cannot resolve repo context: %v\n", err)
+				if jerr := outputJSON(map[string]string{"error": fmt.Sprintf("cannot resolve repo context: %v", err)}); jerr != nil {
+					return jerr
+				}
+				return SilentExit()
 			}
-			os.Exit(1)
+			return HandleError("cannot resolve repo context: %v", err)
 		}
 
-		info.BeadsDir = rc.BeadsDir
-		info.RepoRoot = rc.RepoRoot
-		info.CWDRepoRoot = rc.CWDRepoRoot
-		info.IsRedirected = rc.IsRedirected
-		info.IsWorktree = rc.IsWorktree
+		snapshot.BeadsDir = rc.BeadsDir
+		snapshot.RepoRoot = rc.RepoRoot
+		snapshot.CWDRepoRoot = rc.CWDRepoRoot
+		snapshot.IsRedirected = rc.IsRedirected
+		snapshot.IsWorktree = rc.IsWorktree
 
-		// Read role from repo context
 		if role, ok := rc.Role(); ok {
-			info.Role = string(role)
+			snapshot.Role = string(role)
 		}
 
-		// Load metadata.json config (does not require DB)
-		cfg, err := configfile.Load(rc.BeadsDir)
+		cfg, err := configfile.LoadForDiscovery(rc.BeadsDir)
 		if err != nil {
 			cfg = configfile.DefaultConfig()
 		}
@@ -86,42 +104,54 @@ Examples:
 			cfg = configfile.DefaultConfig()
 		}
 
-		info.DoltMode = cfg.GetDoltMode()
-		info.Database = cfg.GetDoltDatabase()
-		info.ProjectID = cfg.ProjectID
-
-		if cfg.IsDoltServerMode() {
-			info.ServerHost = cfg.GetDoltServerHost()
-			// Use doltserver.DefaultConfig to resolve the actual runtime port
-			// (from port file, env var, etc.) instead of the static config default.
-			// This matches what "bd dolt show" does (GH#2555).
-			dsCfg := doltserver.DefaultConfig(rc.BeadsDir)
-			info.ServerPort = dsCfg.Port
-		}
-		if cfg.IsDoltProxiedServerMode() {
-			p, err := resolveProxiedServerRootPath(rc.BeadsDir)
-			if err != nil {
-				FatalError("resolve proxied server root: %v", err)
-			}
-			info.ProxiedDir = p
+		if err := applyContextBackend(&snapshot, rc.BeadsDir, cfg); err != nil {
+			return HandleError("%v", err)
 		}
 
-		if dataDir := cfg.GetDoltDataDir(); dataDir != "" {
-			info.DataDir = dataDir
-		}
+		snapshot.SyncRemote = resolveSyncRemoteFromDir(rc.BeadsDir)
 
-		// Read sync remote from the selected repo's config.yaml.
-		if remote := resolveSyncRemoteFromDir(rc.BeadsDir); remote != "" {
-			info.SyncRemote = remote
-			info.SyncGitRemote = remote // Deprecated: kept for backwards compat
-		}
-
+		info := contextInfoView(snapshot)
 		if jsonOutput {
-			outputJSON(info)
-		} else {
-			printContextText(info)
+			return outputJSON(info)
 		}
+		printContextText(info)
+		return nil
 	},
+}
+
+// applyContextBackend records the backend half of the direct route's snapshot,
+// off the config files it just read.
+//
+// It is a named function rather than a run of assignments inside the command so
+// that the claim above it — that both `bd context` routes assemble the SAME
+// snapshot — is something a test can drive rather than something a reader has
+// to check by eye. TestContextRoutesNameOneWorkspaceTheSameWay does exactly
+// that, comparing this against the contextinfo provider the proxied route and
+// GET /v0/beads/context both go through.
+//
+// The identity itself goes through domain.SetBackendIdentity, which is the one
+// policy both routes share: it is what stops a non-Dolt workspace from being
+// described as embedded Dolt on database "beads", which is what both routes did
+// while each held its own copy of `Backend: configfile.BackendDolt`.
+func applyContextBackend(snapshot *domain.ContextInfo, beadsDir string, cfg *configfile.Config) error {
+	snapshot.SetBackendIdentity(cfg.GetBackend(), cfg.GetDoltMode(), cfg.GetDoltDatabase())
+	snapshot.ProjectID = cfg.ProjectID
+
+	if cfg.IsDoltServerMode() {
+		snapshot.ServerHost = cfg.GetDoltServerHost()
+		snapshot.ServerPort = doltserver.DefaultConfig(beadsDir).Port
+	}
+	if cfg.IsDoltProxiedServerMode() {
+		p, err := resolveProxiedServerRootPath(beadsDir)
+		if err != nil {
+			return fmt.Errorf("resolve proxied server root: %w", err)
+		}
+		snapshot.ProxiedDir = p
+	}
+	if dataDir := cfg.GetDoltDataDir(); dataDir != "" {
+		snapshot.DataDir = dataDir
+	}
+	return nil
 }
 
 func printContextText(info ContextInfo) {
@@ -149,8 +179,15 @@ func printContextText(info ContextInfo) {
 	// Backend
 	fmt.Println("Backend:")
 	fmt.Printf("  type:         %s\n", info.Backend)
-	fmt.Printf("  mode:         %s\n", info.DoltMode)
-	fmt.Printf("  database:     %s\n", info.Database)
+	// Dolt-only identity. A registered backend reports neither, and a bare
+	// "mode:" with nothing after it reads as a failure to determine rather than
+	// as not-applicable — so omit them, like every other optional field here.
+	if info.DoltMode != "" {
+		fmt.Printf("  mode:         %s\n", info.DoltMode)
+	}
+	if info.Database != "" {
+		fmt.Printf("  database:     %s\n", info.Database)
+	}
 	if info.ServerHost != "" {
 		fmt.Printf("  server:       %s:%d\n", info.ServerHost, info.ServerPort)
 	}

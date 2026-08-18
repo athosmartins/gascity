@@ -1253,6 +1253,11 @@
           "description": "MaxWakesPerTick caps how many sessions the reconciler may start in a\nsingle tick. Fresh generic pool session-bead creation uses the same\nbudget so the controller does not materialize more ordinary pool sessions\nthan it can wake. Bounded dependency-floor prerequisites are exempt.\nNil (unset) defaults to 5. Values \u003c= 0 are treated as the default — set a\npositive integer to override.",
           "default": 5
         },
+        "session_spawn_stagger": {
+          "type": "string",
+          "description": "SessionSpawnStagger is the minimum delay the async session-start\nreconciler waits between launching consecutive spawn goroutines\nwithin a single wake wave (see enqueuePreparedStartWaveForCity in\ncmd/gc/session_lifecycle_parallel.go, ga-ih4ma). Duration string\n(e.g., \"4s\", \"500ms\"). Empty/unset defaults to\nDefaultSessionSpawnStagger; an explicit \"0\" or \"0s\" disables\nstaggering entirely (spawns launch back-to-back, the pre-ga-ih4ma\nbehavior). Overridable per-invocation via the GC_SESSION_SPAWN_STAGGER\nenv var (same duration-string format), which takes precedence over\nthis field when set to a valid, non-negative duration — an\noperational escape hatch mirroring GATE_SPAWN_STAGGER_SECS in\npacks/town-deltas/assets/quality-gate-dispatcher.sh. This knob is\northogonal to max_wakes_per_tick: that caps how many sessions start\nper tick, this controls how spread out their launches are.",
+          "default": "4s"
+        },
         "nudge_dispatcher": {
           "type": "string",
           "enum": [

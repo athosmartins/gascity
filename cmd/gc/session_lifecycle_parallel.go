@@ -111,6 +111,41 @@ func maxParallelStartsPerTick(cfg *config.City) int {
 	return cfg.Daemon.MaxWakesPerTickOrDefault()
 }
 
+// sessionSpawnStagger resolves the minimum delay between consecutive
+// session-start goroutine launches within a reconciler wake wave
+// (ga-ih4ma; see enqueuePreparedStartWaveForCity below and
+// config.DaemonConfig.SessionSpawnStaggerDuration for the full
+// GC_SESSION_SPAWN_STAGGER env var / city.toml / built-in-default
+// resolution order and the reasoning behind the chosen default).
+func sessionSpawnStagger(cfg *config.City) time.Duration {
+	if cfg == nil {
+		return config.DefaultSessionSpawnStagger
+	}
+	return cfg.Daemon.SessionSpawnStaggerDuration()
+}
+
+// interruptibleSleep blocks for d, or until ctx is done, whichever comes
+// first. Non-positive d returns immediately. A nil ctx has no
+// cancellation signal to race against, so it falls back to a plain
+// time.Sleep — callers on the reconciler tick path always pass a real
+// ctx, but session_lifecycle_parallel.go has several call sites that
+// tolerate a nil ctx defensively (see the `ctx != nil &&` guards
+// throughout this file), so this helper does too rather than risk a nil
+// interface panic on ctx.Done().
+func interruptibleSleep(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	if ctx == nil {
+		time.Sleep(d)
+		return
+	}
+	select {
+	case <-time.After(d):
+	case <-ctx.Done():
+	}
+}
+
 func startCandidateHasTemplateDependencies(candidate startCandidate, cfg *config.City) bool {
 	cfgAgent := findAgentByTemplate(cfg, candidate.logicalTemplate(cfg))
 	return cfgAgent != nil && len(cfgAgent.DependsOn) > 0
@@ -1267,7 +1302,25 @@ func enqueuePreparedStartWaveForCity(
 		return nil
 	}
 	results := make([]startResult, len(prepared))
+	// ga-ih4ma: stagger successive spawn-goroutine launches instead of
+	// firing them all back-to-back. Root cause confirmed by direct source
+	// read: before this change, every candidate in a batch (and, because
+	// this function is called once per offset-batch from the wave loop in
+	// executePlannedStartsTraced with no gap of its own, effectively every
+	// candidate in the whole wave) launched its goroutine here with zero
+	// delay between `go` statements. Each goroutine's Dolt-heavy
+	// PostStartObserve phase then landed in the same few-hundred-ms
+	// window, spiking `bd list` latency city-wide (the ga-nawd3 incident;
+	// see max_wakes_per_tick, which mitigates this by capping concurrency
+	// rather than spacing it out). Sleeping here — in the synchronous
+	// launch loop, not inside the goroutines — naturally propagates the
+	// same cadence across subsequent offset-batches too, since the caller
+	// loop only proceeds to the next batch after this call returns.
+	stagger := sessionSpawnStagger(cfg)
 	for i, reserved := range prepared {
+		if i > 0 {
+			interruptibleSleep(ctx, stagger)
+		}
 		item := clonePreparedStartForAsync(reserved.item)
 		release := reserved.release
 		now := time.Now()
@@ -1365,7 +1418,8 @@ func commitAsyncStartResultWithContext(
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreate(refreshed.prepared.candidate.session) {
 			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
-			rollbackPendingCreate(refreshed.prepared.candidate.session, store, clk.Now().UTC(), stderr)
+			rollbackPendingCreate(refreshed.prepared.candidate.session, store, clk.Now().UTC(), stderr,
+				"pending_create_context_canceled", fmt.Sprintf("context canceled during async start refresh: %v", ctx.Err()))
 		}
 		logLifecycleOutcome(stderr, "start", wave, name, template, "context_canceled", refreshed.started, time.Now(), ctx.Err(), refreshed.phases)
 		return false
@@ -1670,7 +1724,11 @@ func commitStartResultTraced(
 					"error": formatLifecycleError(result.err),
 				}, "")
 			}
-			rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
+			rollbackDetail := formatLifecycleError(result.err)
+			if rollbackDetail == "" {
+				rollbackDetail = "rollback pending with no recorded error"
+			}
+			rollbackPendingCreate(session, store, clk.Now().UTC(), stderr, "pending_create_rollback_pending", rollbackDetail)
 			logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, result.err, result.phases)
 			return false
 		}
@@ -1847,15 +1905,70 @@ func shouldRollbackPendingCreate(session *beads.Bead) bool {
 	return strings.TrimSpace(session.Metadata["pending_create_claim"]) == "true"
 }
 
+// identityReadRetryDelay bounds the single retry in
+// runningSessionMatchesPendingCreate. Short enough to stay well inside a
+// reconciler tick's budget even if several pending-create sessions hit the
+// retry in the same tick; long enough to ride out a momentary tmux command
+// hiccup of the kind probeServerAlive's doc comment (ga-h9z) already
+// documents as a real, observed failure mode ("wedged tmux server").
+const identityReadRetryDelay = 150 * time.Millisecond
+
+// runningSessionMatchesPendingCreate reports whether the live runtime named
+// sessionName currently belongs to session, by comparing GC_SESSION_ID /
+// GC_INSTANCE_TOKEN (and, on a token mismatch, GC_RUNTIME_EPOCH) read from
+// the runtime's environment against the bead's own recorded identity.
+//
+// ga-s9sk5: runtime.Provider.GetMeta's documented contract is "returns
+// ("", nil) if the key is not set" -- but the tmux implementation collapses
+// ANY read failure that isn't a session-not-found/no-server error (a
+// command timeout, an unexpected show-environment output, ...) into that
+// same ("", nil). This function additionally only ever checks GetMeta's
+// error for == nil, so even the two sentinel errors GetMeta does propagate
+// are discarded here too. The caller of this function
+// (session_reconciler.go's pending-create-rollback branch) only reaches it
+// after independently confirming the runtime IS alive; treating a blank
+// read as a confirmed "belongs to another session" verdict can therefore
+// close this session's own bead out from under its own still-running,
+// still-writing runtime (rollbackPendingCreate -> closeBead never stops
+// the runtime -- see the call chain this bug is filed against).
+//
+// A real signal -- a non-empty ID or token successfully read, matching or
+// not -- is trusted immediately, on the first attempt: this is what lets a
+// genuine pool-slot-reuse mismatch keep being detected and rolled back
+// exactly as before. Retrying is narrowly scoped to the one case that is
+// truly ambiguous: NEITHER key produced any value at all. That specific
+// "total blank" gets a single short retry before being treated as a
+// confirmed mismatch. This can only ever turn an ambiguous "false" into a
+// "true" (when the retry recovers real, matching data) or into a more
+// confidently-grounded "false" (when the retry recovers real, mismatching
+// data) -- it never turns an already-real signal into its opposite, because
+// any attempt that reads a real signal returns immediately without
+// reaching the retry at all.
 func runningSessionMatchesPendingCreate(session *beads.Bead, sessionName string, sp runtime.Provider) bool {
+	matched, blank := attemptRunningSessionMatchesPendingCreate(session, sessionName, sp)
+	if !blank {
+		return matched
+	}
+	time.Sleep(identityReadRetryDelay)
+	matched, _ = attemptRunningSessionMatchesPendingCreate(session, sessionName, sp)
+	return matched
+}
+
+// attemptRunningSessionMatchesPendingCreate is a single read-and-compare
+// pass for runningSessionMatchesPendingCreate. blank reports whether
+// NEITHER GC_SESSION_ID nor GC_INSTANCE_TOKEN produced any value on this
+// attempt -- the specific "total signal vacuum" that is indistinguishable,
+// from this read alone, between "confirmed foreign runtime" and "transient
+// read failure against our own runtime."
+func attemptRunningSessionMatchesPendingCreate(session *beads.Bead, sessionName string, sp runtime.Provider) (matched, blank bool) {
 	if session == nil || sp == nil {
-		return false
+		return false, false
 	}
 	liveID := ""
 	if value, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
 		liveID = strings.TrimSpace(value)
 		if liveID != "" && liveID != session.ID {
-			return false
+			return false, false
 		}
 	}
 	expectedToken := strings.TrimSpace(session.Metadata["instance_token"])
@@ -1867,23 +1980,61 @@ func runningSessionMatchesPendingCreate(session *beads.Bead, sessionName string,
 			liveGeneration, _ := sp.GetMeta(sessionName, "GC_RUNTIME_EPOCH")
 			expectedGeneration := strings.TrimSpace(session.Metadata["generation"])
 			if strings.TrimSpace(liveGeneration) != "" && expectedGeneration != "" && strings.TrimSpace(liveGeneration) != expectedGeneration {
-				return false
+				return false, false
 			}
 			if liveID == "" {
-				return false
+				return false, false
 			}
 		}
 	}
 	if liveID != "" {
-		return liveID == session.ID
+		return liveID == session.ID, false
+	}
+	if liveToken == "" {
+		// Total blank: neither key produced any value. liveID == "" is
+		// already guaranteed here (the only way past the block above).
+		return false, true
 	}
 	if expectedToken == "" {
-		return false
+		return false, false
 	}
-	return expectedToken != "" && liveToken == expectedToken
+	return expectedToken != "" && liveToken == expectedToken, false
 }
 
-func rollbackPendingCreate(session *beads.Bead, store beads.Store, now time.Time, stderr io.Writer) {
+// recordPendingCreateRollback persists WHY a pending-create session bead is
+// being rolled back, as durable bead metadata, before the bead closes.
+//
+// ga-okcgb: previously the ONLY signal was a single stderr line in the
+// supervisor's own log (see the "rolling back pending create" Fprintf in
+// session_reconciler.go) -- nothing durable on the bead itself. A
+// session/wisp created by `gc sling` that never spawns closes silently: the
+// sling command already reported success, and the target work bead just
+// reappears open/unassigned. Nobody investigating later has anything to
+// find -- "the wisp closed on its own" and "the wisp was consumed
+// successfully" were indistinguishable after the fact. The reconciler
+// always DOES know why at the point it decides to roll back (action/detail
+// are non-empty on every real call site); this makes that already-known
+// reason discoverable via a plain bead metadata read, without requiring a
+// live tail of the supervisor log at the exact moment it happened.
+//
+// Best-effort: a failure to persist this metadata must never block the
+// rollback itself from completing (a stuck pending-create bead is worse
+// than an unrecorded reason), so errors are logged to stderr, not returned.
+func recordPendingCreateRollback(store beads.Store, id, action, detail string, now time.Time, stderr io.Writer) {
+	if store == nil || id == "" || strings.TrimSpace(detail) == "" {
+		return
+	}
+	patch := map[string]string{
+		"pending_create_rollback_reason": detail,
+		"pending_create_rollback_action": action,
+		"pending_create_rollback_at":     now.UTC().Format(time.RFC3339),
+	}
+	if err := setMetaBatch(store, id, patch, stderr); err != nil {
+		fmt.Fprintf(stderr, "session reconciler: recording pending-create rollback reason for %s: %v\n", id, err) //nolint:errcheck
+	}
+}
+
+func rollbackPendingCreate(session *beads.Bead, store beads.Store, now time.Time, stderr io.Writer, action, detail string) {
 	if session == nil || store == nil {
 		return
 	}
@@ -1896,10 +2047,11 @@ func rollbackPendingCreate(session *beads.Bead, store beads.Store, now time.Time
 			session.Metadata["session_name"] = ""
 		}
 	}
+	recordPendingCreateRollback(store, session.ID, action, detail, now, stderr)
 	closeBead(store, session.ID, string(sessionpkg.StateFailedCreate), now, stderr)
 }
 
-func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, now time.Time, stderr io.Writer) {
+func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, now time.Time, stderr io.Writer, action, detail string) {
 	if session == nil || store == nil {
 		return
 	}
@@ -1912,6 +2064,7 @@ func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, 
 			session.Metadata["session_name"] = ""
 		}
 	}
+	recordPendingCreateRollback(store, session.ID, action, detail, now, stderr)
 	if !closeFailedCreateBead(store, session.ID, now, stderr) {
 		return
 	}

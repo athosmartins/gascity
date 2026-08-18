@@ -601,6 +601,49 @@ func processArgsFromPS(pid int, timeout time.Duration) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// doltProcessCPUPercentFromPS reports the %CPU ps(1) attributes to the
+// process at pid — the Go-side counterpart of scripts/dolt-hang-watchdog.sh's
+// dolt_cpu_pct() (same "ps -p <pid> -o %cpu=" probe), used by
+// recoverManagedDoltAppearsSaturatedNotDown (bd_env.go, ga-a1xsn) to tell a
+// CPU-saturated-but-alive managed Dolt apart from a genuinely down/hung one.
+// Bounded by the same timeout-then-SIGKILL-process-group shape as
+// processArgsFromPS above so a wedged ps(1) can't block a bd-failure retry.
+func doltProcessCPUPercentFromPS(pid int, timeout time.Duration) (float64, error) {
+	if pid <= 0 {
+		return 0, fmt.Errorf("invalid pid %d", pid)
+	}
+	if timeout <= 0 {
+		timeout = processArgsPSTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "%cpu=")
+	cmd.WaitDelay = 100 * time.Millisecond
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+			return err
+		}
+		return nil
+	}
+	out, err := cmd.Output()
+	if ctx.Err() != nil {
+		return 0, fmt.Errorf("ps %%cpu for pid %d: %w", pid, ctx.Err())
+	}
+	if err != nil {
+		return 0, err
+	}
+	pct, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse ps %%cpu output %q for pid %d: %w", strings.TrimSpace(string(out)), pid, err)
+	}
+	return pct, nil
+}
+
 func containsProcessConfig(args, configFile string) bool {
 	return strings.Contains(args, "--config "+configFile) || strings.Contains(args, "--config="+configFile)
 }

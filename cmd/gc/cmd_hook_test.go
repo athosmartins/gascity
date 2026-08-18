@@ -682,8 +682,19 @@ max = 5
 		t.Fatal(err)
 	}
 
+	// ga-hy33vh: the fake must emit valid JSON on stdout, not raw diagnostic
+	// text — ga-ael6v pipes this tier's bd output through jq (the
+	// pool:refused:*/pilot:held* label filter) before the doHook
+	// has-work check, so non-JSON stdout makes jq fail silently
+	// (2>/dev/null), this tier is skipped, and a later tier's args win
+	// instead of the one this test pins. Diagnostics move to a log FILE
+	// (same pattern as TestCmdHookSessionTemplateContextDoesNotScanSessionsForName
+	// above) so the env/args assertions are unaffected by the stdout contract
+	// change; only a single non-empty, label-free bead need appear on stdout
+	// to satisfy doHook's has-work check and let tier 1 win as before.
+	logPath := filepath.Join(t.TempDir(), "bd.log")
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'pwd=%s\nstore_root=%s\nstore_scope=%s\nprefix=%s\nrig=%s\nrig_root=%s\nargs=%s\n' \"$PWD\" \"${GC_STORE_ROOT:-}\" \"${GC_STORE_SCOPE:-}\" \"${GC_BEADS_PREFIX:-}\" \"${GC_RIG:-}\" \"${GC_RIG_ROOT:-}\" \"$*\"\n"
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'pwd=%%s\\nstore_root=%%s\\nstore_scope=%%s\\nprefix=%%s\\nrig=%%s\\nrig_root=%%s\\nargs=%%s\\n' \"$PWD\" \"${GC_STORE_ROOT:-}\" \"${GC_STORE_SCOPE:-}\" \"${GC_BEADS_PREFIX:-}\" \"${GC_RIG:-}\" \"${GC_RIG_ROOT:-}\" \"$*\" >> %q\nprintf '[{\"id\":\"hw-1\"}]'\n", logPath)
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -707,28 +718,32 @@ max = 5
 	if code != 0 {
 		t.Fatalf("cmdHook() = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	out := stdout.String()
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", logPath, err)
+	}
+	out := string(logData)
 	if !strings.Contains(out, "pwd="+rigDir) {
-		t.Fatalf("stdout = %q, want command to run from rig root %q", out, rigDir)
+		t.Fatalf("bd log = %q, want command to run from rig root %q", out, rigDir)
 	}
 	if !strings.Contains(out, "store_root="+rigDir) {
-		t.Fatalf("stdout = %q, want GC_STORE_ROOT=%q", out, rigDir)
+		t.Fatalf("bd log = %q, want GC_STORE_ROOT=%q", out, rigDir)
 	}
 	if !strings.Contains(out, "store_scope=rig") {
-		t.Fatalf("stdout = %q, want GC_STORE_SCOPE=rig", out)
+		t.Fatalf("bd log = %q, want GC_STORE_SCOPE=rig", out)
 	}
 	if !strings.Contains(out, "prefix=my") {
-		t.Fatalf("stdout = %q, want GC_BEADS_PREFIX=my", out)
+		t.Fatalf("bd log = %q, want GC_BEADS_PREFIX=my", out)
 	}
 	if !strings.Contains(out, "rig=myrig") {
-		t.Fatalf("stdout = %q, want GC_RIG=myrig", out)
+		t.Fatalf("bd log = %q, want GC_RIG=myrig", out)
 	}
 	if !strings.Contains(out, "rig_root="+rigDir) {
-		t.Fatalf("stdout = %q, want GC_RIG_ROOT=%q", out, rigDir)
+		t.Fatalf("bd log = %q, want GC_RIG_ROOT=%q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=1") {
-		t.Fatalf("stdout = %q, want pool work_query args", out)
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
+		t.Fatalf("bd log = %q, want pool work_query args", out)
 	}
 }
 
@@ -1011,8 +1026,13 @@ max = 5
 		t.Fatal(err)
 	}
 
+	// ga-hy33vh: diagnostics move to a log FILE and stdout carries a valid,
+	// label-free bead instead of raw text — see the identical rationale on
+	// TestCmdHookUsesAgentCityAndRigRoot above (ga-ael6v pipes this tier
+	// through jq; non-JSON stdout makes the tier silently no-op).
+	logPath := filepath.Join(t.TempDir(), "bd.log")
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'pwd=%s\\nargs=%s\\n' \"$PWD\" \"$*\"\n"
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'pwd=%%s\\nargs=%%s\\n' \"$PWD\" \"$*\" >> %q\nprintf '[{\"id\":\"hw-1\"}]'\n", logPath)
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1037,13 +1057,17 @@ max = 5
 	if code != 0 {
 		t.Fatalf("cmdHook() = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	out := stdout.String()
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", logPath, err)
+	}
+	out := string(logData)
 	if !strings.Contains(out, "pwd="+rigDir) {
-		t.Fatalf("stdout = %q, want command to run from rig root %q", out, rigDir)
+		t.Fatalf("bd log = %q, want command to run from rig root %q", out, rigDir)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=1") {
-		t.Fatalf("stdout = %q, want pool template work_query args", out)
+	if !strings.Contains(out, "args=list --status in_progress --assignee=host-session --json --limit=20") {
+		t.Fatalf("bd log = %q, want pool template work_query args", out)
 	}
 }
 
@@ -1087,8 +1111,13 @@ name = "worker"
 		t.Fatal(err)
 	}
 
+	// ga-hy33vh: diagnostics move to a log FILE and stdout carries a valid,
+	// label-free bead instead of raw text — see the identical rationale on
+	// TestCmdHookUsesAgentCityAndRigRoot above (ga-ael6v pipes this tier
+	// through jq; non-JSON stdout makes the tier silently no-op).
+	logPath := filepath.Join(t.TempDir(), "bd.log")
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'agent=%s\\nsession=%s\\nargs=%s\\n' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\"\n"
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'agent=%%s\\nsession=%%s\\nargs=%%s\\n' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\" >> %q\nprintf '[{\"id\":\"hw-1\"}]'\n", logPath)
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1102,16 +1131,20 @@ name = "worker"
 	if code != 0 {
 		t.Fatalf("cmdHook() = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	out := stdout.String()
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", logPath, err)
+	}
+	out := string(logData)
 	if !strings.Contains(out, "agent=worker") {
-		t.Fatalf("stdout = %q, want GC_AGENT=worker", out)
+		t.Fatalf("bd log = %q, want GC_AGENT=worker", out)
 	}
 	if !strings.Contains(out, "session=host-session") {
-		t.Fatalf("stdout = %q, want GC_SESSION_NAME=host-session", out)
+		t.Fatalf("bd log = %q, want GC_SESSION_NAME=host-session", out)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=1`) {
-		t.Fatalf("stdout = %q, want metadata-routed work query", out)
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
+		t.Fatalf("bd log = %q, want metadata-routed work query", out)
 	}
 }
 
@@ -1144,8 +1177,13 @@ dir = "myrig"
 		t.Fatal(err)
 	}
 
+	// ga-hy33vh: diagnostics move to a log FILE and stdout carries a valid,
+	// label-free bead instead of raw text — see the identical rationale on
+	// TestCmdHookUsesAgentCityAndRigRoot above (ga-ael6v pipes this tier
+	// through jq; non-JSON stdout makes the tier silently no-op).
+	logPath := filepath.Join(t.TempDir(), "bd.log")
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'agent=%s\\nsession=%s\\nargs=%s\\n' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\"\n"
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'agent=%%s\\nsession=%%s\\nargs=%%s\\n' \"$GC_AGENT\" \"$GC_SESSION_NAME\" \"$*\" >> %q\nprintf '[{\"id\":\"hw-1\"}]'\n", logPath)
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1163,16 +1201,20 @@ dir = "myrig"
 	if code != 0 {
 		t.Fatalf("cmdHook() = %d, want 0; stderr=%s", code, stderr.String())
 	}
-	out := stdout.String()
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", logPath, err)
+	}
+	out := string(logData)
 	if !strings.Contains(out, "agent="+wantAgent) {
-		t.Fatalf("stdout = %q, want GC_AGENT=%s", out, wantAgent)
+		t.Fatalf("bd log = %q, want GC_AGENT=%s", out, wantAgent)
 	}
 	if !strings.Contains(out, "session="+wantSession) {
-		t.Fatalf("stdout = %q, want GC_SESSION_NAME=%s", out, wantSession)
+		t.Fatalf("bd log = %q, want GC_SESSION_NAME=%s", out, wantSession)
 	}
 	// Tiered query: first tier checks in_progress assigned to session name.
-	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=1`) {
-		t.Fatalf("stdout = %q, want metadata-routed work query", out)
+	if !strings.Contains(out, `args=list --status in_progress --assignee=host-session --json --limit=20`) {
+		t.Fatalf("bd log = %q, want metadata-routed work query", out)
 	}
 }
 

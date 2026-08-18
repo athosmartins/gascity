@@ -48,20 +48,60 @@ func NewHookFiringStore(store DoltStorage, runner *hooks.Runner) *HookFiringStor
 	}
 }
 
-// Inner returns the underlying store, useful for type assertions
-// (e.g., StoreLocator, RawDBAccessor).
-func (h *HookFiringStore) Inner() DoltStorage { return h.inner }
+// Unwrapper is implemented by storage decorators that wrap an inner
+// DoltStorage. UnwrapStore uses this to peel arbitrary chains of
+// decorators (e.g. HookFiringStore wrapping telemetry.InstrumentedStorage
+// wrapping the concrete dolt store) so type assertions to optional
+// interfaces (StoreLocator, BackupStore, etc.) reach the concrete store.
+type Unwrapper interface {
+	Unwrap() DoltStorage
+}
 
-// UnwrapStore returns the underlying concrete store if s is a
-// HookFiringStore decorator, otherwise returns s unchanged.
-// Use this before type assertions to optional interfaces
-// (StoreLocator, BackupStore, Flattener, etc.) so the assertion
-// reaches the concrete store rather than the decorator.
-func UnwrapStore(s DoltStorage) DoltStorage {
-	if h, ok := s.(*HookFiringStore); ok {
-		return h.inner
+// Unwrap returns the underlying store, satisfying Unwrapper.
+func (h *HookFiringStore) Unwrap() DoltStorage { return h.inner }
+
+// RoleFiresHooks reports whether an issue role taken off a store carries this
+// decorator's hook layer — that is, whether a landed write through it runs the
+// workspace's user hook scripts.
+//
+// It is the question a caller cannot answer from the role's own type, and the
+// one a NETWORK server has to answer before it serves anything: `bd serve`
+// documents that hooks do not fire (a user-controlled subprocess per mutation
+// is an unbounded latency multiplier and an orphaned child at shutdown), and
+// the accessors on a decorated store return decorated roles by design —
+// IssueClaimer recurses precisely so a CLI claim keeps its on_update. So the
+// exact value the obvious `store.IssueClaimer()` produces on bd's own storage
+// chain is the one value that server must refuse, and this is what lets it.
+//
+// A decorator built with a nil runner still answers true. Whether hooks fire
+// on this instant's configuration is not the property: the type's contract is
+// to fire them, and a server that admitted it would be one config change away
+// from breaking its own.
+//
+// NOT ENFORCED, because the assertion is on the type: a role this decorator
+// produced and something else then wrapped is invisible here, and so is a
+// future decorator elsewhere that fires hooks of its own. Every case that
+// exists today is in the switch, and a new one belongs there too.
+func RoleFiresHooks(role any) bool {
+	switch role.(type) {
+	case *hookIssueClaimer:
+		return true
 	}
-	return s
+	return false
+}
+
+// UnwrapStore peels back any chain of Unwrapper decorators and returns
+// the innermost store. Use this before type-asserting to optional
+// interfaces (StoreLocator, BackupStore, Flattener, RawDBAccessor, etc.)
+// so the assertion reaches the concrete store rather than a decorator.
+func UnwrapStore(s DoltStorage) DoltStorage {
+	for {
+		u, ok := s.(Unwrapper)
+		if !ok {
+			return s
+		}
+		s = u.Unwrap()
+	}
 }
 
 // ── Issue mutations ─────────────────────────────────────────────────
@@ -106,6 +146,17 @@ func (h *HookFiringStore) UpdateIssue(ctx context.Context, id string, updates ma
 	return nil
 }
 
+// UpdateIssueChecked applies the guarded update (optional ExpectedVersion CAS)
+// and fires on_update on success — mirroring UpdateIssue. A version mismatch
+// (ErrVersionMismatch) or any other error returns without firing.
+func (h *HookFiringStore) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts UpdateIssueOptions) error {
+	if err := h.inner.UpdateIssueChecked(ctx, id, updates, actor, opts); err != nil {
+		return err
+	}
+	h.fireHookByID(ctx, hooks.EventUpdate, id)
+	return nil
+}
+
 // ReopenIssue reopens an issue and fires on_update.
 func (h *HookFiringStore) ReopenIssue(ctx context.Context, id string, reason string, actor string) error {
 	if err := h.inner.ReopenIssue(ctx, id, reason, actor); err != nil {
@@ -133,6 +184,19 @@ func (h *HookFiringStore) CloseIssue(ctx context.Context, id string, reason stri
 	return nil
 }
 
+// CloseIssueChecked closes an issue under the is_blocked guard and fires
+// on_close on success — mirroring CloseIssue, this includes the idempotent
+// no-op when the issue was already closed (res.Unchanged). A guard rejection
+// (ErrCloseBlocked) or any other error returns without firing.
+func (h *HookFiringStore) CloseIssueChecked(ctx context.Context, id string, actor string, opts CloseIssueOptions) (CloseIssueResult, error) {
+	res, err := h.inner.CloseIssueChecked(ctx, id, actor, opts)
+	if err != nil {
+		return res, err
+	}
+	h.fireHookByID(ctx, hooks.EventClose, id)
+	return res, nil
+}
+
 // ── Dependency mutations ────────────────────────────────────────────
 
 // AddDependency adds a dependency and fires on_update for the issue.
@@ -140,7 +204,16 @@ func (h *HookFiringStore) AddDependency(ctx context.Context, dep *types.Dependen
 	if err := h.inner.AddDependency(ctx, dep, actor); err != nil {
 		return err
 	}
-	h.fireDependencyHookByID(ctx, hooks.EventUpdate, dep.IssueID)
+	h.fireDependencyHookByID(ctx, dep.IssueID)
+	return nil
+}
+
+// AddDependencyWithOptions adds a dependency with options and fires on_update.
+func (h *HookFiringStore) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, opts DependencyAddOptions) error {
+	if err := h.inner.AddDependencyWithOptions(ctx, dep, actor, opts); err != nil {
+		return err
+	}
+	h.fireDependencyHookByID(ctx, dep.IssueID)
 	return nil
 }
 
@@ -149,7 +222,16 @@ func (h *HookFiringStore) RemoveDependency(ctx context.Context, issueID, depends
 	if err := h.inner.RemoveDependency(ctx, issueID, dependsOnID, actor); err != nil {
 		return err
 	}
-	h.fireDependencyHookByID(ctx, hooks.EventUpdate, issueID)
+	h.fireDependencyHookByID(ctx, issueID)
+	return nil
+}
+
+// RemoveDependencyWithOptions removes a dependency with options and fires on_update.
+func (h *HookFiringStore) RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts DependencyRemoveOptions) error {
+	if err := h.inner.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, opts); err != nil {
+		return err
+	}
+	h.fireDependencyHookByID(ctx, issueID)
 	return nil
 }
 
@@ -207,6 +289,26 @@ func (h *HookFiringStore) RunInTransaction(ctx context.Context, commitMsg string
 	return nil
 }
 
+// RunInIssueLifecycleTransaction tracks lifecycle hooks and fires them only
+// after the underlying lifecycle transaction commits.
+func (h *HookFiringStore) RunInIssueLifecycleTransaction(ctx context.Context, commitMsg string, fn func(tx IssueLifecycleTransaction) error) error {
+	var tracked *hookTrackingLifecycleTransaction
+	err := h.inner.RunInIssueLifecycleTransaction(ctx, commitMsg, func(tx IssueLifecycleTransaction) error {
+		tracked = &hookTrackingLifecycleTransaction{
+			hookTrackingTransaction: &hookTrackingTransaction{Transaction: tx},
+			reopener:                tx,
+		}
+		return fn(tracked)
+	})
+	if err != nil || tracked == nil {
+		return err
+	}
+	for _, p := range tracked.pending {
+		h.fireHook(p.event, p.issue)
+	}
+	return nil
+}
+
 // ── Internal helpers ────────────────────────────────────────────────
 
 func (h *HookFiringStore) fireHook(event string, issue *types.Issue) {
@@ -214,6 +316,52 @@ func (h *HookFiringStore) fireHook(event string, issue *types.Issue) {
 		return
 	}
 	h.runner.Run(event, issue)
+}
+
+// CompleteIssueOperationCreate fires hooks for a committed guarded create.
+// dependencies is a request-neutral snapshot of the dependency changes whose
+// source issues need update hooks.
+func (h *HookFiringStore) CompleteIssueOperationCreate(ctx context.Context, issue *types.Issue, dependencies []*types.Dependency) {
+	for _, pending := range createHookEvents(issue) {
+		h.fireHook(pending.event, pending.issue)
+	}
+	if h.runner == nil || len(dependencies) == 0 {
+		return
+	}
+	request := &types.Issue{Dependencies: cloneDependenciesForHook(dependencies)}
+	for _, pending := range dependencyHookEvents(ctx, []*types.Issue{request}, h.inner.GetIssue, h.inner.GetDependencyRecords) {
+		h.fireHook(pending.event, pending.issue)
+	}
+}
+
+// CompleteIssueOperationUpdate fires the update hook for a committed guarded
+// operation. The issue is cloned because the hook runner marshals it on its
+// own goroutine while callers (cmd/bd close/update/reopen) go on to mutate
+// the result they handed in.
+func (h *HookFiringStore) CompleteIssueOperationUpdate(issue *types.Issue) {
+	h.fireHook(hooks.EventUpdate, cloneIssueForHook(issue))
+}
+
+// CompleteIssueOperationClose fires the close hook for a committed guarded
+// close. Cloned for the same reason as CompleteIssueOperationUpdate.
+func (h *HookFiringStore) CompleteIssueOperationClose(issue *types.Issue) {
+	h.fireHook(hooks.EventClose, cloneIssueForHook(issue))
+}
+
+// CompleteIssueOperationDependency fires the update hook for an issue whose
+// edges a committed guarded edit changed. It re-reads the issue with its
+// dependency records, exactly as AddDependency and RemoveDependency do, so a
+// hook script sees the graph the edit produced rather than the row alone.
+func (h *HookFiringStore) CompleteIssueOperationDependency(ctx context.Context, issueID string) {
+	h.fireDependencyHookByID(ctx, issueID)
+}
+
+// CompleteIssueOperationComment fires the update hook for a committed guarded
+// comment, which is the event AddIssueComment fires: there is no on_comment
+// event, and a comment is a change to the issue as far as a script is
+// concerned.
+func (h *HookFiringStore) CompleteIssueOperationComment(ctx context.Context, issueID string) {
+	h.fireHookByID(ctx, hooks.EventUpdate, issueID)
 }
 
 func (h *HookFiringStore) fireHookByID(ctx context.Context, event, id string) {
@@ -227,7 +375,7 @@ func (h *HookFiringStore) fireHookByID(ctx context.Context, event, id string) {
 	h.runner.Run(event, issue)
 }
 
-func (h *HookFiringStore) fireDependencyHookByID(ctx context.Context, event, id string) {
+func (h *HookFiringStore) fireDependencyHookByID(ctx context.Context, id string) {
 	if h.runner == nil {
 		return
 	}
@@ -235,7 +383,7 @@ func (h *HookFiringStore) fireDependencyHookByID(ctx context.Context, event, id 
 	if err != nil {
 		return
 	}
-	h.runner.Run(event, issue)
+	h.runner.Run(hooks.EventUpdate, issue)
 }
 
 // ── Hook tracking transaction ───────────────────────────────────────
@@ -378,7 +526,10 @@ func cloneIssueForHook(issue *types.Issue) *types.Issue {
 	clone.ClosedAt = clonePtr(issue.ClosedAt)
 	clone.DueAt = clonePtr(issue.DueAt)
 	clone.DeferUntil = clonePtr(issue.DeferUntil)
+	clone.LeaseExpiresAt = clonePtr(issue.LeaseExpiresAt)
+	clone.HeartbeatAt = clonePtr(issue.HeartbeatAt)
 	clone.ExternalRef = clonePtr(issue.ExternalRef)
+	clone.WispPlaneOverride = clonePtr(issue.WispPlaneOverride)
 	clone.Labels = append([]string(nil), issue.Labels...)
 	clone.Metadata = append([]byte(nil), issue.Metadata...)
 	clone.CompactedAt = clonePtr(issue.CompactedAt)
@@ -469,6 +620,22 @@ func (t *hookTrackingTransaction) CloseIssue(ctx context.Context, id string, rea
 	return nil
 }
 
+type hookTrackingLifecycleTransaction struct {
+	*hookTrackingTransaction
+	reopener IssueLifecycleTransaction
+}
+
+func (t *hookTrackingLifecycleTransaction) ReopenIssueWithResult(ctx context.Context, id string, reason string, actor string) (bool, error) {
+	changed, err := t.reopener.ReopenIssueWithResult(ctx, id, reason, actor)
+	if err != nil || !changed {
+		return changed, err
+	}
+	if issue, getErr := t.Transaction.GetIssue(ctx, id); getErr == nil {
+		t.pending = append(t.pending, pendingHook{hooks.EventUpdate, issue})
+	}
+	return true, nil
+}
+
 func (t *hookTrackingTransaction) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
 	return t.AddDependencyWithOptions(ctx, dep, actor, DependencyAddOptions{})
 }
@@ -484,7 +651,11 @@ func (t *hookTrackingTransaction) AddDependencyWithOptions(ctx context.Context, 
 }
 
 func (t *hookTrackingTransaction) RemoveDependency(ctx context.Context, issueID, dependsOnID string, actor string) error {
-	if err := t.Transaction.RemoveDependency(ctx, issueID, dependsOnID, actor); err != nil {
+	return t.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, DependencyRemoveOptions{})
+}
+
+func (t *hookTrackingTransaction) RemoveDependencyWithOptions(ctx context.Context, issueID, dependsOnID string, actor string, opts DependencyRemoveOptions) error {
+	if err := t.Transaction.RemoveDependencyWithOptions(ctx, issueID, dependsOnID, actor, opts); err != nil {
 		return err
 	}
 	if issue, err := dependencySnapshot(ctx, issueID, t.Transaction.GetIssue, t.Transaction.GetDependencyRecords); err == nil {
@@ -541,6 +712,9 @@ var (
 	} = (*HookFiringStore)(nil)
 	_ interface {
 		UpdateIssue(context.Context, string, map[string]interface{}, string) error
+	} = (*HookFiringStore)(nil)
+	_ interface {
+		UpdateIssueChecked(context.Context, string, map[string]interface{}, string, UpdateIssueOptions) error
 	} = (*HookFiringStore)(nil)
 	_ interface {
 		CloseIssue(context.Context, string, string, string, string) error

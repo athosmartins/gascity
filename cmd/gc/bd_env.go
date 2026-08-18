@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
@@ -687,6 +688,176 @@ var recoverManagedBDCommand = func(cityPath string) error {
 	return runProviderOpWithEnv(script, environ, "recover")
 }
 
+// recoverManagedBDCommandCooldown is the minimum interval between
+// consecutive recoverManagedBDCommand attempts triggered by the
+// reactive bd-command-failure retry path (bdCommandRunnerWithManagedRetryErr).
+// 30s deliberately matches providerRecoverCooldown's precedent value
+// (beads_provider_lifecycle.go, issue #2792) for the *other* recover
+// trigger (env-setup/healthBeadsProvider): long enough to span the bd
+// breaker cooldown plus dolt startup, short enough that a genuinely-down
+// server still gets retried soon. Deliberately a separate var rather
+// than a call to providerRecoverCooldown(): the two gates protect
+// different trigger paths, and sharing one stub would let a test for
+// either silently change the other's behavior. Stubbable for tests.
+var recoverManagedBDCommandCooldown = func() time.Duration { return 30 * time.Second }
+
+// recoverManagedBDCommandGateNow is the clock recoverManagedBDCommandAllowed
+// uses to evaluate recoverManagedBDCommandCooldown. Stubbable for tests,
+// mirroring providerRecoverNow.
+var recoverManagedBDCommandGateNow = time.Now
+
+// recoverManagedBDCommandGateFileName is the cooldown-stamp file's
+// basename, held in the same managed-dolt pack-state directory as
+// dolt.lock (see resolveManagedDoltRuntimeLayout's PackStateDir).
+const recoverManagedBDCommandGateFileName = "recover-managed-bd-trigger.stamp"
+
+// recoverManagedBDCommandAllowed reports whether the reactive bd-failure
+// retry path may attempt a new recoverManagedBDCommand call right now,
+// and atomically records the attempt (advancing the cooldown window) if
+// so.
+//
+// ga-a1xsn: under CPU saturation, every failing `bd` transport call
+// independently forked its own `gc-beads-bd.sh recover` -> `gc
+// dolt-state recover-managed` process — 12 observed simultaneously live
+// in production. recoverManagedDoltProcess already serializes the
+// *destructive* stop/start step via a flock (dolt_lifecycle_lock.go),
+// but a losing process does not bail: it still forks, then busy-polls
+// the already-struggling server every 250ms for up to 30s
+// (waitForManagedDoltLifecycleOrReady) — that polling-under-load is
+// itself an amplifier, regardless of whether the winner's own recovery
+// turns out to be destructive or a same-process no-op. That flock is a
+// legitimate, deliberately-tested mutual-exclusion primitive for the
+// stop/start action itself (see
+// TestRecoverManagedDoltProcessReturnsWhenConcurrentStarterBecomesReady)
+// and is left untouched here; this gate instead stops the amplification
+// one layer up, before the fork even happens — mirroring the
+// check-then-bail idiom scripts/dolt-latency-alarm.sh already uses
+// (atomic mkdir; a losing run exits immediately instead of waiting) and
+// the cooldown healthBeadsProvider already applies to its own, separate
+// recover trigger (env-setup path: lastBeadsProviderRecover /
+// providerRecoverCooldown). That pair cannot help here — it is a
+// process-local sync.Map, so it does nothing across the N independent
+// `gc`/`bd` OS processes a saturation spike produces. This gate persists
+// its timestamp to a file under a fast, non-blocking flock (reusing
+// tryManagedDoltLifecycleLock/releaseManagedDoltLifecycleLock as-is) so
+// the cooldown holds across processes, not just goroutines.
+//
+// Returns true (gate open, caller should proceed) for the first call to
+// pass the cooldown window; every other concurrent or near-concurrent
+// caller gets false immediately — no fork, no filesystem/network wait
+// beyond this function's own flock+read+write, a microseconds-long
+// critical section. A denied caller still gets its own retry against
+// freshly-resolved env immediately afterward (unchanged, see
+// bdCommandRunnerWithManagedRetryErr) — it is not left to fail outright,
+// only spared from independently forking its own recovery attempt.
+//
+// Fails open (returns true) on any error resolving or touching the gate
+// file: this gate exists to suppress amplification, not to become a new,
+// silent way for recovery to stop happening altogether.
+func recoverManagedBDCommandAllowed(cityPath string) bool {
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		return true
+	}
+	gatePath := filepath.Join(layout.PackStateDir, recoverManagedBDCommandGateFileName)
+	if err := os.MkdirAll(filepath.Dir(gatePath), 0o755); err != nil {
+		return true
+	}
+	f, err := os.OpenFile(gatePath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return true
+	}
+	locked, lockErr := tryManagedDoltLifecycleLock(f)
+	if lockErr != nil || !locked {
+		_ = f.Close()
+		return false
+	}
+	defer releaseManagedDoltLifecycleLock(f)
+
+	now := recoverManagedBDCommandGateNow()
+	if raw, readErr := io.ReadAll(f); readErr == nil {
+		if last, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw))); parseErr == nil {
+			if now.Sub(last) < recoverManagedBDCommandCooldown() {
+				return false
+			}
+		}
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return true
+	}
+	if err := f.Truncate(0); err != nil {
+		return true
+	}
+	if _, err := f.WriteString(now.Format(time.RFC3339Nano)); err != nil {
+		return true
+	}
+	return true
+}
+
+// recoverManagedDoltCPUSaturationPctDefault mirrors
+// scripts/dolt-hang-watchdog.sh's own CPU_ALIVE_PCT default: >=20% CPU on
+// the managed dolt sql-server process means it is doing work, not
+// deadlocked or down.
+const recoverManagedDoltCPUSaturationPctDefault = 20.0
+
+// recoverManagedDoltCPUSaturationPct resolves the CPU-saturation threshold,
+// overridable via GC_RECOVER_MANAGED_CPU_SATURATION_PCT. Deliberately a
+// separate knob from the shell watchdog's DOLT_WATCHDOG_CPU_ALIVE_PCT --
+// same reasoning as recoverManagedBDCommandCooldown's doc comment above:
+// sharing one dial would let tuning one trigger path silently change the
+// other's behavior.
+func recoverManagedDoltCPUSaturationPct() float64 {
+	raw := strings.TrimSpace(os.Getenv("GC_RECOVER_MANAGED_CPU_SATURATION_PCT"))
+	if raw == "" {
+		return recoverManagedDoltCPUSaturationPctDefault
+	}
+	pct, err := strconv.ParseFloat(raw, 64)
+	if err != nil || pct <= 0 {
+		return recoverManagedDoltCPUSaturationPctDefault
+	}
+	return pct
+}
+
+// recoverManagedDoltProcessCPUPercent is stubbable for tests.
+var recoverManagedDoltProcessCPUPercent = doltProcessCPUPercentFromPS
+
+// recoverManagedDoltAppearsSaturatedNotDown reports whether the failure
+// that triggered this recovery attempt more likely reflects a
+// CPU-saturated-but-alive managed Dolt than a genuinely down/hung one --
+// mirroring scripts/dolt-hang-watchdog.sh's
+// dolt_actually_serving()/dolt_cpu_pct() "saturation, NOT a hang"
+// discriminator (that script vetoes its own restart decision the same way).
+//
+// ga-a1xsn item 4 ("o mais importante" per the incident writeup): a
+// saturated-but-alive Dolt has nothing to recover -- there is no stopped
+// process to restart -- and forking + polling recoverManagedBDCommand only
+// adds load to the exact resource that is already scarce, worsening the
+// saturation it was meant to relieve. This check runs BEFORE
+// recoverManagedBDCommandAllowed (and that gate's side-effecting
+// cooldown-stamp write) deliberately: a call this function vetoes must not
+// spend the cooldown window that a genuine future outage will need.
+//
+// Fails toward allowing recovery (returns false = "not detectably
+// saturated") whenever the PID or its CPU% cannot be resolved -- the same
+// "fails open" bias as recoverManagedBDCommandAllowed: this check exists to
+// suppress amplification under a *confirmed* saturation reading, not to
+// become a new, silent way for genuine recovery to stop happening.
+func recoverManagedDoltAppearsSaturatedNotDown(cityPath string) bool {
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		return false
+	}
+	pid := managedPIDFromPIDFile(layout.PIDFile)
+	if pid <= 0 {
+		return false
+	}
+	pct, err := recoverManagedDoltProcessCPUPercent(pid, processArgsPSTimeout)
+	if err != nil {
+		return false
+	}
+	return pct >= recoverManagedDoltCPUSaturationPct()
+}
+
 func setProjectedDoltEnvEmpty(env map[string]string) {
 	for _, key := range projectedDoltEnvKeys {
 		env[key] = ""
@@ -1005,8 +1176,16 @@ func bdCommandRunnerWithManagedRetryErr(cityPath string, envFn func(dir string) 
 			return out, err
 		}
 		if bdTransportRecoverableError(cityPath, dir, env, err) {
-			if recErr := recoverManagedBDCommand(cityPath); recErr != nil {
-				return out, err
+			// ga-a1xsn: gate the fork itself, not just the destructive
+			// action inside it — see recoverManagedBDCommandAllowed.
+			// Check saturation-not-down FIRST (cheap, no side effects) so
+			// a vetoed attempt never spends the cooldown window that a
+			// genuine future outage will need — see
+			// recoverManagedDoltAppearsSaturatedNotDown's doc comment.
+			if !recoverManagedDoltAppearsSaturatedNotDown(cityPath) && recoverManagedBDCommandAllowed(cityPath) {
+				if recErr := recoverManagedBDCommand(cityPath); recErr != nil {
+					return out, err
+				}
 			}
 		}
 		retryEnv, retryEnvErr := envFn(dir)

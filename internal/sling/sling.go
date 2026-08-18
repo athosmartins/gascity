@@ -150,6 +150,7 @@ type SlingResult struct {
 	// Structured warnings (callers decide how to display).
 	AgentSuspended bool     // target agent is suspended
 	PoolEmpty      bool     // pool max=0
+	TargetImplicit bool     // target is an auto-synthesized provider-derived agent (see config.Agent.Implicit), not one anyone explicitly configured as a worker
 	AutoBurned     []string // IDs of auto-burned stale molecules
 	MetadataErrors []string // non-fatal metadata write failures
 	BeadWarnings   []string // pre-flight bead state warnings

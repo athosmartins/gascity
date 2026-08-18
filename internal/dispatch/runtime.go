@@ -672,6 +672,16 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 	// next serve cycle will retry. Source-chain propagation is preflighted first
 	// so retryable scan failures keep the root live for singleton scans, but
 	// source beads are not mutated until the root is durably closed.
+	//
+	// Exception: a graph.v2 formula's root is itself blocked on the finalize
+	// bead (see the ga-ex1b4i comment below), so for that shape this first
+	// attempt deterministically fails and the code falls back to closing the
+	// finalizer first after all. The crash-safety property above still holds
+	// for every OTHER close failure on this first attempt (the finalizer
+	// stays open, untouched, for the next serve cycle to retry); it is only
+	// narrowed — to the window between the fallback's two writes — for this
+	// one self-inflicted, deterministic case.
+	finalizerClosed := false
 	if err := setOutcomeAndClose(store, rootID, outcome); err != nil {
 		if errors.Is(err, beads.ErrNotFound) {
 			if closeErr := setOutcomeAndClose(store, bead.ID, "missing_root"); closeErr != nil {
@@ -679,15 +689,44 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 			}
 			return ControlResult{Processed: true, Action: "workflow-missing_root"}, nil
 		}
-		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow head: %w", rootID, err))
+		// ga-ex1b4i / ga-3ef27l: for a graph.v2 formula, addWorkflowRootDeps
+		// (internal/formula/compile.go) gives the workflow root exactly ONE
+		// close-blocking dependency: a "blocks" edge onto its own
+		// workflow-finalize step. That step is THIS bead, and closing it is
+		// something this function only does further down its own success
+		// path — so it is unconditionally still open right here, and the
+		// FIRST root-close attempt always loses the beads store's live-blocker
+		// guard (storage.ErrCloseBlocked: "cannot close blocked issue: <root>
+		// is blocked by [<this finalizer>]"). This is not a rare timing race;
+		// it is a guaranteed self-deadlock on attempt 1 for every graph.v2
+		// workflow-finalize step, every time. It is also entirely
+		// self-resolving: closing this finalizer (its own outcome is always
+		// "pass", independent of the workflow outcome) is exactly what clears
+		// the only blocker, so one retry right after that close is enough —
+		// no open-ended loop. Any other close failure (real infra error, some
+		// dependency this finalizer did not itself create) does not match the
+		// signature below and falls through to the existing hard-failure path
+		// unchanged.
+		if !rootCloseBlockedByOwnFinalizer(err, bead.ID) {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow head: %w", rootID, err))
+		}
+		if closeErr := setOutcomeAndClose(store, bead.ID, "pass"); closeErr != nil {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing self-blocking finalizer ahead of root retry: %w", bead.ID, closeErr))
+		}
+		finalizerClosed = true
+		if retryErr := setOutcomeAndClose(store, rootID, outcome); retryErr != nil {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow head after closing self-blocking finalizer: %w", rootID, retryErr))
+		}
 	}
 	if outcome == "pass" {
 		if err := closeSourceBeadChain(store, rootID, opts); err != nil {
 			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing source bead chain: %w", rootID, err))
 		}
 	}
-	if err := setOutcomeAndClose(store, bead.ID, "pass"); err != nil {
-		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow finalizer: %w", bead.ID, err))
+	if !finalizerClosed {
+		if err := setOutcomeAndClose(store, bead.ID, "pass"); err != nil {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow finalizer: %w", bead.ID, err))
+		}
 	}
 
 	// Purge the molecule-scoped artifact tree now that the workflow has
@@ -703,6 +742,27 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 	}
 
 	return ControlResult{Processed: true, Action: "workflow-" + outcome}, nil
+}
+
+// rootCloseBlockedByOwnFinalizer reports whether err is the beads store's
+// live-blocker close refusal AND names finalizerID as the (sole) blocker.
+// Matched on text rather than errors.Is for the same reason
+// IsTransientControllerError is: by the time an error from a generic Update
+// crosses the third_party/beads storage boundary into this package it is
+// opaque wrapped text (internal/beads does not currently re-export
+// storage.ErrCloseBlocked as a sentinel). The prefix is the literal, stable
+// sentinel string (third_party/beads/internal/storage/issueops/errors.go:
+// ErrCloseBlocked = errors.New("cannot close blocked issue")), and the live
+// direct blockers are formatted straight into the message
+// (.../issueops/close.go: fmt.Errorf("%w: %s is blocked by %v", ...)), so
+// requiring both substrings confirms finalizerID specifically is named as a
+// blocker rather than matching some unrelated blocked-close error.
+func rootCloseBlockedByOwnFinalizer(err error, finalizerID string) bool {
+	if err == nil || finalizerID == "" {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "cannot close blocked issue") && strings.Contains(msg, finalizerID)
 }
 
 func preflightSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions) error {

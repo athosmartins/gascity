@@ -1725,7 +1725,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=1`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
@@ -1747,7 +1747,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=1`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
@@ -1875,8 +1875,15 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	got := a.EffectiveAssignedInProgressQuery()
 	for _, want := range []string{
 		`"$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"`,
-		`bd list --status in_progress --assignee="$id" --json --limit=1`,
+		`bd list --status in_progress --assignee="$id" --json --limit=20`,
 		`ephemeral=true AND status=in_progress`,
+		// ga-ael6v: the assigned-in-progress ("crash recovery") tier must apply
+		// the same pool:refused:*/pilot:held* prefix filter as the routed-pool
+		// tier (ga-g7yt/ga-y8qh) — otherwise a bead a prior session already
+		// refused gets reassigned to a fresh session by inflight-reclaim-guard
+		// and is re-offered as if it were live work to resume.
+		`startswith("pool:refused")`,
+		`startswith("pilot:held")`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveAssignedInProgressQuery() missing assigned recovery fragment %q: %q", want, got)
@@ -1891,12 +1898,39 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=1") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
   *) printf '[]' ;;
 esac
 `)
 	if strings.TrimSpace(out) != `[{"id":"assigned-in-progress","ephemeral":true}]` {
 		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want assigned in-progress work", out)
+	}
+}
+
+// TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead (ga-ael6v): the
+// bug's own acceptance bar is empirical, not textual — "a bead with
+// pool:refused:* does not appear in Step 1a, proven by observation, not by
+// reading the filter." This drives a real bead-shaped payload (carrying the
+// label a prior session's refusal would have left behind) through the actual
+// generated shell command via a fake `bd`, and asserts the bead does NOT come
+// back — reproducing the ga-9ae7o incident (reassigned-after-refusal bead
+// resurfacing to a fresh dog session) as a regression test.
+func TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedInProgressQuery()
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_ID": "worker-bead",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+  "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[]` {
+		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want [] (pool:refused bead must not be re-offered)", out)
 	}
 }
 
@@ -1926,6 +1960,13 @@ func TestEffectiveRoutedPoolQueryDefault(t *testing.T) {
 		`hello-world/worker`,
 		`gc.routed_to`,
 		`gc.run_target`,
+		// ga-nf4x5: story:needs-human's sibling merit/legal-approval gate must be
+		// excluded from routed-pool candidacy the same way — a bead awaiting
+		// Athos's sign-off is not a code-build story regardless of ctx:ready/exec:auto.
+		`--exclude-label "story:needs-approval"`,
+		// ga-7ha7g: exact-match half of the epic-authoring-mismatch gap — see
+		// TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic.
+		`--exclude-label "story:epic"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveRoutedPoolQuery() missing routed pool fragment %q: %q", want, got)
@@ -1941,6 +1982,107 @@ esac
 `)
 	if strings.TrimSpace(out) != `[{"id":"routed-pool"}]` {
 		t.Fatalf("EffectiveRoutedPoolQuery() output = %q, want routed pool work", out)
+	}
+}
+
+// TestBdReadyPoolDemandExcludeLabelArgsIncludesNeedsApproval (ga-nf4x5, SECURITY):
+// story:needs-approval is the Athos MERIT/legal sign-off gate — distinct from
+// story:needs-human (an INFO-GAP) but must be excluded from routed-pool dispatch
+// candidacy the same way. Near-miss: wa-6xn82 (a real LAI legal filing) carried
+// story:needs-approval and was still dispatched to the wa-worker pool with "No
+// human review required" before a worker happened to read the comment and refuse
+// by hand. This is the function that generates the dog's routed-pool probe (the
+// wa-worker/ps-worker probes carry the equivalent exclusion hardcoded in their own
+// prompt.template.md — see pilot-dispatcher.selftest.sh Scenario ga-nf4x5).
+func TestBdReadyPoolDemandExcludeLabelArgsIncludesNeedsApproval(t *testing.T) {
+	got := bdReadyPoolDemandExcludeLabelArgs()
+	for _, want := range []string{
+		`--exclude-label "story:needs-human"`,
+		`--exclude-label "story:needs-approval"`,
+		`--exclude-label "ctx:thin"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
+		}
+	}
+}
+
+// TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic (ga-7ha7g): story:epic
+// is the exact-match half of the epic-authoring-mismatch gap — --exclude-type=epic
+// only checks issue_type, but bead authors routinely label (and/or title, see
+// poolDemandLabelFilterJQ for that half) a bead as an epic without setting
+// issue_type=epic. Confirmed live: ga-9pyg2 (issue_type=task, label story:epic,
+// title "ÉPICO: migração v55 do engine..." — required a Mayor-coordinated engine
+// rebuild, exactly the class of work a pool worker must never execute off its own
+// hook per ga-vhyd).
+func TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic(t *testing.T) {
+	got := bdReadyPoolDemandExcludeLabelArgs()
+	if !strings.Contains(got, `--exclude-label "story:epic"`) {
+		t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing --exclude-label \"story:epic\"", got)
+	}
+}
+
+// TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels
+// (ga-5huvs): needs:engine-window, pilot:no-auto-dispatch, and story:blocked
+// are established town-wide park labels — context_check_is_parked() in
+// context-check-dispatcher.sh already recognizes all three (ga-7mbry/ga-ipm4)
+// — but were missing from the dog pool's own exact-match exclude list here.
+// Live-reproduced on ga-9kjzz: a bead whose fix was fully written, tested,
+// committed, pushed, AND labeled needs:engine-window at 07:16 still
+// re-surfaced as unassigned/ready dog-pool work four separate times over the
+// following 5h20m (dog-garsibd, dog-ga6shkr x2, dog-gao05od) — each
+// occurrence costing a full session's re-investigation before it could
+// re-conclude "nothing left for a dog to do here."
+func TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels(t *testing.T) {
+	got := bdReadyPoolDemandExcludeLabelArgs()
+	for _, want := range []string{
+		`--exclude-label "needs:engine-window"`,
+		`--exclude-label "pilot:no-auto-dispatch"`,
+		`--exclude-label "story:blocked"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
+		}
+	}
+}
+
+// TestPoolDemandLabelFilterJQExcludesParkLabels (ga-5huvs) is the PREFIX half
+// of the same fix: blocked:<reason>, pilot:refused-reason:<slug>, and
+// gate:needs-human(:<reason>) cannot be expressed via bd's exact-match
+// --exclude-label, so poolDemandLabelFilterJQ must exclude them the same way
+// it already excludes pool:refused:*/pilot:held* — mirroring
+// context_check_is_parked()'s coverage (ga-7mbry). Negative control:
+// blocked-by:<id> is a DIFFERENT label family (points at what blocks a bead,
+// not "this bead IS blocked") and must survive — same colon-only discipline
+// context-check-dispatcher.sh's own guard uses to avoid over-matching it.
+func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; poolDemandLabelFilterJQ is a jq pipeline")
+	}
+
+	// needs:engine-window is deliberately NOT a case here — it's exact-match,
+	// so it's filtered by bd's own --exclude-label (bdReadyPoolDemandExcludeLabelArgs,
+	// covered by TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels)
+	// before this jq filter ever sees the bead, not by poolDemandLabelFilterJQ itself.
+	input := `[{"id":"blocked-reason","labels":["blocked:external-quota-motherduck"]},{"id":"refused-reason","labels":["pilot:refused-reason:oracle-named-executor"]},{"id":"gate-bare","labels":["gate:needs-human"]},{"id":"gate-suffixed","labels":["gate:needs-human:technical"]},{"id":"blocked-by-survives","labels":["blocked-by:wa-10srb"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
+
+	shellCmd := "printf '%s' '" + input + "' | " + poolDemandLabelFilterJQ()
+	cmd := exec.Command("sh", "-c", shellCmd)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run poolDemandLabelFilterJQ: %v", err)
+	}
+
+	got := strings.TrimSpace(string(out))
+	for _, wantAbsent := range []string{`"blocked-reason"`, `"refused-reason"`, `"gate-bare"`, `"gate-suffixed"`} {
+		if strings.Contains(got, wantAbsent) {
+			t.Errorf("poolDemandLabelFilterJQ() output = %s, must not contain park-labeled id %s", got, wantAbsent)
+		}
+	}
+	for _, wantPresent := range []string{`"blocked-by-survives"`, `"clean-survives"`} {
+		if !strings.Contains(got, wantPresent) {
+			t.Errorf("poolDemandLabelFilterJQ() output = %s, missing non-parked id %s (over-matched)", got, wantPresent)
+		}
 	}
 }
 
@@ -2120,13 +2262,13 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -2155,7 +2297,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit=1")
+  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --exclude-label story:epic --exclude-label needs:engine-window --exclude-label pilot:no-auto-dispatch --exclude-label story:blocked --json --sort oldest --limit=20")
     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
     ;;
   *)
@@ -2200,7 +2342,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
     ;;
   *)
@@ -2216,6 +2358,39 @@ esac
 	}
 }
 
+// TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead is the ga-w4k2z
+// regression: a bead that keeps getting reclaimed has its updated_at bumped by
+// every reclaim but NOT its created_at, so a naive .[0:1] off the
+// created_at-sorted survivor list re-offers the exact same poisoned head to
+// every dog that polls, starving every newer bead behind it forever (measured
+// live: 13 candidates spanning ~36h, only the head ever served). The fix
+// re-ranks survivors by updated_at before taking the head, so a bead that was
+// JUST reclaimed (updated_at freshly bumped) sorts behind a bead nobody has
+// touched since creation (updated_at == created_at), even though the
+// just-reclaimed bead is older by created_at.
+func TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+    printf '[{"id":"older-just-reclaimed","priority":2,"created_at":"2026-05-20T06:09:30Z","updated_at":"2026-05-20T09:59:00Z"},{"id":"newer-never-touched","priority":2,"created_at":"2026-05-20T08:00:00Z","updated_at":"2026-05-20T08:00:00Z"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "newer-never-touched") {
+		t.Fatalf("EffectiveWorkQuery() did not skip the recently-reclaimed head for an untouched younger survivor: %q", out)
+	}
+	if strings.Contains(out, "older-just-reclaimed") {
+		t.Fatalf("EffectiveWorkQuery() re-offered the just-reclaimed head instead of the least-recently-updated survivor: %q", out)
+	}
+}
+
 func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	out := runEffectiveWorkQuery(t, a, map[string]string{
@@ -2223,7 +2398,7 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[]'
     ;;
   *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
@@ -2271,7 +2446,7 @@ func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
 	wantPresent := []string{
 		// routed/pool tier still excludes epics (gc-udx guard)
-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json`,
+		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
 		// assigned tiers carry NO epic exclusion
 		`bd list --status in_progress --assignee="$id" --json`,
 		`bd ready --assignee="$id" --json`,
@@ -2297,7 +2472,7 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	got := a.EffectiveWorkQuery()
 	wantPresent := []string{
-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json`,
+		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --json`,
 		`bd list --status in_progress --assignee="$cand" --json`,
 		`bd ready --assignee="$cand" --json`,
 		`-- gascity/control-dispatcher gascity/workflow-control`,
@@ -2391,6 +2566,80 @@ esac
 	}
 	if strings.Contains(out, "parent-epic") {
 		t.Fatalf("EffectiveWorkQuery() surfaced the parent epic to the worker: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedPoolExcludesEpicTitledBead (ga-7ha7g): the
+// pool-probe's --exclude-type=epic only checks issue_type — bead authors
+// routinely title a bead as an epic (Portuguese "ÉPICO:", English "EPIC:")
+// without setting issue_type=epic, so a task-typed bead titled this way can
+// still reach the routed pool and be autonomously executed by a worker that
+// has no epic-scale authority. Confirmed live: ga-9pyg2 (issue_type=task,
+// title "ÉPICO: migração v55...", also labeled story:epic — required a
+// Mayor-coordinated engine rebuild, exactly the class of work a pool worker
+// must never execute off its own hook) and gh-ai2 (issue_type=task, title
+// "EPIC: migrar crew GT...", no story:epic label at all — the title-only
+// case only the jq clause below can catch). The fake bd here deliberately
+// ignores --exclude-label (it is a dumb stub matched on --exclude-type=epic
+// only) so this test isolates the NEW poolDemandLabelFilterJQ title-regex
+// clause specifically, independent of bd's own --exclude-label behavior
+// (already covered by TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic).
+func TestEffectiveWorkQueryRoutedPoolExcludesEpicTitledBead(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; pool-demand label filter is a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	env := map[string]string{"GC_SESSION_ORIGIN": "ephemeral"}
+
+	portuguese := runEffectiveWorkQuery(t, a, env, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*"--exclude-type=epic"*)
+    printf '[{"id":"epico-mismatch","issue_type":"task","title":"ÉPICO: migração v55 do engine"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.Contains(portuguese, "epico-mismatch") {
+		t.Fatalf("EffectiveWorkQuery() surfaced a task-typed bead titled \"ÉPICO: ...\" to the routed pool: %q", portuguese)
+	}
+
+	english := runEffectiveWorkQuery(t, a, env, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*"--exclude-type=epic"*)
+    printf '[{"id":"epic-mismatch","issue_type":"task","title":"EPIC: migrar crew GT -> agentes gc"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.Contains(english, "epic-mismatch") {
+		t.Fatalf("EffectiveWorkQuery() surfaced a task-typed bead titled \"EPIC: ...\" to the routed pool: %q", english)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedPoolTitleFilterDoesNotOvermatch (ga-7ha7g): the
+// new title-regex clause is anchored (^(EPIC|ÉPICO)[:\s]) specifically so it
+// does not reject a bead whose title merely contains "epic" outside the
+// leading-prefix position — e.g. this very bug report about the gap itself.
+func TestEffectiveWorkQueryRoutedPoolTitleFilterDoesNotOvermatch(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; pool-demand label filter is a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*"--exclude-type=epic"*)
+    printf '[{"id":"safe-task","issue_type":"task","title":"Pool-probe epic-exclusion checks issue_type only"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "safe-task") {
+		t.Fatalf("EffectiveWorkQuery() over-matched and dropped a title that only mentions \"epic\" mid-sentence: %q", out)
 	}
 }
 
@@ -2620,9 +2869,32 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wq := tt.agent.EffectiveWorkQuery()
 			demand := tt.agent.EffectivePoolDemandQuery()
-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=1", false)
+			// ga-g7yt: the first-row probe now asks for a WINDOW (--limit=20) and
+			// takes the first survivor AFTER the label filter, because --limit=1
+			// then filter is a trap — a parked/held oldest row hides real work
+			// behind it. The shared predicate is still bdReadyPoolDemandShell; only
+			// the limit changed.
+			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=20", false)
 			if !strings.Contains(wq, workPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
+			}
+			// ga-g7yt regression guard: BOTH the worker probe and the reconciler
+			// count must carry the pool:refused:* / pilot:held* prefix filter, or
+			// they disagree — the reconciler counts a parked bead as demand and
+			// spawns a pool for work no worker may claim (the ~17-dog-sessions/11h
+			// churn on ga-66wc). Assert the filter's signature is present in both.
+			for _, hay := range []struct {
+				name, s string
+			}{{"EffectiveWorkQuery", wq}, {"EffectivePoolDemandQuery", demand}} {
+				if !strings.Contains(hay.s, `startswith("pool:refused")`) {
+					t.Errorf("%s() missing pool:refused prefix filter in %q", hay.name, hay.s)
+				}
+				if !strings.Contains(hay.s, `startswith("pilot:held")`) {
+					t.Errorf("%s() missing pilot:held prefix filter in %q", hay.name, hay.s)
+				}
+				if !strings.Contains(hay.s, `--exclude-label "needs-human"`) {
+					t.Errorf("%s() missing needs-human exact exclusion in %q", hay.name, hay.s)
+				}
 			}
 			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit=20", false)
 			if !strings.Contains(wq, migrationWorkPredicate) {
@@ -2789,6 +3061,86 @@ esac
 				if demandOut == "0" {
 					t.Errorf("EffectivePoolDemandQuery output = %q, want >0 when work_query reports work", demandOut)
 				}
+			}
+		})
+	}
+}
+
+// TestPoolDemandLegacyTiersFilterPoolRefused is the regression test for
+// ga-zgfxx / ga-avvu2 AC1. bdReadyPoolDemandShell/routedReadyTierCommand (the
+// PRIMARY tier) already applies poolDemandLabelFilterJQ (ga-g7yt), but the two
+// LEGACY fallback tiers assembled by poolDemandFirstRowFunctionScript and
+// poolDemandCountShell — bdReadyPoolDemandMigrationShell (the gc.run_target
+// migration probe) and legacyEphemeralPoolDemandShell (the ephemeral wisp
+// probe) — did not apply it. A bead already refused with
+// pool:refused:<reason> could still surface through either legacy tier and
+// be reclaimed/re-dispatched by a worker that had already decided against
+// it. Confirmed live 2026-08-06 through 2026-08-08 across 4 dog sessions and
+// 3 Pilot dispatches on the same bug (ga-elvua/ga-dr5mv/ga-rbce8) before
+// being parked behind ga-s2eri.
+//
+// Both EffectiveWorkQuery (worker claim path) and EffectivePoolDemandQuery
+// (reconciler spawn-count path) must agree, per the same protocol-mismatch
+// class TestPoolDemandPredicateSharedWithWorkQuery guards for the primary
+// tier — otherwise the reconciler counts a refused bead as demand and spawns
+// a worker for something no worker may claim.
+func TestPoolDemandLegacyTiersFilterPoolRefused(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; legacy tiers exercise a jq pipeline")
+	}
+	agent := Agent{Name: "worker", Dir: "hello-world"}
+	target := "hello-world/worker"
+
+	cases := []struct {
+		name     string
+		bdScript string
+	}{
+		{
+			name: "migration tier (gc.run_target) leaks a pool:refused bead",
+			bdScript: `#!/bin/sh
+case "$*" in
+  *"--metadata-field gc.routed_to=` + target + `"*)
+    printf '[]'
+    ;;
+  *"--metadata-field gc.run_target=` + target + `"*"--metadata-field gc.kind=workflow"*)
+    printf '[{"id":"legacy-refused","metadata":{"gc.routed_to":""},"labels":["pool:refused:engine-rebuild-required"]}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`,
+		},
+		{
+			name: "ephemeral tier (bd query) leaks a pool:refused wisp",
+			bdScript: `#!/bin/sh
+case "$*" in
+  *"--metadata-field gc.routed_to=` + target + `"*)
+    printf '[]'
+    ;;
+  *"--metadata-field gc.run_target=` + target + `"*"--metadata-field gc.kind=workflow"*)
+    printf '[]'
+    ;;
+  *"ephemeral=true AND status=open"*)
+    printf '[{"id":"eph-refused","assignee":"","issue_type":"task","metadata":{"gc.routed_to":"` + target + `"},"labels":["pool:refused:engine-rebuild-required"],"dependencies":[]}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wqOut := strings.TrimSpace(runEffectiveWorkQuery(t, agent, nil, tc.bdScript))
+			if wqOut != "[]" {
+				t.Errorf("EffectiveWorkQuery() = %q, want [] — a pool:refused bead leaked through a legacy tier", wqOut)
+			}
+			demandOut := strings.TrimSpace(runShellWithFakeBd(t, agent.EffectivePoolDemandQuery(), nil, tc.bdScript))
+			if demandOut != "0" {
+				t.Errorf("EffectivePoolDemandQuery() = %q, want 0 — a pool:refused bead counted as demand from a legacy tier", demandOut)
 			}
 		})
 	}
