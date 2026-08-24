@@ -150,54 +150,8 @@ func TestApplyPoolLimits_Defaults(t *testing.T) {
 	if defaultMaxIdleConns != 5 {
 		t.Errorf("defaultMaxIdleConns = %d, want 5", defaultMaxIdleConns)
 	}
-	// gc-aov9u: the pool now retires connections (idle AND total lifetime) at
-	// 20s — strictly below the Dolt server's 30s idle reaper — so a pooled
-	// connection is never handed out after the server has killed it.
-	if defaultConnMaxLifetime != 20*time.Second {
-		t.Errorf("defaultConnMaxLifetime = %v, want 20s", defaultConnMaxLifetime)
-	}
-	if defaultConnMaxIdleTime != 20*time.Second {
-		t.Errorf("defaultConnMaxIdleTime = %v, want 20s", defaultConnMaxIdleTime)
-	}
-	if defaultConnMaxLifetime >= 30*time.Second || defaultConnMaxIdleTime >= 30*time.Second {
-		t.Errorf("pool retirement (%v lifetime / %v idle) must be below the 30s Dolt reaper",
-			defaultConnMaxLifetime, defaultConnMaxIdleTime)
-	}
-}
-
-// TestApplyPoolLimits_IdleTimeOverride verifies the new ConnMaxIdleTime config
-// knob (gc-aov9u) is honored and that a zero value falls back to the 20s
-// default. MaxIdleTime is surfaced by sql.DBStats only via the cumulative
-// MaxIdleTimeClosed counter, so we assert behaviour indirectly: set a tiny
-// idle-time, force one idle connection, and confirm the pool retires it.
-func TestApplyPoolLimits_IdleTimeOverride(t *testing.T) {
-	t.Parallel()
-
-	db, drv := openMockDB(t)
-	t.Cleanup(func() { _ = db.Close() })
-
-	applyPoolLimits(db, &Config{MaxOpenConns: 2, ConnMaxIdleTime: 10 * time.Millisecond})
-
-	// Open one connection and return it to the idle pool.
-	if err := db.PingContext(context.Background()); err != nil {
-		t.Fatalf("ping: %v", err)
-	}
-	if got := drv.opens.Load(); got < 1 {
-		t.Fatalf("expected at least one driver Open, got %d", got)
-	}
-
-	// Wait past the idle timeout; database/sql's cleaner goroutine retires the
-	// idle connection. Poll up to 2s to avoid flakiness on slow CI.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if db.Stats().MaxIdleTimeClosed >= 1 {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if db.Stats().MaxIdleTimeClosed < 1 {
-		t.Errorf("expected at least 1 connection retired by idle-time, got MaxIdleTimeClosed=%d",
-			db.Stats().MaxIdleTimeClosed)
+	if defaultConnMaxLifetime != time.Hour {
+		t.Errorf("defaultConnMaxLifetime = %v, want 1h", defaultConnMaxLifetime)
 	}
 }
 

@@ -6,12 +6,11 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 func SearchIssuesWithCountsInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter) ([]*types.IssueWithCounts, error) {
-	limit := filter.Limit
-
 	wispDepsExist, err := optionalTableExistsInTx(ctx, tx, "wisp_dependencies")
 	if err != nil {
 		return nil, fmt.Errorf("search issues with counts: wisp dependency probe: %w", err)
@@ -22,14 +21,26 @@ func SearchIssuesWithCountsInTx(ctx context.Context, tx *sql.Tx, query string, f
 		if probeErr != nil {
 			return nil, fmt.Errorf("search issues with counts: ephemeral wisp probe: %w", probeErr)
 		}
-		if empty || !wispDepsExist {
-			return nil, nil
+		if !empty && wispDepsExist {
+			wisps, err := runFilterSearchQueryInTx(ctx, tx, query, filter, WispsFilterTables, true)
+			if err != nil && !isTableNotExistError(err) {
+				return nil, err
+			}
+			if len(wisps) > 0 {
+				return finishSearchIssuesWithCounts(wisps, filter)
+			}
 		}
-		wisps, err := runFilterSearchQueryInTx(ctx, tx, query, filter, WispsFilterTables, true)
+		// Fall through: the wisps tier is missing/empty or matched no rows.
+		// Mirror SearchIssuesInTx / CountIssuesInTx so count-projection searches
+		// also surface a durable issues-table row flagged ephemeral=1 instead of
+		// dropping it. Use the same IssuesFilterTables query the non-ephemeral
+		// path uses, keeping the GH#4387 count/list cardinality parity for
+		// searches that project counts (e.g. `bd search --counts --include-infra`).
+		out, err := runFilterSearchQueryInTx(ctx, tx, query, filter, IssuesFilterTables, wispDepsExist)
 		if err != nil {
 			return nil, err
 		}
-		return finishSearchIssuesWithCounts(wisps, limit), nil
+		return finishSearchIssuesWithCounts(out, filter)
 	}
 
 	out, err := runFilterSearchQueryInTx(ctx, tx, query, filter, IssuesFilterTables, wispDepsExist)
@@ -37,44 +48,59 @@ func SearchIssuesWithCountsInTx(ctx context.Context, tx *sql.Tx, query string, f
 		return nil, err
 	}
 
+	// Skip wisps merge entirely when caller opts out (Q2: perf escape hatch).
+	if filter.SkipWisps {
+		return finishSearchIssuesWithCounts(out, filter)
+	}
+
 	empty, probeErr := wispsTableEmptyOrMissingInTx(ctx, tx)
 	if probeErr != nil {
 		return nil, fmt.Errorf("search issues with counts: wisp probe: %w", probeErr)
 	}
 	if empty {
-		return finishSearchIssuesWithCounts(out, limit), nil
+		return finishSearchIssuesWithCounts(out, filter)
 	}
 	if !wispDepsExist {
-		return finishSearchIssuesWithCounts(out, limit), nil
+		return finishSearchIssuesWithCounts(out, filter)
 	}
 
 	wisps, err := runFilterSearchQueryInTx(ctx, tx, query, filter, WispsFilterTables, true)
 	if err != nil {
 		if isTableNotExistError(err) {
-			return finishSearchIssuesWithCounts(out, limit), nil
+			return finishSearchIssuesWithCounts(out, filter)
 		}
 		return nil, err
 	}
 	if len(wisps) == 0 {
-		return finishSearchIssuesWithCounts(out, limit), nil
+		return finishSearchIssuesWithCounts(out, filter)
 	}
 
-	seen := make(map[string]struct{}, len(out))
-	for _, iwc := range out {
-		if iwc != nil && iwc.Issue != nil {
-			seen[iwc.Issue.ID] = struct{}{}
+	// Prefer the canonical wisp record when an ID exists in both tables (be-iabdi).
+	wispByID := make(map[string]struct{}, len(wisps))
+	for _, w := range wisps {
+		if w != nil && w.Issue != nil {
+			wispByID[w.Issue.ID] = struct{}{}
 		}
 	}
-	for _, w := range wisps {
-		if w == nil || w.Issue == nil {
+	var kept []*types.IssueWithCounts
+	for _, iwc := range out {
+		if iwc == nil || iwc.Issue == nil {
+			kept = append(kept, iwc)
 			continue
 		}
-		if _, dup := seen[w.Issue.ID]; dup {
-			return nil, fmt.Errorf("search issues with counts: id %q exists in both issues and wisps", w.Issue.ID)
+		if _, dup := wispByID[iwc.Issue.ID]; !dup {
+			kept = append(kept, iwc)
 		}
-		out = append(out, w)
 	}
-	return finishSearchIssuesWithCounts(out, limit), nil
+	kept = append(kept, wisps...)
+	return finishSearchIssuesWithCounts(kept, filter)
+}
+
+// hydrationFor reads the two hydration opt-outs off a search filter. It is one
+// function rather than two field reads at each call site so a path cannot pick
+// up one of the pair and quietly drop the other.
+func hydrationFor(filter types.IssueFilter) sqlbuild.CountsHydration {
+	return sqlbuild.CountsHydration{SkipLabels: filter.SkipLabels, SkipCounts: filter.SkipCounts}
 }
 
 func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter, tables FilterTables, includeWispReverseDeps bool) ([]*types.IssueWithCounts, error) {
@@ -87,122 +113,36 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 		whereSQL = "WHERE " + joinAnd(whereClauses)
 	}
 	limitSQL := ""
-	if filter.Limit > 0 {
-		limitSQL = fmt.Sprintf("LIMIT %d", filter.Limit)
+	if eff := EffectiveSearchLimit(filter.Limit, filter.MaxRows); eff > 0 {
+		limitSQL = fmt.Sprintf("LIMIT %d", eff)
 	}
-	const orderBy = "ORDER BY i.priority ASC, i.created_at DESC, i.id ASC"
-	return runSearchQueryInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, filter.SkipLabels, filter.SkipBody)
+	orderBy := sqlbuild.OrderBy(filter.SortBy, filter.SortDesc, "i")
+	return runSearchQueryInTx(ctx, tx, tables, whereSQL, orderBy, limitSQL, args, includeWispReverseDeps, hydrationFor(filter))
 }
 
 //nolint:gosec // G201: SQL fragments are caller-built from hardcoded shapes
-func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, skipLabels bool, skipBody bool) ([]*types.IssueWithCounts, error) {
-	reverseBlockerSelect := `
-				SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS dep_id
-				FROM dependencies WHERE type = 'blocks'
-	`
-	if includeWispReverseDeps {
-		reverseBlockerSelect += `
-				UNION ALL
-				SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS dep_id
-				FROM wisp_dependencies WHERE type = 'blocks'
-		`
-	}
+func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, whereSQL, orderBySQL, limitSQL string, args []interface{}, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+	searchSQL, _ := sqlbuild.SearchCountsSQL(tables, nil, whereSQL, orderBySQL, limitSQL, includeWispReverseDeps, hyd)
+	return scanCountsRowsInTx(ctx, tx, tables.Main, searchSQL, args)
+}
 
-	labelsSelect := "l.labels_json AS labels_json"
-	labelsJoin := fmt.Sprintf(`
-		LEFT JOIN (
-			SELECT issue_id, JSON_ARRAYAGG(label) AS labels_json
-			FROM %s
-			WHERE issue_id IN (SELECT id FROM cand)
-			GROUP BY issue_id
-		) l ON l.issue_id = i.id`, tables.Labels)
-	if skipLabels {
-		labelsSelect = "NULL AS labels_json"
-		labelsJoin = ""
-	}
-
-	// ga-ftmci: the six per-row aggregations below used to aggregate the ENTIRE
-	// labels/deps/comments tables on every call, regardless of how few rows the
-	// filter selects — so a per-session ready-work poll (a handful of rows) still
-	// paid a full-table JSON_ARRAYAGG/GROUP BY over ~100k label rows. With ~14
-	// sessions polling, that pins Dolt CPU. Fix: compute the candidate id-set ONCE
-	// in a `cand` CTE (the exact filtered set), and BOUND every aggregation to
-	// `issue_id IN (SELECT id FROM cand)`. This is output-IDENTICAL (the LEFT JOINs
-	// still NULL for no-match; bounding only drops rows the JOIN would never match)
-	// and ~4-8x faster on the hot few-row path, with no regression on large result
-	// sets (cand ≈ the table there). whereSQL now lives ONLY in the CTE, so the
-	// bound args are consumed there (it is the first occurrence) — args unchanged.
-	searchSQL := fmt.Sprintf(`
-		WITH cand AS (SELECT i.id AS id FROM %s i %s)
-		SELECT %s,
-			%s,
-			COALESCE(dc.cnt, 0) AS dep_count,
-			COALESCE(rc.cnt, 0) AS rdep_count,
-			COALESCE(cc.cnt, 0) AS comment_count,
-			pc.parent_id     AS parent_id,
-			d.deps_json      AS deps_json
-		FROM %s i
-		%s
-		LEFT JOIN (
-			SELECT issue_id, COUNT(*) AS cnt
-			FROM %s
-			WHERE type = 'blocks' AND issue_id IN (SELECT id FROM cand)
-			GROUP BY issue_id
-		) dc ON dc.issue_id = i.id
-		LEFT JOIN (
-			SELECT dep_id, COUNT(*) AS cnt FROM (
-				%s
-			) all_blockers WHERE dep_id IN (SELECT id FROM cand) GROUP BY dep_id
-		) rc ON rc.dep_id = i.id
-		LEFT JOIN (
-			SELECT issue_id, COUNT(*) AS cnt
-			FROM %s
-			WHERE issue_id IN (SELECT id FROM cand)
-			GROUP BY issue_id
-		) cc ON cc.issue_id = i.id
-		LEFT JOIN (
-			SELECT issue_id,
-			       MIN(COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)) AS parent_id
-			FROM %s
-			WHERE type = 'parent-child' AND issue_id IN (SELECT id FROM cand)
-			GROUP BY issue_id
-		) pc ON pc.issue_id = i.id
-		LEFT JOIN (
-			SELECT issue_id, JSON_ARRAYAGG(%s) AS deps_json
-			FROM %s
-			WHERE issue_id IN (SELECT id FROM cand)
-			GROUP BY issue_id
-		) d ON d.issue_id = i.id
-		WHERE i.id IN (SELECT id FROM cand)
-		%s
-		%s
-	`,
-		tables.Main,
-		whereSQL,
-		readyWorkColumnsFor(skipBody),
-		labelsSelect,
-		tables.Main,
-		labelsJoin,
-		tables.Dependencies,
-		reverseBlockerSelect,
-		tables.Comments,
-		tables.Dependencies,
-		readyWorkDepJSONObject,
-		tables.Dependencies,
-		orderBySQL,
-		limitSQL,
-	)
-
-	rows, err := tx.QueryContext(ctx, searchSQL, args...)
+// scanCountsRowsInTx runs a prebuilt counts mega-query and hydrates each row
+// through ScanReadyWorkRowWithCounts, deduping by issue ID. It is the single
+// scan/dedupe loop shared by the predicate-form search path and the by-IDs
+// ready-counts path.
+//
+//nolint:gosec // G201: query is builder-produced; user input rides ? placeholders.
+func scanCountsRowsInTx(ctx context.Context, tx *sql.Tx, mainTable, query string, args []interface{}) ([]*types.IssueWithCounts, error) {
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("search count %s: %w", tables.Main, err)
+		return nil, fmt.Errorf("search count %s: %w", mainTable, err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var out []*types.IssueWithCounts
 	seen := make(map[string]bool)
 	for rows.Next() {
-		iwc, scanErr := scanReadyWorkRowWithCounts(rows)
+		iwc, scanErr := ScanReadyWorkRowWithCounts(rows)
 		if scanErr != nil {
 			return nil, scanErr
 		}
@@ -216,20 +156,48 @@ func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, wh
 		out = append(out, iwc)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("search count %s: rows: %w", tables.Main, err)
+		return nil, fmt.Errorf("search count %s: rows: %w", mainTable, err)
 	}
 	return out, nil
 }
 
-func finishSearchIssuesWithCounts(items []*types.IssueWithCounts, limit int) []*types.IssueWithCounts {
-	sortSearchIssuesWithCounts(items)
-	if limit > 0 && len(items) > limit {
-		return items[:limit]
+// finishSearchIssuesWithCounts is the single terminal hook every
+// SearchIssuesWithCountsInTx exit path routes through: it sorts the merged
+// result, applies the caller-facing Limit trim, and only then enforces the
+// defensive MaxRows cap (be-x42v) on the delivered count — mirroring
+// searchInTx's trimToSearchLimit-before-EnforceMaxRowsCap ordering and
+// finishReadyWorkWithCounts in ready_work_counts.go.
+//
+// Trim-before-cap matters for the merged (issues+wisps) case:
+// runFilterSearchQueryInTx sizes each leg's SQL LIMIT independently via
+// EffectiveSearchLimit(filter.Limit, filter.MaxRows), so the merged
+// pre-trim slice can hold up to ~2x that per-leg bound — e.g. Limit=2,
+// MaxRows=5, 3 rows in each table merges to 6, which would trip MaxRows
+// even though the page actually handed back to the caller (trimmed to
+// Limit=2) is well within the cap. Checking the cap against the delivered
+// count instead avoids that false positive.
+//
+// This does not weaken cap enforcement for a single-source result: a lone
+// query's LIMIT is already bounded to at most max(Limit, MaxRows+1), so its
+// result never exceeds Limit when Limit>0 and the trim is a no-op there —
+// only the two-source merge can produce more rows than Limit pre-trim, and
+// a genuine overage (Limit=0, or Limit>MaxRows overage that survives the
+// trim) still fires.
+func finishSearchIssuesWithCounts(items []*types.IssueWithCounts, filter types.IssueFilter) ([]*types.IssueWithCounts, error) {
+	sortSearchIssuesWithCounts(items, filter.SortBy, filter.SortDesc)
+	if filter.Limit > 0 && len(items) > filter.Limit {
+		items = items[:filter.Limit]
 	}
-	return items
+	if err := EnforceMaxRowsCap(len(items), filter.MaxRows, filter.MaxRowsSource); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
-func sortSearchIssuesWithCounts(items []*types.IssueWithCounts) {
+// sortSearchIssuesWithCounts must order the merged issues+wisps rows the same
+// way sqlbuild.OrderBy orders each per-table query; otherwise the limit cut in
+// finishSearchIssuesWithCounts keeps a different row set than SQL selected.
+func sortSearchIssuesWithCounts(items []*types.IssueWithCounts, sortBy string, sortDesc bool) {
 	if len(items) <= 1 {
 		return
 	}
@@ -241,13 +209,7 @@ func sortSearchIssuesWithCounts(items []*types.IssueWithCounts) {
 		if b == nil || b.Issue == nil {
 			return true
 		}
-		if a.Issue.Priority != b.Issue.Priority {
-			return a.Issue.Priority < b.Issue.Priority
-		}
-		if !a.Issue.CreatedAt.Equal(b.Issue.CreatedAt) {
-			return a.Issue.CreatedAt.After(b.Issue.CreatedAt)
-		}
-		return a.Issue.ID < b.Issue.ID
+		return sqlbuild.Less(a.Issue, b.Issue, sortBy, sortDesc)
 	})
 }
 
