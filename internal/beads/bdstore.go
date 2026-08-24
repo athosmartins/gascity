@@ -1729,7 +1729,7 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	// ask the installed bd what it supports, and pass the flag only if it does. An
 	// unsupported projection costs a slower query; an unsupported FLAG costs the
 	// entire call. Those must never again be the same failure.
-	if query.SkipBody || query.SkipDescription {
+	if query.SkipBody {
 		if s.bdSupportsFlag("list", "--skip-body") {
 			args = append(args, "--skip-body")
 		}
