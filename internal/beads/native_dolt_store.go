@@ -1304,12 +1304,16 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		MetadataFields:      query.Metadata,
 		CreatedBefore:       zeroTimePtr(query.CreatedBefore),
 		IncludeDependencies: true,
-		// ga-ftmci: when the caller (cache reconcile) does not need the large
-		// body columns, narrow the projection so the DB engine stops streaming
-		// design/acceptance_criteria/notes for every row on every full scan.
-		// beadFromNativeIssue never reads those fields, so this is invisible to
-		// the cache and to change detection.
-		SkipBody: query.SkipBody,
+		// ga-9ae7o / ga-hdfbux: beads 1.1.0 removed IssueFilter.SkipBody with no
+		// replacement (internal/types/types.go), so the projection narrowing
+		// this used to request is gone. query.SkipBody (still set by the cache
+		// reconcile) is now a no-op on this backend: reconcile fetches the full
+		// body columns on every scan again. That's a real query-width
+		// regression, but the alternative — staying on beads 1.0.5 — forces
+		// every scope in the city onto the BdStore subprocess-per-call
+		// fallback (version_compat preflight failure), which is far worse.
+		// Re-narrow this if/when beads adds an equivalent, or if the wider
+		// query is measured as the actual bottleneck with the native store.
 	}
 	switch query.TierMode {
 	case TierWisps:
