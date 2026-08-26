@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -544,6 +545,57 @@ var mailCheckAPIClient = func(cityPath string) (*api.Client, string) {
 	return nil, apiClientFallbackReason(cityPath)
 }
 
+// mailCheckAPIReadTimeout bounds how long `gc mail check` (non-inject) waits
+// for the supervisor API's mail-list response before giving up and using
+// the local fallback. mailCheckInjectAPIReadTimeout is tighter: --inject
+// always redoes the local read afterward regardless of the API outcome
+// (see the inject branch below), so a slow API response there buys nothing
+// but latency -- it exists purely to catch a *fast* degraded-store notice.
+//
+// Both are far below api.Client's own 10s HTTP timeout on purpose: mail
+// check runs on every agent hook trigger city-wide and must stay
+// hook-fast, while that shared timeout is tuned for interactive,
+// human-triggered commands. ga-lcdrc: observed 9-60+s `gc mail check`
+// hangs (near-zero CPU throughout -- blocked on this exact round trip, not
+// looping) under ordinary city-wide Dolt/controller contention, while
+// `gc mail inbox` -- which never attempts the API path at all -- stayed
+// under a second on the same mailbox the whole time.
+const (
+	mailCheckAPIReadTimeout       = 1500 * time.Millisecond
+	mailCheckInjectAPIReadTimeout = 500 * time.Millisecond
+)
+
+// errMailCheckAPITimeout is returned by listMailInboxBounded when the read
+// exceeds its budget. It is a local sentinel, not one of the transport-level
+// error kinds api.ShouldFallbackForRead/api.FallbackReason recognize, so
+// routeMailCheck checks for it explicitly before consulting those helpers.
+var errMailCheckAPITimeout = errors.New("mail check: API read exceeded local budget")
+
+// listMailInboxBounded calls c.ListMailInbox but gives up after timeout,
+// returning errMailCheckAPITimeout so the caller falls back to the local
+// path instead of blocking on a slow/contended API round trip. If the
+// abandoned call later completes, its result is simply discarded: safe,
+// because cmd/gc processes are short-lived and about to exit once the
+// (fast) local fallback finishes, and nothing reads the buffered channel
+// again.
+func listMailInboxBounded(c *api.Client, recipient string, timeout time.Duration) (api.CachedRead[api.MailListView], error) {
+	type result struct {
+		cr  api.CachedRead[api.MailListView]
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		cr, err := c.ListMailInbox(recipient, "")
+		ch <- result{cr, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.cr, r.err
+	case <-time.After(timeout):
+		return api.CachedRead[api.MailListView]{}, errMailCheckAPITimeout
+	}
+}
+
 // routeMailCheck dispatches non-injecting `mail check` to the supervisor API
 // when a controller is up; otherwise falls back to the local mail-provider path.
 // Injecting hooks probe the API for degraded-read notices, then use the local
@@ -558,7 +610,7 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 	}
 	if inject {
 		if c != nil {
-			cr, err := c.ListMailInbox(recipient, "")
+			cr, err := listMailInboxBounded(c, recipient, mailCheckInjectAPIReadTimeout)
 			if err == nil {
 				if mailListHasPartial(cr.Body) {
 					logRoute(stderr, cmdName, "api", "error")
@@ -569,7 +621,7 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 					_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", notice)
 					return 0
 				}
-			} else if !api.ShouldFallbackForRead(err) {
+			} else if !errors.Is(err, errMailCheckAPITimeout) && !api.ShouldFallbackForRead(err) {
 				logRoute(stderr, cmdName, "api", "error")
 				if api.IsStoreSlowError(err) {
 					_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", formatMailCheckDegradedNotice())
@@ -581,7 +633,7 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 		return doMailCheckFallback(args, inject, hookFormat, stdout, stderr)
 	}
 	if c != nil {
-		cr, err := c.ListMailInbox(recipient, "")
+		cr, err := listMailInboxBounded(c, recipient, mailCheckAPIReadTimeout)
 		if err == nil {
 			if mailListHasPartial(cr.Body) {
 				logRoute(stderr, cmdName, "api", "error")
@@ -591,12 +643,16 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 			logRoute(stderr, cmdName, "api", "")
 			return renderMailCheckFromAPI(cr, recipient, inject, hookFormat, stdout)
 		}
-		if !api.ShouldFallbackForRead(err) {
+		switch {
+		case errors.Is(err, errMailCheckAPITimeout):
+			logRoute(stderr, cmdName, "fallback", "api-read-timeout")
+		case !api.ShouldFallbackForRead(err):
 			logRoute(stderr, cmdName, "api", "error")
 			fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
+		default:
+			logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
 		}
-		logRoute(stderr, cmdName, "fallback", api.FallbackReason(err))
 	} else {
 		logRoute(stderr, cmdName, "fallback", nilReason)
 	}

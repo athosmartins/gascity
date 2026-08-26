@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 type mkdirAllErrorFS struct {
@@ -1219,6 +1221,68 @@ func TestDoRigListShowsSuspended(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "my-frontend (suspended)") {
 		t.Errorf("output = %q, want suspended annotation", stdout.String())
+	}
+}
+
+// ga-ab4zgu: rigHasRunningAgent used to build its OWN session provider
+// internally (newSessionProvider()), which meant doRigList paid a fresh
+// store-connection + full session-snapshot fetch cost on EVERY rig in its
+// loop -- measured live: ~1.7-2.5s per rig, ~100% of `gc rig list --json`'s
+// wall time for a 7-rig city (~15-80s total depending on Dolt load). The fix
+// makes sp a required parameter so callers build it once and reuse it. This
+// is only testable in isolation (with a fake provider, no real Dolt/tmux)
+// BECAUSE of that change -- before, this function could not be unit tested
+// without a live session backend at all.
+func TestRigHasRunningAgent_UsesProvidedProvider(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(t.TempDir(), "myrig")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := "[workspace]\nname = \"test-city\"\n\n" +
+		"[[agent]]\nname = \"worker\"\ndir = \"myrig\"\nmax_active_sessions = 1\n\n" +
+		"[[rigs]]\nname = \"myrig\"\npath = \"" + rigPath + "\"\n"
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var loadErrs bytes.Buffer
+	cfg, err := loadCityConfigFS(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"), &loadErrs)
+	if err != nil {
+		t.Fatalf("loadCityConfigFS: %v (stderr: %s)", err, loadErrs.String())
+	}
+
+	sp := runtime.NewFake()
+
+	if rigHasRunningAgent(cfg, sp, "myrig") {
+		t.Error("expected false before any session is started")
+	}
+
+	var agent *config.Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].Dir == "myrig" {
+			agent = &cfg.Agents[i]
+		}
+	}
+	if agent == nil {
+		t.Fatal("fixture agent (dir=myrig) not found in loaded config")
+	}
+	name := sessionName(nil, cfg.EffectiveCityName(), agent.QualifiedName(), cfg.Workspace.SessionTemplate)
+	if err := sp.Start(context.Background(), name, runtime.Config{Command: "echo"}); err != nil {
+		t.Fatalf("Start(%q): %v", name, err)
+	}
+
+	if !rigHasRunningAgent(cfg, sp, "myrig") {
+		t.Error("expected true once the PASSED-IN fake provider reports the agent's session running -- proves the function uses sp, not some internally-constructed provider")
+	}
+	if rigHasRunningAgent(cfg, sp, "some-other-rig") {
+		t.Error("expected false for a rig with no matching agent, even with a session running for a different rig")
+	}
+
+	// ga-ab4zgu: nil-safety for the new required parameter -- a caller
+	// mistake must fail safe (false), never panic.
+	if rigHasRunningAgent(cfg, nil, "myrig") {
+		t.Error("expected false when sp is nil")
 	}
 }
 

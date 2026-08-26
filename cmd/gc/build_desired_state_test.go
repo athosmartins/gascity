@@ -5341,6 +5341,14 @@ func TestBuildDesiredState_OnDemandNamedSession_DefaultRoutedTemplateMaterialize
 		}
 		if tp.ConfiguredNamedIdentity == "primary" {
 			foundNamed = true
+			// wa-xwa7l: a materialized named session must carry an explicit
+			// BEADS_ACTOR matching its identity, or bd's actor-resolution
+			// chain (no other source of this identity) falls through to
+			// whatever the tmux server's ambient environment happens to
+			// carry once the session is spawned.
+			if got, want := tp.Env["BEADS_ACTOR"], "primary"; got != want {
+				t.Errorf("named session Env[BEADS_ACTOR] = %q, want %q", got, want)
+			}
 			continue
 		}
 		t.Fatalf("routed singleton template created generic worker session: %+v", tp)

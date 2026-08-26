@@ -1150,7 +1150,7 @@ func filterCityEvents(items []cliWireEvent, afterSeq uint64, typeFilter string, 
 		if uint64(item.Seq) <= afterSeq {
 			continue
 		}
-		if typeFilter != "" && item.Type != typeFilter {
+		if typeFilter != "" && !events.TypeMatches(item.Type, typeFilter) {
 			continue
 		}
 		if !matchPayload(item.Payload, payloadMatch) {
@@ -1167,7 +1167,7 @@ func filterSupervisorEvents(items []cliWireTaggedEvent, typeFilter string, paylo
 	}
 	out := make([]cliWireTaggedEvent, 0, len(items))
 	for _, item := range items {
-		if typeFilter != "" && item.Type != typeFilter {
+		if typeFilter != "" && !events.TypeMatches(item.Type, typeFilter) {
 			continue
 		}
 		if !matchPayload(item.Payload, payloadMatch) {
@@ -1185,7 +1185,7 @@ func filterSupervisorEventsAfterCursor(items []cliWireTaggedEvent, cursor, typeF
 		if uint64(item.Seq) <= cursors[item.City] {
 			continue
 		}
-		if typeFilter != "" && item.Type != typeFilter {
+		if typeFilter != "" && !events.TypeMatches(item.Type, typeFilter) {
 			continue
 		}
 		if !matchPayload(item.Payload, payloadMatch) {

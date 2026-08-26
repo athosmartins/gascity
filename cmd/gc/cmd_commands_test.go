@@ -653,3 +653,46 @@ func TestAddDiscoveredCommandsToRoot_CanSuppressCollisionWarnings(t *testing.T) 
 		t.Fatalf("got %d import commands, want 1", importCount)
 	}
 }
+
+// TestAddDiscoveredCommandsToRoot_LaterEntryOverridesEarlierLeaf is a
+// regression test for ga-9n9z7: town-deltas (and any local pack imported
+// after another) had no way to override an existing packs/*/commands/*/run.sh
+// binding — only orders/*.toml had "later-imported layer wins" semantics
+// (internal/orders.ScanRoots). Command leaves used first-registration-wins
+// (addDiscoveredLeaf silently `return`ed on any name collision), so even a
+// command.toml explicitly targeting an existing binding+verb path (see
+// TestDiscoverPackCommands_ManifestBindingOverride in internal/config) could
+// never actually take effect — whichever pack's commands were appended to
+// cfg.PackCommands FIRST (earlier pack-import order) always won, silently
+// discarding the later one with no warning.
+//
+// This proves the CLI tree now matches orders.ScanRoots' direction: the
+// LATER entry in the input slice (i.e., the higher-priority / later-imported
+// pack) replaces the earlier one at the same (BindingName, Command) leaf,
+// instead of being dropped.
+func TestAddDiscoveredCommandsToRoot_LaterEntryOverridesEarlierLeaf(t *testing.T) {
+	root := &cobra.Command{Use: "gc"}
+	entries := []config.DiscoveredCommand{
+		{BindingName: "dolt", Command: []string{"compact"}, Description: "original (gastown pack)", RunScript: "/orig/run.sh"},
+		{BindingName: "dolt", Command: []string{"compact"}, Description: "override (town-deltas pack, imported later)", RunScript: "/override/run.sh"},
+	}
+
+	addDiscoveredCommandsToRoot(root, entries, "/city", "testcity", os.Stdout, os.Stderr, true)
+
+	dolt := findSubcommand(root, "dolt")
+	if dolt == nil {
+		t.Fatal("missing binding namespace")
+	}
+	var compactLeaves []*cobra.Command
+	for _, c := range dolt.Commands() {
+		if c.Name() == "compact" {
+			compactLeaves = append(compactLeaves, c)
+		}
+	}
+	if len(compactLeaves) != 1 {
+		t.Fatalf("got %d compact leaves, want exactly 1 (later entry must replace, not coexist)", len(compactLeaves))
+	}
+	if got := compactLeaves[0].Short; got != "override (town-deltas pack, imported later)" {
+		t.Fatalf("compact leaf Short = %q, want the LATER entry's description (override must win, matching orders.ScanRoots priority) — got the earlier one instead, meaning the override was silently dropped", got)
+	}
+}

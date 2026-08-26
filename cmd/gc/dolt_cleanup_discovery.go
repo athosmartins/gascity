@@ -261,6 +261,82 @@ func readProcRSSBytes(pid int) int64 {
 	return pages * int64(os.Getpagesize())
 }
 
+// clockTicksPerSecond is the kernel's USER_HZ value used to convert
+// /proc/<pid>/stat's starttime field (ticks since boot) into seconds. Nearly
+// every modern Linux kernel reports 100 here regardless of its internal
+// CONFIG_HZ tick rate — USER_HZ is deliberately pinned so userspace tools
+// don't need sysconf(_SC_CLK_TCK) to stay correct. If a kernel ever used a
+// different USER_HZ, age computation on that host degrades to "unknown" via
+// the negative-age guard in processAgeSeconds below, never a silently wrong
+// age — age is one leg of an AND gate that decides whether to kill a
+// process (ga-b5l0v), so a wrong-but-plausible-looking value is worse than
+// an honest "can't tell."
+const clockTicksPerSecond = 100
+
+// readProcUptimeSeconds reads /proc/uptime and returns the first field
+// (system uptime in seconds since boot). ok is false on any read/parse
+// failure so callers fail safe (age unknown, never a guessed age).
+func readProcUptimeSeconds() (float64, bool) {
+	data, err := readWithTimeout("/proc/uptime")
+	if err != nil {
+		return 0, false
+	}
+	return parseProcUptimeSeconds(data)
+}
+
+func parseProcUptimeSeconds(data []byte) (float64, bool) {
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, false
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || seconds < 0 {
+		return 0, false
+	}
+	return seconds, true
+}
+
+// processAgeSeconds computes how long a dolt sql-server process has been
+// running, from whichever start-time signal discovery populated for it:
+// startTimeTicks (Linux /proc path, DoltProcInfo.StartTimeTicks) or
+// startIdentity (ps fallback used on Darwin and hosts without /proc,
+// DoltProcInfo.StartIdentity — the raw `ps -o lstart=` string, e.g. "Fri Aug
+// 21 18:51:24 2026", parsed with time.ANSIC in the local zone since ps
+// reports local time and carries no zone info of its own).
+//
+// ok is false whenever age genuinely can't be determined (no signal, a
+// read/parse failure, or a computed negative age from a clock/tick-rate
+// mismatch) — ga-b5l0v: the entire point of an age gate on a
+// process-killing decision is a real measurement; a guessed default (0 or
+// "very old") would silently defeat the safety margin it exists to provide.
+// Callers MUST treat ok=false as "don't know," never as a stand-in age.
+func processAgeSeconds(startTimeTicks uint64, startIdentity string, now time.Time) (float64, bool) {
+	if startTimeTicks != 0 {
+		uptime, ok := readProcUptimeSeconds()
+		if !ok {
+			return 0, false
+		}
+		procUptimeSeconds := float64(startTimeTicks) / float64(clockTicksPerSecond)
+		age := uptime - procUptimeSeconds
+		if age < 0 {
+			return 0, false
+		}
+		return age, true
+	}
+	if startIdentity != "" {
+		started, err := time.ParseInLocation(time.ANSIC, startIdentity, time.Local)
+		if err != nil {
+			return 0, false
+		}
+		age := now.Sub(started).Seconds()
+		if age < 0 {
+			return 0, false
+		}
+		return age, true
+	}
+	return 0, false
+}
+
 // readDoltSQLServerArgv reads /proc/<pid>/cmdline and returns the NUL-split
 // argv if and only if the process looks like `dolt sql-server`. The boolean
 // is false for any non-dolt process so callers can skip cheaply.

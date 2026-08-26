@@ -492,6 +492,112 @@ schema = 2
 	}
 }
 
+func TestSuspendAgent_LocalDiscoveredPreservesCommentsAndUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "worker")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the worker.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// This file carries fields configedit's schema-2 struct doesn't know
+	// about (max_active_sessions, model) plus a hand-written rationale
+	// comment — exactly the shape of a real pool-template agent.toml.
+	original := `# budget rationale: keep this worker small (ga-example)
+max_active_sessions = 6
+model = "sonnet"
+`
+	agentTomlPath := filepath.Join(agentDir, "agent.toml")
+	if err := os.WriteFile(agentTomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.SuspendAgent("worker"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	after := string(mustReadFile(t, agentTomlPath))
+	if !strings.Contains(after, "# budget rationale: keep this worker small (ga-example)") {
+		t.Fatalf("SuspendAgent lost the file's comment:\n%s", after)
+	}
+	if !strings.Contains(after, "max_active_sessions = 6") {
+		t.Fatalf("SuspendAgent lost a field it doesn't model:\n%s", after)
+	}
+	if !strings.Contains(after, `model = "sonnet"`) {
+		t.Fatalf("SuspendAgent lost a field it doesn't model:\n%s", after)
+	}
+	if !strings.Contains(after, "suspended = true") {
+		t.Fatalf("agent.toml = %q, want suspended = true", after)
+	}
+}
+
+func TestSuspendAgent_LocalDiscoveredPreservesRealWorldMultiBlockLayout(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, `[workspace]
+name = "test-city"
+`)
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte(`[pack]
+name = "test-city"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentDir := filepath.Join(dir, "agents", "reviewer")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "prompt.template.md"), []byte("You are the reviewer.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Mirrors the real shape reported in ga-gdjav: several comment blocks,
+	// each explaining the field(s) right below it, non-alphabetical order,
+	// blank-line-separated groups.
+	original := `# reviewer: dedicated cap-exempt template for the quality gate.
+#
+# Budget rationale: max_active_sessions=6 is 3 reviewers x 2 concurrent runs.
+scope = "city"
+min_active_sessions = 0
+max_active_sessions = 6
+idle_timeout = "1h"
+wake_mode = "fresh"
+
+# Model: explicit pin so review stays off the scarce weekly Opus budget.
+model = "sonnet"
+
+# Remote Control OFF for ephemeral reviewers (bug wa-9ye2).
+provider = "claude"
+`
+	agentTomlPath := filepath.Join(agentDir, "agent.toml")
+	if err := os.WriteFile(agentTomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.SuspendAgent("reviewer"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+
+	after := string(mustReadFile(t, agentTomlPath))
+	wantUnchanged := original
+	if !strings.HasPrefix(after, wantUnchanged) {
+		t.Fatalf("SuspendAgent changed pre-existing content.\nbefore:\n%s\nafter:\n%s", original, after)
+	}
+	if !strings.Contains(after, "\nsuspended = true\n") {
+		t.Fatalf("agent.toml = %q, want an appended suspended = true", after)
+	}
+}
+
 func TestResumeAgent_LocalDiscovered(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, `[workspace]
@@ -962,6 +1068,44 @@ suspended = true
 	}
 }
 
+// TestSuspendCity_PreservesUnrelatedCommentsAndBlockOrdering reproduces
+// ga-twzji: city.toml is a hand-maintained file with real operational
+// comments (e.g. the ga-23z6a eval-window-concurrency-guard warning), and
+// every write through the Editor used to re-encode the WHOLE file from the
+// typed struct, silently destroying every comment on ANY mutation — even
+// one as small as flipping workspace.suspended, and even for content the
+// mutation never touched (the [[agent]] block below).
+func TestSuspendCity_PreservesUnrelatedCommentsAndBlockOrdering(t *testing.T) {
+	dir := t.TempDir()
+	city := `# ga-23z6a eval-window-concurrency-guard: do not hand-edit the two
+# value lines below; the guard reads them directly.
+[workspace]
+name = "test-city"
+
+# mayor: the one always-on coordinator agent for this city.
+[[agent]]
+name = "mayor"
+provider = "claude"
+`
+	path := writeTOML(t, dir, city)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.SuspendCity(); err != nil {
+		t.Fatalf("SuspendCity: %v", err)
+	}
+
+	after := string(mustReadFile(t, path))
+	if !strings.Contains(after, "# ga-23z6a eval-window-concurrency-guard") {
+		t.Fatalf("SuspendCity lost the workspace comment:\n%s", after)
+	}
+	if !strings.Contains(after, "# mayor: the one always-on coordinator agent for this city.") {
+		t.Fatalf("SuspendCity lost the unrelated agent comment:\n%s", after)
+	}
+	if !strings.Contains(after, "suspended = true") {
+		t.Fatalf("city.toml = %q, want suspended = true", after)
+	}
+}
+
 func TestCreateAgent(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, "[workspace]\n")
@@ -1229,6 +1373,47 @@ func TestUpdateAgentSchema2LocalConventionAgentWritesAgentTOML(t *testing.T) {
 	agent := findAgent(t, readExpandedTOML(t, path), "coder")
 	if agent.Provider != "gemini" || agent.Scope != "city" || !agent.Suspended {
 		t.Fatalf("expanded agent = %+v, want updated provider/scope/suspended", agent)
+	}
+}
+
+func TestUpdateAgentSchema2LocalConventionPreservesCommentsAndUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, "[workspace]\n")
+	if err := os.WriteFile(filepath.Join(dir, "pack.toml"), []byte("[pack]\nname = \"test-city\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+	if err := ed.CreateAgent(config.Agent{Name: "coder", Provider: "claude", Scope: "city"}); err != nil {
+		t.Fatalf("CreateAgent: %v", err)
+	}
+
+	// Simulate a richer agent.toml than the scaffold writes, the way a real
+	// pool-template file looks once someone adds capacity fields plus a
+	// rationale comment by hand.
+	agentTomlPath := filepath.Join(dir, "agents", "coder", "agent.toml")
+	original := `provider = "claude"
+
+# do not raise this without checking the gate budget first (ga-example)
+max_active_sessions = 6
+model = "sonnet"
+`
+	if err := os.WriteFile(agentTomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ed.UpdateAgent("coder", configedit.AgentUpdate{Provider: "gemini"}); err != nil {
+		t.Fatalf("UpdateAgent: %v", err)
+	}
+
+	after := string(mustReadFile(t, agentTomlPath))
+	if !strings.Contains(after, "# do not raise this without checking the gate budget first (ga-example)") {
+		t.Fatalf("UpdateAgent lost the file's comment:\n%s", after)
+	}
+	if !strings.Contains(after, "max_active_sessions = 6") {
+		t.Fatalf("UpdateAgent lost a field it doesn't model:\n%s", after)
+	}
+	if !strings.Contains(after, `provider = "gemini"`) {
+		t.Fatalf("agent.toml = %q, want updated provider", after)
 	}
 }
 

@@ -357,11 +357,21 @@ func WriteCityAndRigSiteBindingsForEditRemovingRigs(fs fsys.FS, tomlPath string,
 
 func writeCityAndRigSiteBindingsForEdit(fs fsys.FS, tomlPath string, cfg *City, removedRigNames map[string]struct{}) error {
 	cityRoot := filepath.Dir(tomlPath)
-	content, err := cfg.MarshalForWrite()
+	snapshot, err := snapshotCityAndSiteFiles(fs, tomlPath, SiteBindingPath(cityRoot))
 	if err != nil {
 		return err
 	}
-	snapshot, err := snapshotCityAndSiteFiles(fs, tomlPath, SiteBindingPath(cityRoot))
+	// Splice the mutation into the existing file's own text instead of a
+	// plain full re-encode, so hand-written comments and blank-line
+	// grouping survive (ga-twzji). Falls back to cfg.MarshalForWrite()'s
+	// plain output whenever the existing content can't be safely
+	// reconciled — never blocks or corrupts the write.
+	var content []byte
+	if existing := snapshot.files[tomlPath]; existing.existed {
+		content, err = cfg.MarshalForWritePreservingComments(existing.data)
+	} else {
+		content, err = cfg.MarshalForWrite()
+	}
 	if err != nil {
 		return err
 	}

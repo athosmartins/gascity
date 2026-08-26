@@ -1091,7 +1091,7 @@ func TestLoadCityConfigFailsWhenRequiredBuiltinPackRemainsPartiallyMaterialized(
 	}
 
 	targetDir := filepath.Join(dir, citylayout.SystemPacksRoot, "core", "assets", "prompts")
-	targetFile := filepath.Join(targetDir, "pool-worker.md")
+	targetFile := filepath.Join(targetDir, "pool-worker.template.md")
 	if err := os.Remove(targetFile); err != nil {
 		t.Fatalf("Remove(%s): %v", targetFile, err)
 	}
@@ -1119,7 +1119,7 @@ func TestLoadCityConfigFailsWhenRequiredBuiltinPackRefreshLeavesStaleContent(t *
 	}
 
 	targetDir := filepath.Join(dir, citylayout.SystemPacksRoot, "core", "assets", "prompts")
-	targetFile := filepath.Join(targetDir, "pool-worker.md")
+	targetFile := filepath.Join(targetDir, "pool-worker.template.md")
 	if err := os.WriteFile(targetFile, []byte("stale core prompt\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile(%s): %v", targetFile, err)
 	}
@@ -1206,7 +1206,7 @@ func TestLoadCityConfigRevalidatesRequiredBuiltinPackContentsAfterReadyCacheSucc
 		t.Fatalf("loadCityConfig() initial error: %v", err)
 	}
 
-	targetFile := filepath.Join(dir, citylayout.SystemPacksRoot, "core", "assets", "prompts", "pool-worker.md")
+	targetFile := filepath.Join(dir, citylayout.SystemPacksRoot, "core", "assets", "prompts", "pool-worker.template.md")
 	if err := os.Remove(targetFile); err != nil {
 		t.Fatalf("Remove(%s): %v", targetFile, err)
 	}
@@ -1225,7 +1225,7 @@ func TestMaterializeBuiltinPacksIncludesWorkerFilesystemSearchGuidance(t *testin
 		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
 	}
 
-	for _, name := range []string{"pool-worker.md", "graph-worker.md"} {
+	for _, name := range []string{"pool-worker.template.md", "graph-worker.template.md"} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(dir, citylayout.SystemPacksRoot, "core", "assets", "prompts", name)
 			data, err := os.ReadFile(path)

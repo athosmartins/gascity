@@ -17,6 +17,50 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 )
 
+// TestFilterCityEvents_TypeCommaList reproduces ga-gye3f at the CLI's own
+// re-filter layer: even when the server-side query already OR-matched a
+// comma-joined --type, cmd/gc re-filters the response itself, and that
+// re-filter used to compare item.Type against the WHOLE comma string with
+// !=, which never equals a single type and silently dropped everything.
+func TestFilterCityEvents_TypeCommaList(t *testing.T) {
+	items := []cliWireEvent{
+		{Seq: 1, Type: "session.woke"},
+		{Seq: 2, Type: "session.stopped"},
+		{Seq: 3, Type: "bead.created"},
+	}
+	got := filterCityEvents(items, 0, "session.woke,session.stopped,session.crashed", nil)
+	if len(got) != 2 {
+		t.Fatalf("filterCityEvents with comma-list type = %d items, want 2 (session.woke + session.stopped); got=%+v", len(got), got)
+	}
+	for _, item := range got {
+		if item.Type != "session.woke" && item.Type != "session.stopped" {
+			t.Errorf("unexpected item in comma-list filter result: %+v", item)
+		}
+	}
+}
+
+func TestFilterSupervisorEvents_TypeCommaList(t *testing.T) {
+	items := []cliWireTaggedEvent{
+		{Seq: 1, Type: "session.woke", City: "gastown"},
+		{Seq: 2, Type: "bead.created", City: "gastown"},
+	}
+	got := filterSupervisorEvents(items, "session.woke,session.crashed", nil)
+	if len(got) != 1 || got[0].Type != "session.woke" {
+		t.Fatalf("filterSupervisorEvents with comma-list type = %+v, want only session.woke", got)
+	}
+}
+
+func TestFilterSupervisorEventsAfterCursor_TypeCommaList(t *testing.T) {
+	items := []cliWireTaggedEvent{
+		{Seq: 1, Type: "session.woke", City: "gastown"},
+		{Seq: 2, Type: "bead.created", City: "gastown"},
+	}
+	got := filterSupervisorEventsAfterCursor(items, "", "session.woke,session.crashed", nil)
+	if len(got) != 1 || got[0].Type != "session.woke" {
+		t.Fatalf("filterSupervisorEventsAfterCursor with comma-list type = %+v, want only session.woke", got)
+	}
+}
+
 func TestDoEventsCityDefaultUsesJSONLItems(t *testing.T) {
 	items := []cliWireEvent{
 		{Actor: "human", Seq: 1, Subject: "gc-1", Ts: time.Unix(1700000000, 0).UTC(), Type: "bead.created"},

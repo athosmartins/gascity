@@ -3531,6 +3531,25 @@ func okMailCheckHandler(_ *testing.T) http.Handler {
 	})
 }
 
+// slowMailCheckHandler returns a valid mail-list response (same body as
+// okMailCheckHandler) after sleeping delay -- simulates a slow/contended
+// supervisor API for ga-lcdrc's bounded-read tests.
+func slowMailCheckHandler(delay time.Duration) mailMatrixHandler {
+	return func(_ *testing.T) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			time.Sleep(delay)
+			w.Header().Set("X-GC-Cache-Age-S", "2")
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck
+				"items": []map[string]any{
+					{"id": "msg-1", "from": "alice", "to": "mayor", "subject": "hi", "body": "hello", "created_at": "2026-04-23T10:00:00Z", "read": false},
+				},
+				"total": 1,
+			})
+		})
+	}
+}
+
 func partialStoreSlowMailCheckHandler(_ *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-GC-Cache-Age-S", "2")
@@ -3748,6 +3767,73 @@ func TestRouteMailCheck_SixRowMatrix(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRouteMailCheckAPIReadIsBoundedNonInject proves ga-lcdrc's fix: a slow
+// (but eventually successful) API response must not block `gc mail check`
+// past mailCheckAPIReadTimeout. Before the fix, routeMailCheck called
+// c.ListMailInbox directly with no bound of its own, so a slow/contended
+// supervisor held the command open for as long as the handler took (up to
+// api.Client's own 10s HTTP timeout) -- reproducing the near-zero-CPU hangs
+// reported live in ga-lcdrc. The handler here sleeps well past the budget;
+// on the pre-fix code this test fails both the "did we bail out" and the
+// "wrong local-fallback exit code" assertions because elapsed >= handlerDelay.
+func TestRouteMailCheckAPIReadIsBoundedNonInject(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+
+	const handlerDelay = 2 * time.Second
+	srv := httptest.NewServer(slowMailCheckHandler(handlerDelay)(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := routeMailCheck(cityPath, []string{"mayor"}, false, "", c, "", &stdout, &stderr)
+	elapsed := time.Since(start)
+
+	if elapsed >= handlerDelay {
+		t.Fatalf("routeMailCheck took %s (>= the %s handler delay) -- mailCheckAPIReadTimeout=%s was not enforced", elapsed, handlerDelay, mailCheckAPIReadTimeout)
+	}
+	if elapsed > mailCheckAPIReadTimeout+2*time.Second {
+		t.Fatalf("routeMailCheck took %s, wanted close to mailCheckAPIReadTimeout=%s plus local-fallback overhead", elapsed, mailCheckAPIReadTimeout)
+	}
+	if code != 1 { // fallback hits the empty fake provider, same as the "controller-down" matrix row
+		t.Fatalf("exit = %d, want 1 (empty local fallback); stderr=%q", code, stderr.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "fallback", "api-read-timeout")
+}
+
+// TestRouteMailCheckAPIReadIsBoundedInject is the --inject counterpart of
+// TestRouteMailCheckAPIReadIsBoundedNonInject. --inject is the higher-stakes
+// case: it runs on every agent hook trigger city-wide and always redoes the
+// local read afterward regardless of the API outcome (see routeMailCheck),
+// so an unbounded API wait here was pure added latency on the hottest path
+// in the whole framework.
+func TestRouteMailCheckAPIReadIsBoundedInject(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+
+	const handlerDelay = 2 * time.Second
+	srv := httptest.NewServer(slowMailCheckHandler(handlerDelay)(t))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := routeMailCheck(cityPath, []string{"mayor"}, true, "", c, "", &stdout, &stderr)
+	elapsed := time.Since(start)
+
+	if elapsed >= handlerDelay {
+		t.Fatalf("routeMailCheck(--inject) took %s (>= the %s handler delay) -- mailCheckInjectAPIReadTimeout=%s was not enforced", elapsed, handlerDelay, mailCheckInjectAPIReadTimeout)
+	}
+	if elapsed > mailCheckInjectAPIReadTimeout+2*time.Second {
+		t.Fatalf("routeMailCheck(--inject) took %s, wanted close to mailCheckInjectAPIReadTimeout=%s plus local-fallback overhead", elapsed, mailCheckInjectAPIReadTimeout)
+	}
+	if code != 0 { // --inject always exits 0
+		t.Fatalf("exit = %d, want 0 (--inject always succeeds); stderr=%q", code, stderr.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "fallback", "inject-local-side-effects")
 }
 
 func TestRouteMailCountPartialStoreSlowHumanReturnsError(t *testing.T) {

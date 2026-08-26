@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -24,13 +25,38 @@ type Filter struct {
 	Limit    int       // cap results at this count (0 or negative = unlimited)
 }
 
+// TypeMatches reports whether eventType satisfies filter, where filter is
+// either a single event type or a comma-separated list of types to
+// OR-match against — the same comma-list convention used elsewhere in this
+// CLI family (e.g. `bd list --status open,in_progress`,
+// `--exclude-type=convoy,epic`). An empty filter matches any type; callers
+// that need "no filter configured" to mean something else (e.g. skip the
+// predicate entirely) must check for "" themselves before calling this.
+//
+// Before this fix, every Type predicate in this package (and its mirrors
+// in cmd/gc/cmd_events.go) compared eventType against the raw filter string
+// with ==, so a comma-joined filter like "session.woke,session.stopped"
+// never equaled any single event's Type and silently matched zero events
+// instead of erroring or OR-matching — see ga-gye3f.
+func TypeMatches(eventType, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	for _, part := range strings.Split(filter, ",") {
+		if eventType == strings.TrimSpace(part) {
+			return true
+		}
+	}
+	return false
+}
+
 // matchesFilter reports whether e satisfies all non-zero predicates in f.
 // It does not enforce Limit — that is applied by the caller.
 func matchesFilter(e Event, f Filter) bool {
 	if f.AfterSeq > 0 && e.Seq <= f.AfterSeq {
 		return false
 	}
-	if f.Type != "" && e.Type != f.Type {
+	if f.Type != "" && !TypeMatches(e.Type, f.Type) {
 		return false
 	}
 	if f.Actor != "" && e.Actor != f.Actor {

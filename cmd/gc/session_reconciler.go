@@ -1088,10 +1088,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			trace.recordDecision("reconciler.session.pending_create", templateName, name, action, "rollback", nil, nil, "")
 		}
 		if clearClaim {
-			rollbackPendingCreateClearingClaim(session, store, clk.Now().UTC(), stderr)
+			rollbackPendingCreateClearingClaim(session, store, clk.Now().UTC(), stderr, action, detail)
 			return
 		}
-		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr)
+		rollbackPendingCreate(session, store, clk.Now().UTC(), stderr, action, detail)
 	}
 	phaseStart = time.Now()
 	for i := range ordered {
@@ -2677,6 +2677,9 @@ func resolvePreservedConfiguredNamedSessionTemplate(
 	tp.Env["GC_ALIAS"] = identity
 	tp.Env["GC_AGENT"] = identity
 	tp.Env["GC_SESSION_ORIGIN"] = "named"
+	// bd's actor-resolution chain has no other way to learn this named
+	// session's identity — see setTemplateEnvIdentity (wa-xwa7l).
+	tp.Env["BEADS_ACTOR"] = identity
 	installAgentSideEffects(bp, spec.Agent, tp, stderr)
 	return tp, nil
 }

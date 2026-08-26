@@ -756,6 +756,70 @@ func TestCliBeadRouterAllowsCityTargetFromCityStore(t *testing.T) {
 	}
 }
 
+// swallowMetadataStore wraps a beads.Store whose SetMetadata reports success
+// (nil error) without the write actually taking effect — reproducing ga-66wc:
+// `gc sling` printed its normal success text ("Slung <bead> → <target>") while
+// gc.routed_to stayed unset, because the router trusted a nil error from
+// SetMetadata as proof the write was durable. Real production stores can
+// nil-error on a write that doesn't stick (e.g. a swallowed downstream
+// failure); this fake reproduces that outcome directly rather than depending
+// on a specific store implementation's failure mode.
+type swallowMetadataStore struct {
+	beads.Store
+	swallowKey string
+}
+
+func (s *swallowMetadataStore) SetMetadata(id, key, value string) error {
+	if key == s.swallowKey {
+		return nil // reports success but never writes — the bug under test
+	}
+	return s.Store.SetMetadata(id, key, value)
+}
+
+// TestCliBeadRouterDetectsSilentRoutedToWriteFailure is a regression test for
+// ga-66wc: gc sling must not report success when the gc.routed_to write it
+// just performed did not actually take effect. Before this fix, Route()
+// returned nil as long as SetMetadata returned nil, with no check that the
+// write was observable — so a bead could come out of `gc sling` looking
+// identical to a successful route (same stdout, exit 0) while routed_to
+// stayed empty and no session would ever pick up the work.
+func TestCliBeadRouterDetectsSilentRoutedToWriteFailure(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "alpha")
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "alpha", Path: rigPath}},
+		Agents: []config.Agent{{
+			Name: "claude",
+			Dir:  "alpha",
+		}},
+	}
+	inner := newSlingTestStore()
+	if _, err := inner.Create(beads.Bead{ID: "RIG-1", Type: "task", Status: "open"}); err != nil {
+		t.Fatalf("seed RIG-1: %v", err)
+	}
+	store := &swallowMetadataStore{Store: inner, swallowKey: "gc.routed_to"}
+	deps := &slingDeps{
+		CityName: "test-city",
+		CityPath: cityPath,
+		Cfg:      cfg,
+		Store:    store,
+		StoreRef: "rig:alpha",
+	}
+	router := cliBeadRouter{deps: deps}
+
+	err := router.Route(context.Background(), sling.RouteRequest{
+		BeadID: "RIG-1",
+		Target: "alpha/claude",
+	})
+	if err == nil {
+		t.Fatal("Route() = nil error, want an error reporting the silent gc.routed_to write failure")
+	}
+	if !strings.Contains(err.Error(), "RIG-1") || !strings.Contains(err.Error(), "gc.routed_to") {
+		t.Errorf("Route() error = %q, want it to name the bead and gc.routed_to", err.Error())
+	}
+}
+
 func TestDoSlingFormulaToAgent(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()
@@ -870,6 +934,51 @@ func TestDoSlingMultiSessionMaxZeroWarns(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "session config") || !strings.Contains(stderr.String(), "max_active_sessions=0") {
 		t.Errorf("stderr = %q, want session config max_active_sessions=0 warning", stderr.String())
+	}
+}
+
+// TestDoSlingImplicitTargetWarnsAtCLI is a regression test for ga-sg0pq8:
+// `gc sling <rig>/claude-headless <bead>` (an implicit, provider-derived
+// agent auto-synthesized by InjectImplicitAgents — see config.Agent.Implicit)
+// used to route the bead with gc.routed_to set and zero indication that the
+// target has no dedicated worker backing it. The bead sat routed but
+// unclaimed indefinitely, invisible until someone happened to check
+// `gc session list`. Verifies the CLI now surfaces a warning on stderr.
+func TestDoSlingImplicitTargetWarnsAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "claude-headless", Dir: "whatsapp_automation", Implicit: true}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 (still routes)", code)
+	}
+	if !strings.Contains(stderr.String(), "implicit") {
+		t.Errorf("stderr = %q, want implicit-target warning", stderr.String())
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "whatsapp_automation/claude-headless")
+}
+
+func TestDoSlingImplicitTargetForceSuppressesWarningAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	a := config.Agent{Name: "claude-headless", Dir: "whatsapp_automation", Implicit: true}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	opts.Force = true
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0", code)
+	}
+	if strings.Contains(stderr.String(), "implicit") {
+		t.Errorf("--force should suppress warning; stderr = %q", stderr.String())
 	}
 }
 

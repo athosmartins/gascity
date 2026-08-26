@@ -301,7 +301,11 @@ gc dolt health --json
 Parse the JSON output (HealthReport schema):
 - `server`: running, reachable, pid, port, latency_ms
 - `databases[]`: name, commits, open_beads
-- `backups`: dolt_freshness, dolt_age_seconds, dolt_stale
+- `backups[]`: name, state, age_sec, path, size_bytes, remote_count,
+  verified_remote_count, stale (ga-soxi9: was a single city-wide object
+  keyed on a directory glob unrelated to any database's real backup
+  remotes — now one entry per database, asked from Dolt itself via
+  `dolt backup -v`)
 - `processes`: zombie_count, zombie_pids
 - `orphans[]`: name, size
 
@@ -317,8 +321,16 @@ are wedged (the latter is what first prompted this check to exist).
 | `server.reachable == false` | — | Dolt server is down or unresponsive (CRITICAL) |
 | `server.latency_ms > 5000` | 5 s | Server may be overloaded |
 | `databases[].commits > 50000` | 50 k | Compactor dog may have stalled |
-| `backups.dolt_stale == true` | >30 min | Backup dog may have failed |
+| `backups[].state == "none"`\* | any | No backup remote registered at all for this database — real risk, high alarm |
+| `backups[].state == "unverified"` or `"query-failed"` | any | Could not confirm this database's backup is actually present (registered remote with no local manifest, a remote scheme this check can't stat, or the query itself failed) — worth a look, not yet a confirmed failure; don't treat as either "ok" or "none" |
+| `backups[].stale == true` (only meaningful when `state == "ok"`) | >30 min | Backup dog may have failed |
 | `processes.zombie_count > 0` | any | Zombie Dolt servers detected |
+
+\* `state` values: `ok` (a configured remote resolved to a real, dated local
+manifest), `none` (zero remotes registered), `unverified` (≥1 remote
+registered, but none resolved — either a `file://` target with no manifest
+on disk, or every remote uses a scheme this check can't stat locally, e.g.
+`s3://`), `query-failed` (`dolt backup -v` itself failed/timed out).
 | `orphans` non-empty | any | Orphan databases accumulating |
 
 **Step 3: React to alerts**

@@ -166,6 +166,58 @@ schema = 2
 	}
 }
 
+// TestDoPrime_RendersBuiltinGraphWorkerPromptNotRawPlaceholder guards
+// ga-5sxs3: a formula_v2 agent with no custom prompt_template used to get
+// the builtin graph-worker prompt dumped via a raw os.ReadFile, bypassing
+// renderPrompt entirely — so {{ .AssignedReadyQuery }} (and every other
+// template directive in graph-worker.md) reached the agent completely
+// unrendered, literal braces and all. This reproduces with hookMode=false
+// (doPrime, not doPrimeWithHookFormat) and no prompt.template.md for the
+// agent — exactly the "manual gc prime invocation" shape the bug was first
+// caught in (GC_SESSION_ORIGIN=manual).
+func TestDoPrime_RendersBuiltinGraphWorkerPromptNotRawPlaceholder(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, "agents", "worker1"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(agents/worker1): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`
+[workspace]
+name = "backstage"
+
+[daemon]
+formula_v2 = true
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "pack.toml"), []byte(`
+[pack]
+name = "backstage"
+schema = 2
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(pack.toml): %v", err)
+	}
+
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+
+	var stdout, stderr bytes.Buffer
+	code := doPrime([]string{"worker1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doPrime() = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	got := stdout.String()
+	if strings.Contains(got, "{{ .AssignedReadyQuery }}") {
+		t.Fatalf("stdout still contains the raw, unrendered template placeholder — builtin graph-worker prompt was not run through renderPrompt:\n%s", got)
+	}
+	if got == "" {
+		t.Fatal("stdout is empty — expected the rendered graph-worker prompt body")
+	}
+	if !strings.Contains(got, "Startup") {
+		t.Fatalf("stdout doesn't look like the graph-worker prompt at all (missing its own Startup section) — did the fallback stop emitting anything?\n%s", got)
+	}
+}
+
 func TestDoPrimeScopesRigPackFragmentsByCurrentRig(t *testing.T) {
 	clearGCEnv(t)
 

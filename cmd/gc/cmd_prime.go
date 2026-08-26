@@ -208,7 +208,7 @@ func primeInvocationAgentName(args []string) (string, bool) {
 }
 
 func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode bool, hookFormat string, strictMode bool) int {
-	agentName, sessionTemplateContext := primeInvocationAgentName(args)
+	agentName, _ := primeInvocationAgentName(args)
 	var hookContext primeHookContext
 	suppressHookPrompt := false
 	if hookMode {
@@ -333,12 +333,16 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 				sessionName:       sessionName,
 			}))
 		}
-		var ctx PromptContext
-		if a.PromptTemplate != "" || hookMode || sessionTemplateContext {
-			ctx = buildPrimeContextForBeads(cityPath, cityName, &a, cfg.Rigs, cfg.Beads, stderr)
-			ctx.ProviderKey, ctx.ProviderDisplayName = providerInfoForAgent(&a, &cfg.Workspace, cfg.Providers)
-			ctx.InstructionsFile = instructionsFileForAgent(&a, &cfg.Workspace, cfg.Providers)
-		}
+		// Built unconditionally (ga-5sxs3): the builtin-prompt fallback below
+		// (agents with no prompt_template) needs ctx.AssignedReadyQuery etc.
+		// rendered too, not just the custom-prompt_template branch — a
+		// narrower guard here previously let that fallback dump graph-worker/
+		// pool-worker.md's raw {{ .X }} placeholders unrendered whenever
+		// hookMode and sessionTemplateContext were both false (e.g. a manual
+		// `gc prime` invocation).
+		ctx := buildPrimeContextForBeads(cityPath, cityName, &a, cfg.Rigs, cfg.Beads, stderr)
+		ctx.ProviderKey, ctx.ProviderDisplayName = providerInfoForAgent(&a, &cfg.Workspace, cfg.Providers)
+		ctx.InstructionsFile = instructionsFileForAgent(&a, &cfg.Workspace, cfg.Providers)
 		if a.PromptTemplate != "" {
 			fragments := effectivePromptFragments(
 				cfg.Workspace.GlobalFragments,
@@ -359,22 +363,40 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 		}
 		// Agents without a prompt_template: read a builtin prompt shipped by
 		// the core bootstrap pack, materialized under .gc/system/packs/core/.
-		// When formula_v2 is enabled, all agents use graph-worker.md.
-		// Otherwise pool agents use pool-worker.md.
+		// When formula_v2 is enabled, all agents use graph-worker.template.md.
+		// Otherwise pool agents use pool-worker.template.md.
 		// Pool instances have Pool=nil after resolution, so also check the
 		// template agent via findAgentByName.
 		if a.PromptTemplate == "" {
 			promptFile := ""
 			if cfg.Daemon.FormulaV2 {
-				promptFile = citylayout.SystemPacksRoot + "/core/assets/prompts/graph-worker.md"
+				promptFile = citylayout.SystemPacksRoot + "/core/assets/prompts/graph-worker.template.md"
 			} else if a.SupportsInstanceExpansion() || isPoolInstance(cfg, a) {
-				promptFile = citylayout.SystemPacksRoot + "/core/assets/prompts/pool-worker.md"
+				promptFile = citylayout.SystemPacksRoot + "/core/assets/prompts/pool-worker.template.md"
 			}
 			if promptFile != "" {
-				if content, fErr := os.ReadFile(filepath.Join(cityPath, promptFile)); fErr == nil {
-					writePrimePromptWithFormat(stdout, cityName, ctx.AgentName, string(content), hookMode, hookFormat, suppressHookPrompt)
+				// Rendered through the same renderPrompt path as a custom
+				// prompt_template (ga-5sxs3) — these builtin prompts contain
+				// {{ .AssignedReadyQuery }} etc. too, and a plain os.ReadFile
+				// dump previously shipped that placeholder unrendered to
+				// every formula_v2/pool agent with no custom prompt_template.
+				fragments := effectivePromptFragments(
+					cfg.Workspace.GlobalFragments,
+					a.InjectFragments,
+					a.AppendFragments,
+					a.InheritedAppendFragments,
+					cfg.AgentDefaults.AppendFragments,
+				)
+				packDirs := cfg.PackDirsForRig(ctx.RigName)
+				prompt := renderPrompt(fsys.OSFS{}, cityPath, cityName, promptFile, ctx, cfg.Workspace.SessionTemplate, stderr,
+					packDirs, fragments, nil)
+				if prompt != "" {
+					writePrimePromptWithFormat(stdout, cityName, ctx.AgentName, prompt, hookMode, hookFormat, suppressHookPrompt)
 					return 0
 				}
+				// Rendered empty (or unreadable) — same fail-open behavior
+				// as the custom prompt_template branch above: fall through
+				// to the default prompt rather than emit nothing.
 			}
 		}
 	}

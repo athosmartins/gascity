@@ -814,8 +814,8 @@ func TestFormulaFilesystemSearchGuidanceCoversPromptSources(t *testing.T) {
 	paths := []string{
 		"examples/gastown/packs/gastown/template-fragments/following-mol.template.md",
 		"examples/gastown/packs/maintenance/template-fragments/following-mol.template.md",
-		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md",
-		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md",
+		"internal/bootstrap/packs/core/assets/prompts/pool-worker.template.md",
+		"internal/bootstrap/packs/core/assets/prompts/graph-worker.template.md",
 	}
 	for _, rel := range paths {
 		t.Run(rel, func(t *testing.T) {
@@ -848,8 +848,8 @@ func TestCoreWorkerPromptsUseAssignedReadyQueryTemplate(t *testing.T) {
 	}
 
 	for _, rel := range []string{
-		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md",
-		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md",
+		"internal/bootstrap/packs/core/assets/prompts/pool-worker.template.md",
+		"internal/bootstrap/packs/core/assets/prompts/graph-worker.template.md",
 	} {
 		t.Run(rel, func(t *testing.T) {
 			data, err := os.ReadFile(filepath.Join(repoRoot, rel))

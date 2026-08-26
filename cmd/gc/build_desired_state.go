@@ -729,6 +729,9 @@ func buildDesiredStateWithSessionBeads(
 		tp.Env["GC_ALIAS"] = identity
 		tp.Env["GC_AGENT"] = identity
 		tp.Env["GC_SESSION_ORIGIN"] = "named"
+		// bd's actor-resolution chain has no other way to learn this named
+		// session's identity — see setTemplateEnvIdentity (wa-xwa7l).
+		tp.Env["BEADS_ACTOR"] = identity
 		// When a canonical bead exists, use ITS session_name as the
 		// desiredState key so syncSessionBeads finds it in bySessionName
 		// and takes the UPDATE path. Without this, resolveSessionName
@@ -2465,6 +2468,12 @@ func setTemplateEnvIdentity(tp *TemplateParams, identity string) {
 	}
 	tp.Env["GC_AGENT"] = identity
 	tp.Env["GC_ALIAS"] = identity
+	// bd's own actor-resolution chain (--actor flag, then $BEADS_ACTOR, then
+	// git config user.name, then $USER) has no other way to learn this
+	// session's identity — without this, a session whose env is stamped only
+	// through this helper falls through to whatever BEADS_ACTOR the tmux
+	// server's ambient environment happens to carry (wa-xwa7l).
+	tp.Env["BEADS_ACTOR"] = identity
 	tp.EnvIdentityStamped = true
 }
 

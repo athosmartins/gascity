@@ -218,6 +218,10 @@ type cleanupOptions struct {
 	ActiveTestRoots   []string
 	KillProcess       func(pid int, sig syscall.Signal) error
 	ReapGracePeriod   time.Duration
+	// Now returns the current time for the reap stage's age-gated fallback
+	// classification (ga-b5l0v). Nil in production (defaults to time.Now);
+	// tests inject a fixed clock for deterministic age-threshold coverage.
+	Now func() time.Time
 }
 
 // runDoltCleanup is the testable core of the `gc dolt-cleanup` command. It
@@ -373,7 +377,18 @@ func runReapStage(report *CleanupReport, opts cleanupOptions) {
 	if activeTestRoots == nil {
 		activeTestRoots = discoverActiveTestRoots(opts.HomeDir, tempDir)
 	}
-	plan := planOrphanReap(procs, rigPorts, opts.HomeDir, tempDir, activeTestRoots)
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	// Captured once and reused for the whole reap pass (plan + both
+	// revalidation checkpoints below) rather than re-read at each site —
+	// age only ever increases, so reusing the same reference point is
+	// strictly conservative (never causes a target to look OLDER at
+	// revalidation than it did at plan time) and keeps one run's decisions
+	// internally consistent.
+	nowT := nowFn()
+	plan := planOrphanReap(procs, rigPorts, opts.HomeDir, tempDir, activeTestRoots, nowT)
 
 	report.Reaped.ProtectedPIDs = nil
 	for _, p := range plan.Protected {
@@ -403,7 +418,7 @@ func runReapStage(report *CleanupReport, opts cleanupOptions) {
 	gone := make(map[int]bool, len(plan.Reap))
 	sigtermSent := make(map[int]bool, len(plan.Reap))
 	for _, target := range plan.Reap {
-		switch revalidateReapTarget(report, discover, target, rigPorts, opts.HomeDir, tempDir, activeTestRoots, "SIGTERM") {
+		switch revalidateReapTarget(report, discover, target, rigPorts, opts.HomeDir, tempDir, activeTestRoots, nowT, "SIGTERM") {
 		case reapRevalidationEligible:
 		case reapRevalidationVanished:
 			appendVanishedPID(report, target.PID)
@@ -429,7 +444,7 @@ func runReapStage(report *CleanupReport, opts cleanupOptions) {
 		if gone[target.PID] || !sigtermSent[target.PID] {
 			continue
 		}
-		switch revalidateReapTarget(report, discover, target, rigPorts, opts.HomeDir, tempDir, activeTestRoots, "SIGKILL") {
+		switch revalidateReapTarget(report, discover, target, rigPorts, opts.HomeDir, tempDir, activeTestRoots, nowT, "SIGKILL") {
 		case reapRevalidationEligible:
 		case reapRevalidationVanished:
 			gone[target.PID] = true
@@ -483,7 +498,7 @@ const (
 	reapRevalidationError
 )
 
-func revalidateReapTarget(report *CleanupReport, discover func() ([]DoltProcInfo, error), target ReapTarget, rigPorts map[int]string, homeDir, tempDir string, activeTestRoots []string, signalName string) reapRevalidationStatus {
+func revalidateReapTarget(report *CleanupReport, discover func() ([]DoltProcInfo, error), target ReapTarget, rigPorts map[int]string, homeDir, tempDir string, activeTestRoots []string, now time.Time, signalName string) reapRevalidationStatus {
 	refreshed, err := discover()
 	if err != nil {
 		recordReapRevalidationError(report, signalName, err)
@@ -493,7 +508,7 @@ func revalidateReapTarget(report *CleanupReport, discover func() ([]DoltProcInfo
 		if proc.PID != target.PID {
 			continue
 		}
-		recheck := classifyDoltProcess(proc, rigPorts, homeDir, tempDir, activeTestRoots)
+		recheck := classifyDoltProcess(proc, rigPorts, homeDir, tempDir, activeTestRoots, now)
 		if recheck.Action != "reap" || recheck.ConfigPath != target.ConfigPath || !sameReapProcessIdentity(target, proc) {
 			appendProtectedPID(report, target.PID)
 			return reapRevalidationProtected

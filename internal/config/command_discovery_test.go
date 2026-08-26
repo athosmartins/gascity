@@ -181,3 +181,69 @@ func TestDiscoverPackCommands_AllowsVisibleAssetSubdirsUnderLeaf(t *testing.T) {
 		t.Fatalf("command words = %#v, want %#v", got[0].Command, []string{"deploy"})
 	}
 }
+
+// TestDiscoverPackCommands_ManifestBindingOverride is a regression test for
+// ga-9n9z7: town-deltas (and any other local pack) had no way to claim an
+// EXISTING binding namespace for one of its own commands/*/run.sh entries —
+// command.toml could redirect the verb path (see ManifestOverride above) but
+// always registered under the importing pack's own default binding
+// (stampDefaultBinding), so a same-named command in a differently-named pack
+// could never override — e.g. a town-deltas command.toml declaring
+// `command = ["dolt", "compact"]` still landed under `gc town-deltas ...`,
+// never under `gc dolt compact`. This proves a pack can now declare an
+// explicit `binding` in command.toml to target another pack's namespace —
+// the discovery half of the override; cmd/gc's
+// TestAddDiscoveredCommandsToRoot_LaterEntryOverridesEarlierLeaf proves the
+// other half (that a later-registered same-binding/same-verb entry actually
+// wins the CLI leaf instead of being silently dropped).
+func TestDiscoverPackCommands_ManifestBindingOverride(t *testing.T) {
+	dir := t.TempDir()
+	packDir := filepath.Join(dir, "town-deltas")
+
+	writeTestFile(t, packDir, "commands/dolt-compact-override/command.toml", `
+command = ["dolt", "compact"]
+binding = "dolt"
+description = "Patched compact"
+run = "../../scripts/compact.sh"
+`)
+	writeTestFile(t, packDir, "scripts/compact.sh", "#!/bin/sh\nexit 0\n")
+
+	got, err := DiscoverPackCommands(fsys.OSFS{}, packDir, "town-deltas")
+	if err != nil {
+		t.Fatalf("DiscoverPackCommands: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d commands, want 1", len(got))
+	}
+	if got[0].BindingName != "dolt" {
+		t.Fatalf("BindingName = %q, want %q (explicit manifest binding must survive discovery, unstamped)", got[0].BindingName, "dolt")
+	}
+	// PackName still reflects the importing pack, independent of the binding
+	// it targets — only the CLI namespace (BindingName) is redirected.
+	if got[0].PackName != "town-deltas" {
+		t.Fatalf("PackName = %q, want %q", got[0].PackName, "town-deltas")
+	}
+}
+
+// TestDiscoverPackCommands_NoManifestBindingLeavesBindingNameEmpty guards the
+// backward-compatible default: a command.toml without `binding` (the
+// overwhelming majority of existing packs) must leave BindingName empty so
+// stampDefaultBinding's `if out[i].BindingName == ""` still applies the
+// importing pack's own name, exactly as before this change.
+func TestDiscoverPackCommands_NoManifestBindingLeavesBindingNameEmpty(t *testing.T) {
+	dir := t.TempDir()
+	packDir := filepath.Join(dir, "mypk")
+
+	writeTestFile(t, packDir, "commands/status/run.sh", "#!/bin/sh\nexit 0\n")
+
+	got, err := DiscoverPackCommands(fsys.OSFS{}, packDir, "mypk")
+	if err != nil {
+		t.Fatalf("DiscoverPackCommands: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d commands, want 1", len(got))
+	}
+	if got[0].BindingName != "" {
+		t.Fatalf("BindingName = %q, want empty (no binding declared)", got[0].BindingName)
+	}
+}

@@ -27,6 +27,17 @@ type commandManifest struct {
 	Command     []string `toml:"command"`
 	Description string   `toml:"description"`
 	Run         string   `toml:"run"`
+	// Binding lets a command explicitly join an EXISTING binding namespace
+	// (e.g. "dolt") instead of defaulting to the importing pack's own name
+	// (stampDefaultBinding, applied later only when BindingName is still
+	// unset). This is the override mechanism for packs/*/commands/*/run.sh
+	// that orders/*.toml already has via internal/orders.ScanRoots'
+	// "higher-priority (later-imported) layer overwrites by name" — see
+	// cmd/gc's addDiscoveredLeaf for the matching leaf-registration half:
+	// a later entry at the same (BindingName, Command) now replaces an
+	// earlier one instead of being silently dropped. Empty (the default for
+	// every existing pack) preserves prior behavior exactly.
+	Binding string `toml:"binding"`
 }
 
 func resolveContainedRunPath(packDir, nodeDir, runRel string) (string, error) {
@@ -110,6 +121,7 @@ func discoveredCommandFromDir(fs fsys.FS, packDir, packName, commandDir string, 
 	manifestPath := filepath.Join(commandDir, "command.toml")
 	words := append([]string{}, defaultWords...)
 	description := ""
+	binding := ""
 
 	if data, err := fs.ReadFile(manifestPath); err == nil {
 		var manifest commandManifest
@@ -126,6 +138,7 @@ func discoveredCommandFromDir(fs fsys.FS, packDir, packName, commandDir string, 
 		if manifest.Run != "" {
 			runRel = manifest.Run
 		}
+		binding = strings.TrimSpace(manifest.Binding)
 	}
 
 	if strings.Contains(runRel, "{{") {
@@ -149,6 +162,7 @@ func discoveredCommandFromDir(fs fsys.FS, packDir, packName, commandDir string, 
 			SourceDir:   commandDir,
 			PackDir:     packDir,
 			PackName:    packName,
+			BindingName: binding,
 		}, true, nil
 	}
 
@@ -179,5 +193,6 @@ func discoveredCommandFromDir(fs fsys.FS, packDir, packName, commandDir string, 
 		SourceDir:   commandDir,
 		PackDir:     packDir,
 		PackName:    packName,
+		BindingName: binding,
 	}, true, nil
 }

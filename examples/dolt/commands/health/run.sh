@@ -88,6 +88,28 @@ now_ms() {
   esac
 }
 
+# Always export DOLT_CLI_PASSWORD (even empty) so no dolt invocation in this
+# script ever prompts for a password on stdin. Without this, any `dolt
+# --user ...` call silently fails with "Failed to parse credentials:
+# operation not supported by device" on sessions without a controlling TTY.
+# ga-soxi9 gate-fix-1 (gate_run=ga-g3hay): this used to live INSIDE the
+# server_running branch below, which the SQL probe (--user via $conn_args)
+# never reached when the server was down anyway — but the per-database
+# backup-freshness loop further down deliberately runs regardless of
+# server_reachable (backups are on-disk and worth checking even when the
+# server is down), and ALSO passes --user. Scoping the export to
+# server_running meant every "dolt --user ... backup -v" call would hit the
+# same interactive-prompt failure precisely when the server is down —
+# reproduced live: 100% of databases reported query-failed in that state,
+# even ones with a perfectly good, freshly-synced backup, defeating the
+# whole point of checking backups independent of server reachability.
+# Exporting unconditionally costs nothing for the server_running path
+# (identical value, just set slightly earlier) and is safe file-wide: every
+# `dolt` invocation in this script already passes --user (verified by
+# inspection — the two conn_args-based SQL calls and this backup call are
+# the only three).
+export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
+
 # Find dolt PID by port.
 pid=$(managed_runtime_listener_pid "$GC_DOLT_PORT" || true)
 if [ -n "$pid" ] || managed_runtime_tcp_reachable "$GC_DOLT_PORT"; then
@@ -96,13 +118,6 @@ if [ -n "$pid" ] || managed_runtime_tcp_reachable "$GC_DOLT_PORT"; then
   # Measure query latency.
   start_ms=$(now_ms)
   conn_args="--host $host --port $GC_DOLT_PORT --user $GC_DOLT_USER --no-tls"
-  # Always export DOLT_CLI_PASSWORD (even empty) so the client does not
-  # prompt for a password on stdin. Without this, the SELECT 1 probe
-  # silently fails with "Failed to parse credentials: operation not
-  # supported by device" on sessions without a controlling TTY —
-  # which then left the health report claiming "server: running" but
-  # never reporting per-database detail.
-  export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
   # Bound the ping. A TCP-reachable but unresponsive server (stuck
   # goroutine, saturated pool, migration lock) would otherwise hang.
   if run_bounded 5 dolt $conn_args sql -q "SELECT 1" >/dev/null 2>&1; then
@@ -120,8 +135,14 @@ _meta_cache=$(mktemp)
 # mutated through the pipe); the survivors are spooled here and read back in
 # the parent shell.
 _zombie_scan_out=$(mktemp)
+# Scratch file for one database's `dolt backup -v` output at a time (ga-soxi9
+# backup-freshness loop below). Same reason as _zombie_scan_out: a `... | while
+# read` would run the loop body in a subshell, losing every variable it sets
+# once the pipe closes. Redirecting from a file instead of piping into the
+# loop keeps it in the parent shell, where the mutations need to land.
+_backup_remotes_tmp=$(mktemp)
 metadata_files > "$_meta_cache"
-trap 'rm -f "$_meta_cache" "$_zombie_scan_out"' EXIT
+trap 'rm -f "$_meta_cache" "$_zombie_scan_out" "$_backup_remotes_tmp"' EXIT
 
 # Collect database info.
 #
@@ -185,23 +206,132 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
   done
 fi
 
-# Check backup freshness.
-backup_freshness=""
-backup_stale=false
-backup_age_sec=0
-newest_backup=$(ls -1d "$GC_CITY_PATH"/migration-backup-* 2>/dev/null | sort -r | head -1 || true)
-if [ -n "$newest_backup" ]; then
-  backup_mtime=$(stat -c %Y "$newest_backup" 2>/dev/null || stat -f %m "$newest_backup" 2>/dev/null || echo 0)
-  now=$(date +%s)
-  backup_age_sec=$((now - backup_mtime))
-  if [ "$backup_age_sec" -ge 3600 ]; then
-    backup_freshness="$((backup_age_sec / 3600))h$((backup_age_sec % 3600 / 60))m"
-  elif [ "$backup_age_sec" -ge 60 ]; then
-    backup_freshness="$((backup_age_sec / 60))m$((backup_age_sec % 60))s"
+# Format a whole-seconds age as a short human string (h/m/s), same shape the
+# old single-value check used to produce.
+_backup_human_age() {
+  _a="$1"
+  if [ "$_a" -ge 3600 ]; then
+    printf '%sh%sm' "$((_a / 3600))" "$((_a % 3600 / 60))"
+  elif [ "$_a" -ge 60 ]; then
+    printf '%sm%ss' "$((_a / 60))" "$((_a % 60))"
   else
-    backup_freshness="${backup_age_sec}s"
+    printf '%ss' "$_a"
   fi
-  [ "$backup_age_sec" -gt 1800 ] && backup_stale=true
+}
+
+# Check backup freshness, per database. ga-soxi9: this used to glob
+# "$GC_CITY_PATH"/migration-backup-* and report on THAT — but those
+# directories belong to a different subsystem entirely (gc dolt rollback's
+# own pre-migration snapshots; see commands/rollback/run.sh, the only other
+# reader of that naming convention). The check never asked Dolt about its
+# actual configured backup remotes, so "Backups: none found" and "Backups:
+# Xh ago" were both reporting on data that has nothing to do with whether
+# `dolt backup sync` (mol-dog-backup.sh, the real offsite-backup driver) is
+# working. Ask Dolt itself instead — it is the source of truth for what
+# backups it thinks it has (same doctrine mol-dog-backup.toml already states
+# for the sync side: never assume a naming convention, check every remote
+# name `dolt backup` actually returns) — and report per database, since a
+# single city-wide line cannot distinguish "db A has no backup" from "db B
+# does".
+#
+# backup_info accumulator, one line per database: name|state|age_sec|path|
+# size_bytes|remote_count|verified_remote_count|stale
+#   state=none        no backup remote registered at all (real risk)
+#   state=unverified   remote(s) registered, but none resolved to a verifiable
+#                      local manifest — either a file:// target with the
+#                      backup data actually missing (real risk), or every
+#                      remote uses a scheme this check cannot stat locally
+#                      (e.g. s3://) — "don't know" must never render the same
+#                      as "confirmed good" or the same as "confirmed absent"
+#   state=ok           at least one file:// remote has a real manifest;
+#                      age/path/size describe the freshest such remote
+#   state=query-failed `dolt backup -v` itself failed or timed out (e.g.
+#                      transient contention on a busy host) — distinct from
+#                      "none": we did not learn anything about this
+#                      database's backups, so we must not report it as
+#                      either registered or absent
+backup_info=""
+if [ -d "$data_dir" ]; then
+  for d in "$data_dir"/*/; do
+    [ ! -d "$d/.dolt" ] && continue
+    name="$(basename "$d")"
+    case "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" in information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe) continue ;; esac
+
+    # --user must precede the subcommand (dolt's global-flag position) and
+    # is required here even though `backup -v` makes no server connection:
+    # DOLT_CLI_PASSWORD is exported unconditionally above (even as "") and
+    # applies to every dolt invocation for the rest of this script's
+    # lifetime — without a matching --user, dolt's credential parser treats
+    # a present password with no user as a hard error ("Failed to parse
+    # credentials"), not a timeout, and every database failed identically
+    # until this was added (reproduced live on this host). The export was
+    # gate-fixed (ga-g3hay) to be unconditional, not scoped to
+    # server_running, specifically so this call — which runs regardless of
+    # server reachability — never falls back to dolt's interactive password
+    # prompt when the server is down.
+    if (cd "$d" && run_bounded 5 dolt --user "$GC_DOLT_USER" backup -v 2>/dev/null) > "$_backup_remotes_tmp"; then
+      # grep -c always writes a count to stdout, including "0" for zero
+      # matches — but a "0" result also has a non-zero EXIT status (no match
+      # found), which under this file's `set -e` would abort the whole
+      # script right here (a bare `x=$(cmd)` propagates cmd's exit status).
+      # `|| true` neutralizes only that exit-status trip; it does NOT affect
+      # what already landed in $remote_count, so it does not reintroduce the
+      # double-"0" bug a `|| echo 0` fallback would (that form appends a
+      # SECOND "0" behind the one grep already printed on the zero-match
+      # path, corrupting remote_count with an embedded newline — caught
+      # live while building this fix). Only fall back to 0 if grep produced
+      # no output at all (e.g. the file genuinely couldn't be read).
+      remote_count=$(grep -c . "$_backup_remotes_tmp" 2>/dev/null) || true
+      [ -z "$remote_count" ] && remote_count=0
+    else
+      # The query itself failed/timed out — do not conflate with "ran
+      # successfully and found zero remotes" (state=none below). Reproduced
+      # live on this exact host: a single database's `dolt backup -v` failed
+      # once under concurrent load while 10 others in the same sweep
+      # succeeded, and while every other run in isolation (13/13) succeeded
+      # too — a transient hiccup, not a real "no backup" condition, and
+      # exactly the silent-collapse shape this bug is about.
+      backup_info="$backup_info$name|query-failed|0||0|0|0|false
+"
+      continue
+    fi
+    if [ "$remote_count" -eq 0 ]; then
+      backup_info="$backup_info$name|none|0||0|0|0|false
+"
+      continue
+    fi
+
+    best_mtime=0; best_path=""; best_size=0; verified_count=0
+    while read -r rname rurl _rrest; do
+      [ -z "$rname" ] && continue
+      case "$rurl" in
+        file://*)
+          rpath="${rurl#file://}"
+          [ -f "$rpath/manifest" ] || continue
+          verified_count=$((verified_count + 1))
+          m_mtime=$(stat -c %Y "$rpath/manifest" 2>/dev/null || stat -f %m "$rpath/manifest" 2>/dev/null || echo 0)
+          if [ "$m_mtime" -gt "$best_mtime" ]; then
+            best_mtime="$m_mtime"
+            best_path="$rpath"
+            size_kb=$(du -sk "$rpath" 2>/dev/null | cut -f1)
+            best_size=$(( ${size_kb:-0} * 1024 ))
+          fi
+          ;;
+      esac
+    done < "$_backup_remotes_tmp"
+
+    if [ "$best_mtime" -gt 0 ]; then
+      now=$(date +%s)
+      age=$((now - best_mtime))
+      stale=false
+      [ "$age" -gt 1800 ] && stale=true
+      backup_info="$backup_info$name|ok|$age|$best_path|$best_size|$remote_count|$verified_count|$stale
+"
+    else
+      backup_info="$backup_info$name|unverified|0||0|$remote_count|0|false
+"
+    fi
+  done
 fi
 
 # Find orphan databases.
@@ -371,11 +501,18 @@ JSONEOF
   cat <<JSONEOF
 
   ],
-  "backups": {
-    "dolt_freshness": "$backup_freshness",
-    "dolt_age_sec": $backup_age_sec,
-    "dolt_stale": $backup_stale
-  },
+  "backups": [
+JSONEOF
+  first=true
+  echo "$backup_info" | while IFS='|' read -r name state age path size remote_count verified_count stale; do
+    [ -z "$name" ] && continue
+    if [ "$first" = true ]; then first=false; else echo ","; fi
+    printf '    {"name": "%s", "state": "%s", "age_sec": %s, "path": "%s", "size_bytes": %s, "remote_count": %s, "verified_remote_count": %s, "stale": %s}' \
+      "$name" "$state" "$age" "$path" "$size" "$remote_count" "$verified_count" "$stale"
+  done
+  cat <<JSONEOF
+
+  ],
   "orphans": [
 JSONEOF
   first=true
@@ -419,14 +556,36 @@ if [ -n "$db_info" ]; then
   done
 fi
 
-if [ -n "$backup_freshness" ]; then
-  stale=""
-  [ "$backup_stale" = true ] && stale=" [STALE]"
+if [ -n "$backup_info" ]; then
   echo ""
-  echo "Backups: ${backup_freshness} ago${stale}"
-else
-  echo ""
-  echo "Backups: none found"
+  echo "Backups:"
+  echo "$backup_info" | while IFS='|' read -r name state age path size remote_count verified_count stale; do
+    [ -z "$name" ] && continue
+    case "$state" in
+      ok)
+        human_age=$(_backup_human_age "$age")
+        stale_tag=""
+        [ "$stale" = true ] && stale_tag=" [STALE]"
+        if [ "$size" -ge 1048576 ]; then
+          human_size=$(awk "BEGIN {printf \"%.1f MB\", $size/1048576}")
+        elif [ "$size" -ge 1024 ]; then
+          human_size=$(awk "BEGIN {printf \"%.1f KB\", $size/1024}")
+        else
+          human_size="${size} B"
+        fi
+        echo "  $name: ${human_age} ago${stale_tag} ($human_size, $path)"
+        ;;
+      none)
+        echo "  $name: NONE REGISTERED"
+        ;;
+      unverified)
+        echo "  $name: registered ($remote_count remote(s)) but could not verify any locally — check manually"
+        ;;
+      query-failed)
+        echo "  $name: could not query backup config (dolt backup -v failed/timed out) — check manually"
+        ;;
+    esac
+  done
 fi
 
 if [ "$orphan_count" -gt 0 ]; then

@@ -663,10 +663,7 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 
 	// Compile wisp from formula so graph workflows can be decorated with
 	// routing metadata before instantiation.
-	var searchPaths []string
-	if a.FormulaLayer != "" {
-		searchPaths = []string{a.FormulaLayer}
-	}
+	searchPaths := orderFormulaSearchPaths(a, cfg)
 	recipe, err := prepareOrderWispRecipe(context.Background(), store, a, searchPaths)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc order run: %v\n", err) //nolint:errcheck // best-effort stderr

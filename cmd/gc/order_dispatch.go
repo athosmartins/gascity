@@ -1155,6 +1155,35 @@ func prepareOrderWispRecipe(ctx context.Context, store beads.Store, a orders.Ord
 	return formula.CompileWithoutRuntimeVarValidation(ctx, a.Formula, searchPaths, inv.Vars)
 }
 
+// orderFormulaSearchPaths returns the formula search paths for compiling an
+// order's wisp/molecule recipe. The city/rig FormulaLayers list is checked
+// first (lowest→highest priority, per config.ComputeFormulaLayers — a
+// same-named town-deltas override always sorts last and wins) so an
+// order-triggered molecule resolves formulas exactly like `gc formula show`,
+// sling, and convergence/convoy dispatch already do. a.FormulaLayer — the
+// single directory the order's own TOML happened to be scanned from — is
+// appended as a lower-priority fallback so an order whose formula lives
+// outside the configured FormulaLayers set (ad-hoc/test layers) still
+// resolves.
+//
+// Without the cfg-derived paths, a single-layer search degenerates
+// formula.Resolve's "highest-priority layer wins" into "only layer, period"
+// — an order whose own TOML was scanned from the builtin pack (no
+// town-deltas override of the order itself, only of the formula it
+// references) would silently compile from a stale builtin formula copy even
+// though a town-deltas override exists and is otherwise correctly resolved
+// by every other caller (ga-65rml0).
+func orderFormulaSearchPaths(a orders.Order, cfg *config.City) []string {
+	var searchPaths []string
+	if a.FormulaLayer != "" {
+		searchPaths = append(searchPaths, a.FormulaLayer)
+	}
+	if cfg != nil {
+		searchPaths = append(searchPaths, cfg.FormulaLayers.SearchPaths(a.Rig)...)
+	}
+	return searchPaths
+}
+
 func redactOrderEnvError(err error, env []string) string {
 	if err == nil {
 		return ""
@@ -1197,10 +1226,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		}
 	}
 
-	var searchPaths []string
-	if a.FormulaLayer != "" {
-		searchPaths = []string{a.FormulaLayer}
-	}
+	searchPaths := orderFormulaSearchPaths(a, m.cfg)
 	recipe, err := prepareOrderWispRecipe(ctx, store, a, searchPaths)
 	if err != nil {
 		m.rec.Record(events.Event{

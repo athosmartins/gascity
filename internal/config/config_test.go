@@ -1725,7 +1725,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=1`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
@@ -1747,7 +1747,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=1`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
@@ -1875,8 +1875,15 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	got := a.EffectiveAssignedInProgressQuery()
 	for _, want := range []string{
 		`"$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"`,
-		`bd list --status in_progress --assignee="$id" --json --limit=1`,
+		`bd list --status in_progress --assignee="$id" --json --limit=20`,
 		`ephemeral=true AND status=in_progress`,
+		// ga-ael6v: the assigned-in-progress ("crash recovery") tier must apply
+		// the same pool:refused:*/pilot:held* prefix filter as the routed-pool
+		// tier (ga-g7yt/ga-y8qh) — otherwise a bead a prior session already
+		// refused gets reassigned to a fresh session by inflight-reclaim-guard
+		// and is re-offered as if it were live work to resume.
+		`startswith("pool:refused")`,
+		`startswith("pilot:held")`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveAssignedInProgressQuery() missing assigned recovery fragment %q: %q", want, got)
@@ -1891,12 +1898,39 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=1") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
   *) printf '[]' ;;
 esac
 `)
 	if strings.TrimSpace(out) != `[{"id":"assigned-in-progress","ephemeral":true}]` {
 		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want assigned in-progress work", out)
+	}
+}
+
+// TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead (ga-ael6v): the
+// bug's own acceptance bar is empirical, not textual — "a bead with
+// pool:refused:* does not appear in Step 1a, proven by observation, not by
+// reading the filter." This drives a real bead-shaped payload (carrying the
+// label a prior session's refusal would have left behind) through the actual
+// generated shell command via a fake `bd`, and asserts the bead does NOT come
+// back — reproducing the ga-9ae7o incident (reassigned-after-refusal bead
+// resurfacing to a fresh dog session) as a regression test.
+func TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedInProgressQuery()
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_ID": "worker-bead",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+  "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[]` {
+		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want [] (pool:refused bead must not be re-offered)", out)
 	}
 }
 
@@ -1926,6 +1960,10 @@ func TestEffectiveRoutedPoolQueryDefault(t *testing.T) {
 		`hello-world/worker`,
 		`gc.routed_to`,
 		`gc.run_target`,
+		// ga-nf4x5: story:needs-human's sibling merit/legal-approval gate must be
+		// excluded from routed-pool candidacy the same way — a bead awaiting
+		// Athos's sign-off is not a code-build story regardless of ctx:ready/exec:auto.
+		`--exclude-label "story:needs-approval"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveRoutedPoolQuery() missing routed pool fragment %q: %q", want, got)
@@ -1941,6 +1979,28 @@ esac
 `)
 	if strings.TrimSpace(out) != `[{"id":"routed-pool"}]` {
 		t.Fatalf("EffectiveRoutedPoolQuery() output = %q, want routed pool work", out)
+	}
+}
+
+// TestBdReadyPoolDemandExcludeLabelArgsIncludesNeedsApproval (ga-nf4x5, SECURITY):
+// story:needs-approval is the Athos MERIT/legal sign-off gate — distinct from
+// story:needs-human (an INFO-GAP) but must be excluded from routed-pool dispatch
+// candidacy the same way. Near-miss: wa-6xn82 (a real LAI legal filing) carried
+// story:needs-approval and was still dispatched to the wa-worker pool with "No
+// human review required" before a worker happened to read the comment and refuse
+// by hand. This is the function that generates the dog's routed-pool probe (the
+// wa-worker/ps-worker probes carry the equivalent exclusion hardcoded in their own
+// prompt.template.md — see pilot-dispatcher.selftest.sh Scenario ga-nf4x5).
+func TestBdReadyPoolDemandExcludeLabelArgsIncludesNeedsApproval(t *testing.T) {
+	got := bdReadyPoolDemandExcludeLabelArgs()
+	for _, want := range []string{
+		`--exclude-label "story:needs-human"`,
+		`--exclude-label "story:needs-approval"`,
+		`--exclude-label "ctx:thin"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
+		}
 	}
 }
 
@@ -2120,13 +2180,13 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -2155,7 +2215,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit=1")
+  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --json --sort oldest --limit=20")
     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
     ;;
   *)
@@ -2200,7 +2260,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
     ;;
   *)
@@ -2223,7 +2283,7 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=1"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
     printf '[]'
     ;;
   *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
@@ -2271,7 +2331,7 @@ func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
 	wantPresent := []string{
 		// routed/pool tier still excludes epics (gc-udx guard)
-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json`,
+		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json`,
 		// assigned tiers carry NO epic exclusion
 		`bd list --status in_progress --assignee="$id" --json`,
 		`bd ready --assignee="$id" --json`,
@@ -2297,7 +2357,7 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	got := a.EffectiveWorkQuery()
 	wantPresent := []string{
-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json`,
+		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json`,
 		`bd list --status in_progress --assignee="$cand" --json`,
 		`bd ready --assignee="$cand" --json`,
 		`-- gascity/control-dispatcher gascity/workflow-control`,
@@ -2620,9 +2680,32 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wq := tt.agent.EffectiveWorkQuery()
 			demand := tt.agent.EffectivePoolDemandQuery()
-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=1", false)
+			// ga-g7yt: the first-row probe now asks for a WINDOW (--limit=20) and
+			// takes the first survivor AFTER the label filter, because --limit=1
+			// then filter is a trap — a parked/held oldest row hides real work
+			// behind it. The shared predicate is still bdReadyPoolDemandShell; only
+			// the limit changed.
+			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=20", false)
 			if !strings.Contains(wq, workPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
+			}
+			// ga-g7yt regression guard: BOTH the worker probe and the reconciler
+			// count must carry the pool:refused:* / pilot:held* prefix filter, or
+			// they disagree — the reconciler counts a parked bead as demand and
+			// spawns a pool for work no worker may claim (the ~17-dog-sessions/11h
+			// churn on ga-66wc). Assert the filter's signature is present in both.
+			for _, hay := range []struct {
+				name, s string
+			}{{"EffectiveWorkQuery", wq}, {"EffectivePoolDemandQuery", demand}} {
+				if !strings.Contains(hay.s, `startswith("pool:refused")`) {
+					t.Errorf("%s() missing pool:refused prefix filter in %q", hay.name, hay.s)
+				}
+				if !strings.Contains(hay.s, `startswith("pilot:held")`) {
+					t.Errorf("%s() missing pilot:held prefix filter in %q", hay.name, hay.s)
+				}
+				if !strings.Contains(hay.s, `--exclude-label "needs-human"`) {
+					t.Errorf("%s() missing needs-human exact exclusion in %q", hay.name, hay.s)
+				}
 			}
 			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit=20", false)
 			if !strings.Contains(wq, migrationWorkPredicate) {

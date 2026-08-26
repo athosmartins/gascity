@@ -8147,3 +8147,96 @@ func TestDispatchClosesNoStoresWhenCitySuspended(t *testing.T) {
 		t.Errorf("storeFn called %d times, want 0 when city is suspended", len(spies))
 	}
 }
+
+// TestOrderDispatchWispUsesConfiguredFormulaLayersOverOrderScannedLayer is
+// the regression test for ga-65rml0: an order-triggered molecule must
+// resolve its formula through the city/rig's full, correctly-precedenced
+// FormulaLayers — not just the single directory the order's own TOML
+// happened to be scanned from (a.FormulaLayer). Simulates the real-world
+// shape of the bug: the order definition lives only in a "builtin" layer
+// (staleDir), but a higher-priority layer (freshDir, standing in for a
+// town-deltas override) has a same-named formula with different step
+// content. Before the ga-65rml0 fix, searchPaths was just
+// []string{a.FormulaLayer}, so the molecule always materialized from
+// staleDir regardless of what freshDir contained.
+func TestOrderDispatchWispUsesConfiguredFormulaLayersOverOrderScannedLayer(t *testing.T) {
+	staleDir := t.TempDir()
+	writeFile(t, filepath.Join(staleDir, "test-formula.toml"), `formula = "test-formula"
+version = 1
+
+[[steps]]
+id = "work"
+title = "STALE STEP"
+`)
+
+	freshDir := t.TempDir()
+	writeFile(t, filepath.Join(freshDir, "test-formula.toml"), `formula = "test-formula"
+version = 1
+
+[[steps]]
+id = "work"
+title = "FRESH STEP"
+`)
+
+	store := beads.NewMemStore()
+	tracking, err := store.Create(beads.Bead{
+		Title:  "order:digest-like",
+		Labels: []string{"order-run:digest-like", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		FormulaLayers: config.FormulaLayers{
+			// Lowest→highest priority (per formula.Resolve): freshDir last
+			// means freshDir wins, matching how a town-deltas layer is
+			// imported after the builtin gastown pack in a real city.
+			City: []string{staleDir, freshDir},
+		},
+	}
+	var stderr bytes.Buffer
+	ad := buildOrderDispatcherFromOrderSet(t.TempDir(), cfg, []orders.Order{{
+		Name:         "digest-like",
+		Trigger:      "cooldown",
+		Interval:     "1m",
+		Formula:      "test-formula",
+		FormulaLayer: staleDir, // order's own TOML was scanned from the stale layer
+	}}, events.Discard, &stderr)
+	if ad == nil {
+		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
+	}
+	mad := ad.(*memoryOrderDispatcher)
+
+	mad.dispatchWisp(context.Background(), store, mad.aa[0], t.TempDir(), tracking.ID)
+
+	// The order's root/molecule bead only gets Title=recipe.Name (the
+	// synthetic root step compile.go always injects) — the [[steps]] step
+	// from the formula body materializes as a separate CHILD bead, which
+	// dispatchWisp does not label, so it must be found by a full scan
+	// rather than by "order-run:" label.
+	all, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("store.List: %v", err)
+	}
+	var stepTitle string
+	found := false
+	for _, b := range all {
+		if b.Title == "STALE STEP" || b.Title == "FRESH STEP" {
+			stepTitle = b.Title
+			found = true
+			break
+		}
+	}
+	if !found {
+		var dump []string
+		for _, b := range all {
+			dump = append(dump, fmt.Sprintf("{id=%s title=%q type=%q ref=%q}", b.ID, b.Title, b.Type, b.Ref))
+		}
+		t.Fatalf("no step bead titled STALE STEP or FRESH STEP found among %d beads: %v (stderr: %s)", len(all), dump, stderr.String())
+	}
+	if stepTitle != "FRESH STEP" {
+		t.Fatalf("step bead Title = %q, want %q (materialized from staleDir instead of the higher-priority freshDir; stderr: %s)",
+			stepTitle, "FRESH STEP", stderr.String())
+	}
+}

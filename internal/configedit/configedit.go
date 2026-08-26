@@ -13,6 +13,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 
@@ -550,42 +553,184 @@ func isAgentPatchOnlyIdentity(p config.AgentPatch) bool {
 func WriteLocalDiscoveredAgentSuspended(fs fsys.FS, cityRoot string, agent config.Agent, suspended bool) error {
 	agentTomlPath := filepath.Join(cityRoot, "agents", agent.Name, "agent.toml")
 
-	values := make(map[string]any)
-	data, err := fs.ReadFile(agentTomlPath)
-	switch {
-	case err == nil:
-		if len(bytes.TrimSpace(data)) > 0 {
-			if _, decodeErr := toml.Decode(string(data), &values); decodeErr != nil {
-				return fmt.Errorf("reading agents/%s/agent.toml: %w", agent.Name, decodeErr)
-			}
-		}
-	case os.IsNotExist(err):
-		// Start from an empty config; suspend=true may create the file.
-	default:
-		return fmt.Errorf("reading agents/%s/agent.toml: %w", agent.Name, err)
-	}
-
+	sets := map[string]any{}
+	var deletes []string
 	if suspended {
-		values["suspended"] = true
+		sets["suspended"] = true
 	} else {
-		delete(values, "suspended")
+		deletes = []string{"suspended"}
 	}
 
+	values, err := mutateLocalDiscoveredAgentTOML(fs, agentTomlPath, sets, deletes)
+	if err != nil {
+		return fmt.Errorf("agents/%s/agent.toml: %w", agent.Name, err)
+	}
 	if len(values) == 0 {
 		if err := fs.Remove(agentTomlPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("removing agents/%s/agent.toml: %w", agent.Name, err)
 		}
-		return nil
+	}
+	return nil
+}
+
+// keyAssignmentRE matches a top-level "key = value" line in a flat TOML
+// file: a bare key at the start of the line, followed by '='. agent.toml's
+// schema is always flat scalars (validateLocalDiscoveredAgent /
+// unsupportedLocalDiscoveredAgentFields never allow nested tables), so this
+// never needs to understand [section] headers — hasTableHeader below routes
+// anything with one away from this patcher entirely.
+var keyAssignmentRE = regexp.MustCompile(`(?m)^([A-Za-z0-9_-]+)\s*=`)
+
+// hasTableHeader reports whether text contains a TOML [section] or
+// [[array-of-tables]] header. A hit means the file is outside agent.toml's
+// known flat-scalar schema; mutateLocalDiscoveredAgentTOML falls back to a
+// full re-encode in that case rather than risk splicing a patched line into
+// the wrong table.
+func hasTableHeader(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeTOMLAssignment renders a single "key = value" TOML line via the
+// real encoder, so value quoting/escaping matches BurntSushi's own rules
+// instead of a hand-rolled formatter.
+func encodeTOMLAssignment(key string, value any) (string, error) {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(map[string]any{key: value}); err != nil {
+		return "", err
+	}
+	return strings.TrimRight(buf.String(), "\n"), nil
+}
+
+// patchFlatTOML applies `sets` (added or updated) and `deletes` (removed)
+// to the top-level keys of flat TOML text, preserving every other line —
+// comments, blank lines, and the existing key order — byte for byte. Only
+// call this when hasTableHeader(original) is false.
+//
+// An existing key's line is replaced in place (value only, same position);
+// a new key is appended at the end, after a blank-line separator when the
+// file already has content. Deleted keys are dropped entirely.
+func patchFlatTOML(original string, sets map[string]any, deletes []string) (string, error) {
+	var lines []string
+	if trimmed := strings.TrimSuffix(original, "\n"); trimmed != "" {
+		lines = strings.Split(trimmed, "\n")
+	}
+
+	handled := make(map[string]bool, len(sets))
+	out := make([]string, 0, len(lines)+len(sets))
+	for _, line := range lines {
+		m := keyAssignmentRE.FindStringSubmatch(line)
+		if m == nil {
+			out = append(out, line)
+			continue
+		}
+		key := m[1]
+		if slices.Contains(deletes, key) {
+			continue
+		}
+		if v, ok := sets[key]; ok {
+			newLine, err := encodeTOMLAssignment(key, v)
+			if err != nil {
+				return "", err
+			}
+			out = append(out, newLine)
+			handled[key] = true
+			continue
+		}
+		out = append(out, line)
+	}
+
+	var newKeys []string
+	for k := range sets {
+		if !handled[k] {
+			newKeys = append(newKeys, k)
+		}
+	}
+	sort.Strings(newKeys)
+	if len(newKeys) > 0 {
+		for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+			out = out[:len(out)-1]
+		}
+		if len(out) > 0 {
+			out = append(out, "")
+		}
+		for _, k := range newKeys {
+			newLine, err := encodeTOMLAssignment(k, sets[k])
+			if err != nil {
+				return "", err
+			}
+			out = append(out, newLine)
+		}
+	}
+
+	result := strings.Join(out, "\n")
+	if result == "" {
+		return "", nil
+	}
+	return result + "\n", nil
+}
+
+// mutateLocalDiscoveredAgentTOML applies `sets` (added/updated) and
+// `deletes` (removed) to agentTomlPath's top-level keys, preserving
+// comments and key order via patchFlatTOML instead of the decode-to-map,
+// mutate, re-encode-the-whole-map round trip this replaced. That round
+// trip silently destroyed every hand-written comment on ANY mutation,
+// regardless of which field actually changed, because BurntSushi's TOML
+// encoder has no concept of comments and alphabetizes map[string]any keys
+// on encode (ga-gdjav).
+//
+// Returns the full post-mutation key set so callers can tell whether an
+// empty result means the file should be removed instead of written.
+func mutateLocalDiscoveredAgentTOML(fs fsys.FS, agentTomlPath string, sets map[string]any, deletes []string) (map[string]any, error) {
+	data, err := fs.ReadFile(agentTomlPath)
+	var original string
+	switch {
+	case err == nil:
+		original = string(data)
+	case os.IsNotExist(err):
+		// Start from an empty config; a set may create the file.
+	default:
+		return nil, fmt.Errorf("reading: %w", err)
+	}
+
+	values := make(map[string]any)
+	if strings.TrimSpace(original) != "" {
+		if _, decodeErr := toml.Decode(original, &values); decodeErr != nil {
+			return nil, fmt.Errorf("reading: %w", decodeErr)
+		}
+	}
+	for _, k := range deletes {
+		delete(values, k)
+	}
+	for k, v := range sets {
+		values[k] = v
+	}
+
+	if len(values) == 0 {
+		return values, nil
+	}
+
+	if !hasTableHeader(original) {
+		if patched, perr := patchFlatTOML(original, sets, deletes); perr == nil {
+			if err := fsys.WriteFileAtomic(fs, agentTomlPath, []byte(patched), 0o644); err != nil {
+				return nil, fmt.Errorf("writing: %w", err)
+			}
+			return values, nil
+		}
 	}
 
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(values); err != nil {
-		return fmt.Errorf("encoding agents/%s/agent.toml: %w", agent.Name, err)
+		return nil, fmt.Errorf("encoding: %w", err)
 	}
 	if err := fsys.WriteFileAtomic(fs, agentTomlPath, buf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("writing agents/%s/agent.toml: %w", agent.Name, err)
+		return nil, fmt.Errorf("writing: %w", err)
 	}
-	return nil
+	return values, nil
 }
 
 func removeLocalDiscoveredAgentConfig(fs fsys.FS, cityRoot string, agent config.Agent) error {
@@ -779,28 +924,20 @@ func writeLocalDiscoveredAgentUpdate(fs fsys.FS, cityRoot string, agent config.A
 	}
 
 	agentTomlPath := filepath.Join(cityRoot, "agents", agent.Name, "agent.toml")
-	values := make(map[string]any)
-	data, err := fs.ReadFile(agentTomlPath)
-	switch {
-	case err == nil:
-		if len(bytes.TrimSpace(data)) > 0 {
-			if _, decodeErr := toml.Decode(string(data), &values); decodeErr != nil {
-				return fmt.Errorf("reading agents/%s/agent.toml: %w", agent.Name, decodeErr)
-			}
-		}
-	case os.IsNotExist(err):
-	default:
-		return fmt.Errorf("reading agents/%s/agent.toml: %w", agent.Name, err)
-	}
-
+	sets := map[string]any{}
 	if patch.Provider != "" {
-		values["provider"] = patch.Provider
+		sets["provider"] = patch.Provider
 	}
 	if patch.Scope != "" {
-		values["scope"] = patch.Scope
+		sets["scope"] = patch.Scope
 	}
 	if patch.Suspended != nil {
-		values["suspended"] = *patch.Suspended
+		sets["suspended"] = *patch.Suspended
+	}
+
+	values, err := mutateLocalDiscoveredAgentTOML(fs, agentTomlPath, sets, nil)
+	if err != nil {
+		return fmt.Errorf("agents/%s/agent.toml: %w", agent.Name, err)
 	}
 
 	// An empty merged convention config means there is no durable agent.toml
@@ -809,15 +946,6 @@ func writeLocalDiscoveredAgentUpdate(fs fsys.FS, cityRoot string, agent config.A
 		if err := fs.Remove(agentTomlPath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("removing agents/%s/agent.toml: %w", agent.Name, err)
 		}
-		return nil
-	}
-
-	var buf bytes.Buffer
-	if err := toml.NewEncoder(&buf).Encode(values); err != nil {
-		return fmt.Errorf("encoding agents/%s/agent.toml: %w", agent.Name, err)
-	}
-	if err := fsys.WriteFileAtomic(fs, agentTomlPath, buf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("writing agents/%s/agent.toml: %w", agent.Name, err)
 	}
 	return nil
 }

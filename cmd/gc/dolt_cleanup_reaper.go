@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // DoltProcInfo describes a live `dolt sql-server` process candidate.
@@ -135,6 +136,45 @@ func hasTestChildPrefix(cleanPath, root string, prefixes []string) bool {
 	return false
 }
 
+// underTempRoot reports whether configPath sits anywhere under root — same
+// root-safety checks as hasTestChildPrefix (a "." or "/" root never matches
+// anything, so a caller passing an unset tempDir can't accidentally match
+// every path on the filesystem), but with NO prefix requirement: any child
+// path counts, not just ones matching a known allowlisted name pattern.
+// Used only by the ga-b5l0v age-gated fallback below — deliberately never by
+// isTestConfigPath, which stays exact-prefix-only for its existing callers
+// (discoverActiveTestRootsFromPS's "is this arg a plausible test root at
+// all" question deliberately keeps the tighter, more conservative check).
+func underTempRoot(configPath, root string) bool {
+	if root == "" {
+		return false
+	}
+	cleanRoot := filepath.Clean(root)
+	if cleanRoot == "." || cleanRoot == string(filepath.Separator) {
+		return false
+	}
+	cleanPath := filepath.Clean(configPath)
+	rootPrefix := cleanRoot + string(filepath.Separator)
+	return strings.HasPrefix(cleanPath, rootPrefix)
+}
+
+// orphanAgeThresholdSeconds is how long a dolt sql-server process must have
+// been running — with a --config path under a system temp root but NOT
+// matching the specific-prefix allowlist above — before the ga-b5l0v
+// fallback below will reap it. The allowlist only recognizes the gc
+// binary's OWN Go-test-harness temp-dir conventions (gctest-*,
+// gc-state-runtime-builtin-*, etc.); it was never meant to, and does not,
+// recognize other tools' throwaway workspaces — e.g. an agent session's
+// scratchpad (/tmp/claude-<uid>/.../scratchpad/...) or other ad-hoc /tmp
+// roots. Two hours is comfortably above every observed legitimate run in
+// this codebase (the largest selftest suite here takes ~12-15 minutes) and
+// well under the 4-hour reap-sweep interval, so a slow-but-legitimate run
+// is never caught mid-flight even if a sweep lands awkwardly — while still
+// being short enough that a genuine orphan (ga-b5l0v: one sat for 2+ days)
+// gets caught within the next sweep or two of going idle, not another
+// multi-day wait.
+const orphanAgeThresholdSeconds = 2 * 60 * 60
+
 func configUnderActiveTestRoot(configPath string, activeTestRoots []string) bool {
 	if configPath == "" {
 		return false
@@ -160,9 +200,17 @@ func configUnderActiveTestRoot(configPath string, activeTestRoots []string) bool
 //  2. Else extract --config path; matches /tmp/Test*, os.TempDir()/Test*,
 //     known Gas City temp prefixes → reap.
 //  3. Else protect if the config sits under an active test root.
-//  4. Else protect with a reason that echoes the actual config path so
+//  4. Else reap if the config is under a system temp root (broader than
+//     step 2's specific prefixes) AND the process has been running longer
+//     than orphanAgeThresholdSeconds (ga-b5l0v — see that constant's doc).
+//     Both conditions required, same as steps 1-3 above never having relied
+//     on a single signal alone: a bare "under /tmp" match isn't sufficient
+//     on its own (a genuinely in-progress run, not yet old enough, must
+//     stay protected), and age alone isn't checked without also confirming
+//     the path is somewhere throwaway in the first place.
+//  5. Else protect with a reason that echoes the actual config path so
 //     operators can decide whether to kill it manually (architect Open Q 0).
-func classifyDoltProcess(p DoltProcInfo, rigPortByPort map[int]string, homeDir, tempDir string, activeTestRoots []string) reapClassification {
+func classifyDoltProcess(p DoltProcInfo, rigPortByPort map[int]string, homeDir, tempDir string, activeTestRoots []string, now time.Time) reapClassification {
 	for _, port := range p.Ports {
 		if name, ok := rigPortByPort[port]; ok {
 			return reapClassification{
@@ -189,6 +237,11 @@ func classifyDoltProcess(p DoltProcInfo, rigPortByPort map[int]string, homeDir, 
 	if isTestConfigPath(cfgPath, homeDir, tempDir) {
 		return reapClassification{Action: "reap", ConfigPath: cfgPath}
 	}
+	if underTempRoot(cfgPath, "/tmp") || underTempRoot(cfgPath, tempDir) {
+		if age, ok := processAgeSeconds(p.StartTimeTicks, p.StartIdentity, now); ok && age >= orphanAgeThresholdSeconds {
+			return reapClassification{Action: "reap", ConfigPath: cfgPath}
+		}
+	}
 	return reapClassification{
 		Action: "protect",
 		Reason: fmt.Sprintf("config %q not on test-config-path allowlist; kill manually if not wanted", cfgPath),
@@ -201,10 +254,10 @@ func classifyDoltProcess(p DoltProcInfo, rigPortByPort map[int]string, homeDir, 
 // planOrphanReap classifies each dolt sql-server process and partitions them
 // into reap targets vs protected processes. Order is preserved so the report
 // renders deterministically.
-func planOrphanReap(procs []DoltProcInfo, rigPortByPort map[int]string, homeDir, tempDir string, activeTestRoots []string) ReapPlan {
+func planOrphanReap(procs []DoltProcInfo, rigPortByPort map[int]string, homeDir, tempDir string, activeTestRoots []string, now time.Time) ReapPlan {
 	plan := ReapPlan{}
 	for _, p := range procs {
-		c := classifyDoltProcess(p, rigPortByPort, homeDir, tempDir, activeTestRoots)
+		c := classifyDoltProcess(p, rigPortByPort, homeDir, tempDir, activeTestRoots, now)
 		switch c.Action {
 		case "reap":
 			plan.Reap = append(plan.Reap, ReapTarget{

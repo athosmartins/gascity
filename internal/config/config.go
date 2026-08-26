@@ -4,6 +4,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1659,6 +1660,11 @@ type DoltConfig struct {
 	// 1 enables archive compaction (higher CPU on startup).
 	// nil (omitted) defaults to 0.
 	ArchiveLevel *int `toml:"archive_level,omitempty" jsonschema:"default=0"`
+	// AutoGCEnabled toggles Dolt's incremental auto-GC on the managed
+	// sql-server. Auto-GC bounds the noms journal so it never reaches
+	// GB scale, which shrinks both the unclean-stop corruption window
+	// and the recovery blast radius. nil (omitted) defaults to true.
+	AutoGCEnabled *bool `toml:"auto_gc_enabled,omitempty" jsonschema:"default=true"`
 	// MaxConnections overrides the managed Dolt listener max_connections.
 	// 0 means use the managed default.
 	MaxConnections int `toml:"max_connections,omitempty" jsonschema:"default=256"`
@@ -1677,6 +1683,25 @@ func (d DoltConfig) EffectiveArchiveLevel() int {
 		return *d.ArchiveLevel
 	}
 	return 0
+}
+
+// EffectiveAutoGCEnabled returns whether Dolt incremental auto-GC is enabled
+// for the managed sql-server, defaulting omitted values to true.
+func (d DoltConfig) EffectiveAutoGCEnabled() bool {
+	if d.AutoGCEnabled != nil {
+		return *d.AutoGCEnabled
+	}
+	return true
+}
+
+// AutoGCSysVar returns the dolt_auto_gc_enabled system-variable value
+// ("ON"/"OFF") matching EffectiveAutoGCEnabled, so the config writer and the
+// doctor contract derive it from one place.
+func (d DoltConfig) AutoGCSysVar() string {
+	if d.EffectiveAutoGCEnabled() {
+		return "ON"
+	}
+	return "OFF"
 }
 
 // EffectiveMaxConnections returns the managed Dolt listener max_connections.
@@ -2134,6 +2159,21 @@ type DaemonConfig struct {
 	// Nil (unset) defaults to 5. Values <= 0 are treated as the default — set a
 	// positive integer to override.
 	MaxWakesPerTick *int `toml:"max_wakes_per_tick,omitempty" jsonschema:"default=5"`
+	// SessionSpawnStagger is the minimum delay the async session-start
+	// reconciler waits between launching consecutive spawn goroutines
+	// within a single wake wave (see enqueuePreparedStartWaveForCity in
+	// cmd/gc/session_lifecycle_parallel.go, ga-ih4ma). Duration string
+	// (e.g., "4s", "500ms"). Empty/unset defaults to
+	// DefaultSessionSpawnStagger; an explicit "0" or "0s" disables
+	// staggering entirely (spawns launch back-to-back, the pre-ga-ih4ma
+	// behavior). Overridable per-invocation via the GC_SESSION_SPAWN_STAGGER
+	// env var (same duration-string format), which takes precedence over
+	// this field when set to a valid, non-negative duration — an
+	// operational escape hatch mirroring GATE_SPAWN_STAGGER_SECS in
+	// packs/town-deltas/assets/quality-gate-dispatcher.sh. This knob is
+	// orthogonal to max_wakes_per_tick: that caps how many sessions start
+	// per tick, this controls how spread out their launches are.
+	SessionSpawnStagger string `toml:"session_spawn_stagger,omitempty" jsonschema:"default=4s"`
 	// NudgeDispatcher selects how queued nudges get delivered to running
 	// sessions. "legacy" (default) auto-spawns a per-session `gc nudge poll`
 	// process that polls the file-backed queue every 2s. "supervisor" runs
@@ -2413,6 +2453,55 @@ func (d *DaemonConfig) MaxWakesPerTickOrDefault() int {
 		return DefaultMaxWakesPerTick
 	}
 	return *d.MaxWakesPerTick
+}
+
+// DefaultSessionSpawnStagger is the built-in delay between consecutive
+// session-start goroutine launches within a reconciler wake wave, used
+// when neither the GC_SESSION_SPAWN_STAGGER env var nor
+// [daemon].session_spawn_stagger override it (ga-ih4ma).
+//
+// Sizing rationale: this is deliberately larger than
+// quality-gate-dispatcher.sh's GATE_SPAWN_STAGGER_SECS default of 3s.
+// That default is tuned for gate-reviewer boot, a lighter, shorter-lived
+// process. Measured crew session boot cost (ga-nawd3 incident) is
+// materially heavier: ~13s for the provider Start call plus ~8-12s for
+// the Dolt-heavy PostStartObserve phase (worker liveness/bead lookups),
+// ~22-25s wall time end to end. The goal of the stagger is only to keep
+// concurrently-spawned sessions' Dolt-heavy phases from landing in the
+// same instant — not to fully serialize the wave. 4s is enough offset
+// that 5 sessions spaced 4s apart finish enqueuing within 16s, comfortably
+// inside a single session's own ~22-25s lifecycle, so a wave of 5 still
+// completes in roughly one session's wall time instead of stacking to
+// 5x — while no longer presenting Dolt with 5 simultaneous heavy queries.
+const DefaultSessionSpawnStagger = 4 * time.Second
+
+// sessionSpawnStaggerEnvVar is the operational override for
+// SessionSpawnStaggerDuration, checked before the city.toml field. A
+// duration string (e.g., "4s", "0s"); invalid or negative values are
+// ignored and resolution falls through to the config field / default.
+const sessionSpawnStaggerEnvVar = "GC_SESSION_SPAWN_STAGGER"
+
+// SessionSpawnStaggerDuration returns the minimum delay between
+// consecutive session-start goroutine launches within a reconciler wake
+// wave (ga-ih4ma). Resolution order: GC_SESSION_SPAWN_STAGGER env var
+// (when set to a valid, non-negative duration) takes precedence over
+// [daemon].session_spawn_stagger, which takes precedence over
+// DefaultSessionSpawnStagger. An explicit zero duration ("0" / "0s") from
+// either the env var or the config field disables staggering (spawns
+// launch back-to-back). Unparseable or negative values are treated as
+// absent and resolution continues to the next source.
+func (d *DaemonConfig) SessionSpawnStaggerDuration() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv(sessionSpawnStaggerEnvVar)); raw != "" {
+		if dur, err := time.ParseDuration(raw); err == nil && dur >= 0 {
+			return dur
+		}
+	}
+	if d != nil && strings.TrimSpace(d.SessionSpawnStagger) != "" {
+		if dur, err := time.ParseDuration(strings.TrimSpace(d.SessionSpawnStagger)); err == nil && dur >= 0 {
+			return dur
+		}
+	}
+	return DefaultSessionSpawnStagger
 }
 
 // DriftDrainTimeoutDuration returns the drift drain timeout as a time.Duration.
@@ -3142,8 +3231,61 @@ func bdReadyIncludeEphemeralArg(includeEphemeralReady bool) string {
 	return ""
 }
 
+// bdReadyPoolDemandShell emits the canonical routed-pool predicate.
+//
+// ga-g7yt: the exact-match exclusions live here; the PREFIX ones cannot (bd's
+// --exclude-label is exact — "Exclude issues that have ANY of these labels"), so
+// pool:refused:* and pilot:held* are handled by poolDemandLabelFilterJQ, which
+// EVERY caller must apply. Without them a parked bead stays in the pool's
+// candidate set forever: the worker claims it, refuses it, releases it, and the
+// next incarnation repeats — measured at ~17 dog sessions in 11h on ga-66wc, with
+// a second independent case (ga-vne2) re-claimed by the SAME session 7min after
+// refusing it. wa-worker/ps-worker already carry this filter hardcoded in their
+// prompt templates (ga-y8qh, ga-en2s); the dog's probe is generated HERE, which is
+// the only reason it was left out.
 func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string {
-	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json ` + limitFlag
+	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic` + bdReadyPoolDemandExcludeLabelArgs() + ` --json ` + limitFlag
+}
+
+// bdReadyPoolDemandExcludeLabelArgs returns the EXACT-match label exclusions.
+// Keep in sync with poolDemandLabelFilterJQ (the prefix half) — together they are
+// the whole predicate. Mirrors agents/wa-worker/prompt.template.md Step 1b3.
+//
+// ga-nf4x5: story:needs-approval is the Athos MERIT/legal sign-off gate
+// (refino-gate-dispatcher.sh applies it once code-gate passed but a human
+// decision on merit/risk is still pending — e.g. wa-6xn82, a real LAI legal
+// filing dispatched to the wa-worker pool with "No human review required"
+// before a worker happened to read the comment and refuse by hand). Distinct
+// from story:needs-human (an INFO-GAP) but excluded the same way: a human
+// decision gate, not a code-quality gate that gate-done can ever clear.
+// Appended AFTER ctx:thin (not inserted between the pre-existing flags) so the
+// original "story:needs-human" ... "ctx:thin" contiguous substring several
+// tests hardcode stays intact.
+func bdReadyPoolDemandExcludeLabelArgs() string {
+	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval"`
+}
+
+// poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
+// part bd's exact-match --exclude-label cannot express. It takes a bd-ready JSON
+// array on stdin and returns the survivors (unlimited; callers slice).
+//
+// Ported verbatim in behaviour from wa-worker/ps-worker Step 1b3 so all three
+// pools read the same demand shape. Two subtleties that are easy to get wrong and
+// are load-bearing:
+//
+//   - pool:refused:* is a PREFIX (pool:refused:engine-rebuild-required, etc.), so
+//     it needs startswith, not equality.
+//   - "held" must be decided by the ABSENCE OF ALL pilot:held* labels first; only
+//     then is the expiry branch reachable. And pilot:held-until:<epoch> labels
+//     ACCUMULATE (nothing prunes them), so the bead is still held iff its LATEST
+//     stamp is in the future — use max, never .[0] (ga-4aree).
+func poolDemandLabelFilterJQ() string {
+	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
+		`[ .[] `+
+			`| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) `+
+			`| select((((.labels // []) | map(select(startswith("pilot:held"))) | length) == 0) `+
+			`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) `+
+			`| if length > 0 then (max < $now_ts) else false end)) ]`)
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
@@ -3230,7 +3372,14 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// The shared predicate stays order-free so the count-form does no wasted
 	// sorting; the worker first-row path asks bd for the oldest candidate.
-	return bdReadyPoolDemandShell("--sort oldest --limit=1", includeEphemeralReady) + ` 2>/dev/null`
+	//
+	// ga-g7yt: --limit=1 followed by a post-filter is a TRAP — if the oldest
+	// candidate is the one being filtered out (parked or still held), real work
+	// sitting right behind it becomes invisible and the session drains empty
+	// believing the pool had nothing. A dog hit exactly this and only found the
+	// real bead by re-running the query by hand with a wider limit. So: ask for a
+	// WINDOW and take the first SURVIVOR, never the first row.
+	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null; }`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3245,8 +3394,16 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 // The && chain ensures any non-zero bd exit short-circuits the whole expression
 // (TestEffectiveScaleCheckUsesReadyOnly).
 func poolDemandCountShell(target string, includeEphemeralReady bool) string {
+	// ga-g7yt: the label filter is applied on a SEPARATE line, never as a pipe on
+	// the bd call above. Piping would make $? the JQ exit code, so a failed
+	// `bd ready` would masquerade as "no demand" — exactly the failure this
+	// function's own doc-comment forbids. Capture first, check bd's status, THEN
+	// filter. (Both the reconciler count and the worker probe must apply the same
+	// filter or they disagree: the reconciler would count parked beads as demand
+	// and spawn a pool for work no worker is allowed to claim.)
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
+		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
@@ -3267,10 +3424,22 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
+// ga-ael6v: applies poolDemandLabelFilterJQ to the assigned-in-progress tier.
+// A refused bead (pool:refused:<reason>) deliberately keeps status=in_progress
+// and its assignee — refuse doesn't clear either, so inflight-reclaim-guard can
+// still find it as in-flight — but if that assignee later gets reassigned to a
+// FRESH session (the reclaim-guard's own job), the new session's Step 1a saw
+// "assigned in-progress work" and resumed it as if it were live crash-recovery,
+// re-doing (and re-refusing) work a prior incarnation already decided against.
+// Same root as ga-g7yt/ga-y8qh (routed-pool tier): the pool:refused:* prefix
+// can't be expressed by an exact bd flag, so every reader of a pool-owned bead
+// must apply poolDemandLabelFilterJQ, not just the tier that discovers NEW work.
+// --limit=1 widened to 20 for the same reason as routedReadyTierCommand: a
+// filtered-out top row must not hide a real in-progress bead behind it.
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -3290,13 +3459,17 @@ func legacyControlAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
+// ga-ael6v: same fix as standardAssignedInProgressWorkQueryScript, applied to
+// the control-dispatcher/workflow-control legacy identity fallback — same
+// class of bug, same shared bd-list-then-filter shape, so it gets the same
+// treatment rather than leaving a second, differently-named instance behind.
 func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3316,10 +3489,15 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`done; `
 }
 
+// ga-ael6v: filter-then-slice, not slice-then-filter (same reasoning as
+// routedReadyTierCommand) — matches on assignee first, then applies the
+// canonical pool:refused:*/pilot:held* predicate to the matched set before
+// taking the first row, so a refused ephemeral wisp can't shadow a real one.
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
-		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
+		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
+		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 

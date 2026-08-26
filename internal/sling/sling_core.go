@@ -92,6 +92,16 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 	if sp.Max == 0 && !opts.Force {
 		result.PoolEmpty = true
 	}
+	// ga-sg0pq8: an implicit agent (config.Agent.Implicit) is auto-synthesized
+	// by InjectImplicitAgents for every configured provider x every rig — a
+	// genuinely valid resolveAgentIdentity match, not a name that should have
+	// been rejected. But nobody explicitly configured it as a dedicated
+	// worker (no min_active_sessions, no custom scale_check), so routed work
+	// can sit for a long time — or indefinitely — with no signal to the
+	// operator that anything is different from routing to a real pool.
+	if a.Implicit && !opts.Force {
+		result.TargetImplicit = true
+	}
 
 	if shouldValidateExistingBead(opts) {
 		if err := validateExistingBead(opts.BeadOrFormula, deps); err != nil {

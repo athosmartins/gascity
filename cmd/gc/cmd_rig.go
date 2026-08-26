@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/hooks"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/spf13/cobra"
 )
 
@@ -1078,8 +1079,22 @@ func doRigList(fs fsys.FS, cityPath string, jsonOutput bool, stdout, stderr io.W
 			Running: hqRunning,
 			Beads:   rigBeadsStatus(fs, cityPath),
 		})
+		// ga-ab4zgu: build the session provider ONCE, outside this loop, not once
+		// PER RIG. rigHasRunningAgent used to call newSessionProvider() itself,
+		// which opens a fresh store connection and re-fetches the full
+		// session-bead snapshot (store.ListByLabel) from scratch on every call —
+		// measured live: ~1.7-2.5s per rig (dominated by that snapshot fetch),
+		// ~100% of gc rig list --json's wall time, for a value that does not
+		// change between rigs within a single listing. 7 rigs meant paying that
+		// full construction cost 7 times for one logically-single "who's
+		// running right now" snapshot. Reusing one provider/snapshot across all
+		// rigs is also more CORRECT, not just faster: it gives every rig's
+		// Running field the same point-in-time view instead of 7 snapshots
+		// staggered ~2s apart, which could show inconsistent state if something
+		// changed mid-listing under the old per-rig construction.
+		sp := newSessionProvider()
 		for i := range cfg.Rigs {
-			running := rigHasRunningAgent(cfg, cfg.Rigs[i].Name)
+			running := rigHasRunningAgent(cfg, sp, cfg.Rigs[i].Name)
 			result.Rigs = append(result.Rigs, RigListItem{
 				Name:               cfg.Rigs[i].Name,
 				Path:               cfg.Rigs[i].Path,
@@ -1139,12 +1154,15 @@ func doRigList(fs fsys.FS, cityPath string, jsonOutput bool, stdout, stderr io.W
 	return 0
 }
 
-func rigHasRunningAgent(cfg *config.City, rigName string) bool {
-	if cfg == nil || rigName == "" {
+// ga-ab4zgu: sp is now a required parameter, not constructed internally.
+// Callers that check multiple rigs (doRigList) build ONE provider up front
+// and reuse it — see the call site's comment for why (measured ~2s/call
+// when this function built its own provider on every invocation).
+func rigHasRunningAgent(cfg *config.City, sp runtime.Provider, rigName string) bool {
+	if cfg == nil || rigName == "" || sp == nil {
 		return false
 	}
 	cityName := cfg.EffectiveCityName()
-	sp := newSessionProvider()
 	for i := range cfg.Agents {
 		a := cfg.Agents[i]
 		if a.Dir != rigName {

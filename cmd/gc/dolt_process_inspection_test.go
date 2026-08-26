@@ -29,6 +29,41 @@ func TestProcessArgsFromPSReturnsWhenPSHangs(t *testing.T) {
 	}
 }
 
+func TestDoltProcessCPUPercentFromPSParsesOutput(t *testing.T) {
+	binDir := t.TempDir()
+	psPath := filepath.Join(binDir, "ps")
+	if err := os.WriteFile(psPath, []byte("#!/bin/sh\necho ' 87.3'\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(ps): %v", err)
+	}
+	t.Setenv("PATH", strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)))
+
+	pct, err := doltProcessCPUPercentFromPS(os.Getpid(), time.Second)
+	if err != nil {
+		t.Fatalf("doltProcessCPUPercentFromPS() error = %v", err)
+	}
+	if pct != 87.3 {
+		t.Fatalf("doltProcessCPUPercentFromPS() = %v, want 87.3", pct)
+	}
+}
+
+func TestDoltProcessCPUPercentFromPSReturnsWhenPSHangs(t *testing.T) {
+	binDir := t.TempDir()
+	psPath := filepath.Join(binDir, "ps")
+	if err := os.WriteFile(psPath, []byte("#!/bin/sh\nexec sleep 10\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(ps): %v", err)
+	}
+	t.Setenv("PATH", strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)))
+
+	start := time.Now()
+	_, err := doltProcessCPUPercentFromPS(os.Getpid(), 100*time.Millisecond)
+	if err == nil {
+		t.Fatal("doltProcessCPUPercentFromPS succeeded with a hanging ps")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("doltProcessCPUPercentFromPS took %s, want bounded timeout", elapsed)
+	}
+}
+
 func TestFindPortHolderPIDUsesProcBeforeLsof(t *testing.T) {
 	if _, err4 := os.Stat("/proc/net/tcp"); err4 != nil {
 		if _, err6 := os.Stat("/proc/net/tcp6"); err6 != nil {

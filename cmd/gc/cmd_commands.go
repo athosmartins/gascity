@@ -86,7 +86,18 @@ func addDiscoveredLeaf(root *cobra.Command, entry config.DiscoveredCommand, city
 
 	leafWord := entry.Command[len(entry.Command)-1]
 	if existing := findSubcommand(parent, leafWord); existing != nil {
-		return
+		// A same-name leaf already exists at this (binding, command) path.
+		// Replace rather than keep-first-drop-second: sortCommandsForTree's
+		// stable sort preserves each tied entry's original relative order,
+		// which is pack-import order, so the entry reaching this point
+		// second is from the LATER-imported (higher-priority) pack — the
+		// override, per command.toml's `binding` field (ga-9n9z7). This
+		// mirrors internal/orders.ScanRoots' documented "higher-priority
+		// roots (later in the slice) override lower ones by name" — the
+		// only other pack-override mechanism in this codebase. Before this,
+		// the earlier (lower-priority) entry always won silently, so an
+		// explicit binding override could never actually take effect.
+		parent.RemoveCommand(existing)
 	}
 
 	annotations := map[string]string{}

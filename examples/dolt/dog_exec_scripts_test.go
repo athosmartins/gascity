@@ -674,10 +674,34 @@ case "$query" in
     print_cell hash-blocked-issues
     exit 0
     ;;
+  *"DOLT_HASHOF_TABLE('wisp_events')"*)
+    if [ "$mode" = "dolt_ignored_table_false_positive" ] && [ "$(current_head)" = "compactcommit" ]; then
+      print_cell hash-wispevents-after-writer
+      exit 0
+    fi
+    print_cell hash-wispevents-before
+    exit 0
+    ;;
   *"information_schema.tables"*)
     if [ "$mode" = "table_discovery_failure" ]; then
       printf 'information_schema unavailable\n' >&2
       exit 43
+    fi
+    if [ "$mode" = "dolt_ignored_table_false_positive" ]; then
+      # Simulates a real dolt_ignore-aware query: once the query text itself
+      # references dolt_ignore (i.e. the fix is present), the ignored table
+      # wisp_events never comes back from discovery at all. Pre-fix, the
+      # query has no such clause, so wisp_events surfaces alongside beads —
+      # reproducing ga-wfzmk's false-positive quarantine.
+      case "$query" in
+        *dolt_ignore*)
+          print_cell beads
+          ;;
+        *)
+          print_cells beads wisp_events
+          ;;
+      esac
+      exit 0
     fi
     if [ "$mode" = "post_flatten_table_list_failure" ] && [ "$(current_head)" = "compactcommit" ]; then
       printf 'information_schema unavailable after flatten\n' >&2
@@ -724,6 +748,27 @@ case "$query" in
     ;;
   *"SELECT COUNT(*) FROM"*"notes"*)
     print_cell 10
+    exit 0
+    ;;
+  *"SELECT COUNT(*) FROM"*"wisp_events"*)
+    # Ordinary concurrent-writer churn on a dolt_ignore'd table: gains a row
+    # across the flatten window purely from normal live traffic, same shape
+    # as beads' own gain simulation below but tracked in a separate counter
+    # file so the two tables' call counts don't interfere.
+    wisp_calls=0
+    wisp_count_file="${count_file:+$count_file.wisp_events}"
+    if [ -n "$wisp_count_file" ] && [ -f "$wisp_count_file" ]; then
+      wisp_calls="$(cat "$wisp_count_file")"
+    fi
+    wisp_calls=$((wisp_calls + 1))
+    if [ -n "$wisp_count_file" ]; then
+      printf '%%s\n' "$wisp_calls" > "$wisp_count_file"
+    fi
+    if [ "$mode" = "dolt_ignored_table_false_positive" ] && [ "$wisp_calls" -gt 1 ]; then
+      print_cell 11
+    else
+      print_cell 10
+    fi
     exit 0
     ;;
   *"SELECT COUNT(*) FROM"*"beads"*)
@@ -1911,6 +1956,46 @@ func TestCompactScriptAllowsRowCountIncreaseWithStableValueHashes(t *testing.T) 
 	}
 	if !strings.Contains(string(data), "DOLT_GC") {
 		t.Fatalf("row-count increase with stable value hashes should still run full GC:\n%s", data)
+	}
+}
+
+// TestCompactScriptExcludesDoltIgnoredTablesFromIntegrityVerification covers
+// ga-wfzmk: hq and whatsapp_automation sat quarantined for months on a false
+// positive. user_tables() enumerated every non-dolt_* BASE TABLE, including
+// ones the database's own dolt_ignore list excludes from version-control
+// tracking (wisps, wisp_*, events, leases, local_metadata, repo_mtimes) —
+// live-confirmed high-churn tables whose row count / DOLT_HASHOF_TABLE value
+// legitimately drifts from ordinary concurrent traffic within seconds, fully
+// independent of whether the flatten preserved any actually-versioned data.
+// Comparing their pre/post-flatten snapshots is inherently unstable and
+// carries no integrity signal — it quarantines on volatility the database
+// itself declared out of scope for version control.
+func TestCompactScriptExcludesDoltIgnoredTablesFromIntegrityVerification(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "dolt_ignored_table_false_positive", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("compact should not quarantine on dolt_ignore'd table churn: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "quarantine") {
+		t.Fatalf("dolt_ignore'd table churn must not trigger quarantine:\n%s", out)
+	}
+	data, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(data)
+	if !strings.Contains(log, "DOLT_HASHOF_TABLE('beads')") {
+		t.Fatalf("versioned table 'beads' should still be verified:\n%s", log)
+	}
+	if strings.Contains(log, "DOLT_HASHOF_TABLE('wisp_events')") {
+		t.Fatalf("dolt_ignore'd table wisp_events must be excluded from hash verification entirely, not merely tolerated:\n%s", log)
+	}
+	if !strings.Contains(log, "DOLT_GC") {
+		t.Fatalf("compact should proceed to full GC when only an ignored table churned:\n%s", log)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("no quarantine marker should be written when only a dolt_ignore'd table churned")
 	}
 }
 

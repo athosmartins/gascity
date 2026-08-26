@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3435,6 +3437,226 @@ func TestBdCommandRunnerWithManagedRetryRecoversAndRerunsWithFreshEnv(t *testing
 	}
 	if seenPorts[0] != "3307" || seenPorts[1] != "3308" {
 		t.Fatalf("seenPorts = %v, want [3307 3308]", seenPorts)
+	}
+}
+
+// TestRecoverManagedBDCommandAllowedGatesWithinCooldown proves the core
+// unit ga-a1xsn's fix relies on: recoverManagedBDCommandAllowed opens
+// exactly once per cooldown window and denies every other caller until
+// it elapses, independent of the surrounding retry machinery exercised
+// by TestBdCommandRunnerWithManagedRetryGatesConcurrentRecoverCalls
+// below.
+func TestRecoverManagedBDCommandAllowedGatesWithinCooldown(t *testing.T) {
+	origNow := recoverManagedBDCommandGateNow
+	origCooldown := recoverManagedBDCommandCooldown
+	t.Cleanup(func() {
+		recoverManagedBDCommandGateNow = origNow
+		recoverManagedBDCommandCooldown = origCooldown
+	})
+	recoverManagedBDCommandCooldown = func() time.Duration { return 30 * time.Second }
+
+	cityPath := t.TempDir()
+	now := time.Date(2026, 8, 13, 16, 22, 0, 0, time.UTC)
+	recoverManagedBDCommandGateNow = func() time.Time { return now }
+
+	if !recoverManagedBDCommandAllowed(cityPath) {
+		t.Fatal("first call should open the gate")
+	}
+	if recoverManagedBDCommandAllowed(cityPath) {
+		t.Fatal("second call at the same instant should be denied (still inside the cooldown)")
+	}
+
+	now = now.Add(29 * time.Second)
+	if recoverManagedBDCommandAllowed(cityPath) {
+		t.Fatal("call 29s after the first (still inside the 30s cooldown) should be denied")
+	}
+
+	now = now.Add(2 * time.Second) // 31s since the first call
+	if !recoverManagedBDCommandAllowed(cityPath) {
+		t.Fatal("call 31s after the first (past the 30s cooldown) should reopen the gate")
+	}
+}
+
+// TestBdCommandRunnerWithManagedRetryGatesConcurrentRecoverCalls
+// reproduces ga-a1xsn: under CPU saturation, oracle-wa observed 12
+// simultaneous `gc dolt-state recover-managed` processes because every
+// independently-failing `bd` call forked its own recovery attempt with
+// no cross-process gate between them. Before the fix, each of the
+// concurrent callers below independently invokes recoverManagedBDCommand
+// (12 calls); after the fix, only the first to win the cooldown gate
+// does (1 call) and the other 11 fall straight through to their own
+// immediate retry, exactly as a caller whose error was merely
+// retryable-but-not-recoverable already did before this change (see
+// TestBdTransportTransientDisconnectDoesNotTriggerManagedRecovery).
+func TestBdCommandRunnerWithManagedRetryGatesConcurrentRecoverCalls(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+
+	origRunner := beadsExecCommandRunnerWithEnv
+	origRecover := recoverManagedBDCommand
+	origNow := recoverManagedBDCommandGateNow
+	origCooldown := recoverManagedBDCommandCooldown
+	t.Cleanup(func() {
+		beadsExecCommandRunnerWithEnv = origRunner
+		recoverManagedBDCommand = origRecover
+		recoverManagedBDCommandGateNow = origNow
+		recoverManagedBDCommandCooldown = origCooldown
+	})
+	recoverManagedBDCommandCooldown = func() time.Duration { return 30 * time.Second }
+	fixedNow := time.Date(2026, 8, 13, 16, 22, 0, 0, time.UTC)
+	recoverManagedBDCommandGateNow = func() time.Time { return fixedNow }
+
+	cityPath := t.TempDir()
+
+	var recoverCalls int32
+	recoverManagedBDCommand = func(_ string) error {
+		atomic.AddInt32(&recoverCalls, 1)
+		return nil
+	}
+
+	beadsExecCommandRunnerWithEnv = func(_ map[string]string) beads.CommandRunner {
+		return func(_ string, _ string, _ ...string) ([]byte, error) {
+			// Every attempt reports the same transport failure --
+			// oracle-wa's incident had many callers failing around the
+			// same saturated moment, not a single retry succeeding.
+			return nil, fmt.Errorf("connection refused")
+		}
+	}
+
+	const callers = 12 // matches oracle-wa's observed peak (ga-a1xsn)
+	dirs := make([]string, callers)
+	for i := range dirs {
+		dirs[i] = t.TempDir()
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		dir := dirs[i]
+		go func() {
+			defer wg.Done()
+			runner := bdCommandRunnerWithManagedRetry(cityPath, func(_ string) map[string]string {
+				return map[string]string{"GC_DOLT_PORT": "3307"}
+			})
+			_, _ = runner(dir, "bd", "list", "--json")
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&recoverCalls); got != 1 {
+		t.Fatalf("recoverManagedBDCommand called %d times for %d concurrent transport failures inside one cooldown window, want 1 (ga-a1xsn: this is the amplifier the gate exists to prevent)", got, callers)
+	}
+}
+
+// TestRecoverManagedDoltAppearsSaturatedNotDown proves ga-a1xsn item 4 (the
+// incident writeup's own "most important" gap): the discriminator reads the
+// managed dolt sql-server process's CPU% and treats >=threshold as
+// saturation-not-down — mirroring scripts/dolt-hang-watchdog.sh's
+// dolt_actually_serving()/dolt_cpu_pct() "saturation, NOT a hang" idiom —
+// while failing toward "not saturated" (i.e. toward allowing recovery to
+// proceed) whenever the CPU reading itself errors.
+func TestRecoverManagedDoltAppearsSaturatedNotDown(t *testing.T) {
+	origReader := recoverManagedDoltProcessCPUPercent
+	t.Cleanup(func() { recoverManagedDoltProcessCPUPercent = origReader })
+
+	cityPath := t.TempDir()
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(layout.PIDFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(layout.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		pct  float64
+		err  error
+		want bool
+	}{
+		{"below threshold", 19.9, nil, false},
+		{"at threshold", 20, nil, true},
+		{"well above threshold", 85, nil, true},
+		{"reader error fails toward not-saturated", 99, fmt.Errorf("ps unavailable"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recoverManagedDoltProcessCPUPercent = func(int, time.Duration) (float64, error) {
+				return tc.pct, tc.err
+			}
+			if got := recoverManagedDoltAppearsSaturatedNotDown(cityPath); got != tc.want {
+				t.Fatalf("recoverManagedDoltAppearsSaturatedNotDown() = %v, want %v (cpu=%v err=%v)", got, tc.want, tc.pct, tc.err)
+			}
+		})
+	}
+}
+
+// TestRecoverManagedDoltAppearsSaturatedNotDownNoResolvablePID proves the
+// other "fails open toward recovering" edge: a fresh city with no dolt.pid
+// at all must not block recovery on an inconclusive read, the same bias
+// recoverManagedBDCommandAllowed already applies to its own gate file.
+func TestRecoverManagedDoltAppearsSaturatedNotDownNoResolvablePID(t *testing.T) {
+	cityPath := t.TempDir()
+	if got := recoverManagedDoltAppearsSaturatedNotDown(cityPath); got != false {
+		t.Fatalf("recoverManagedDoltAppearsSaturatedNotDown() = %v, want false with no resolvable PID", got)
+	}
+}
+
+// TestBdCommandRunnerWithManagedRetrySkipsRecoveryWhenDoltAppearsSaturated
+// proves ga-a1xsn item 4 end-to-end: when the managed dolt sql-server is
+// CPU-saturated-but-alive, a failing bd transport call must NOT fork
+// recoverManagedBDCommand at all — there is nothing down to recover, and
+// the fork+poll itself would add load to the already-scarce resource —
+// while the transport error still propagates to the caller unchanged.
+func TestBdCommandRunnerWithManagedRetrySkipsRecoveryWhenDoltAppearsSaturated(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+
+	origRunner := beadsExecCommandRunnerWithEnv
+	origRecover := recoverManagedBDCommand
+	origReader := recoverManagedDoltProcessCPUPercent
+	t.Cleanup(func() {
+		beadsExecCommandRunnerWithEnv = origRunner
+		recoverManagedBDCommand = origRecover
+		recoverManagedDoltProcessCPUPercent = origReader
+	})
+
+	cityPath := t.TempDir()
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(layout.PIDFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(layout.PIDFile, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recoverManagedDoltProcessCPUPercent = func(int, time.Duration) (float64, error) {
+		return 87, nil // well above the default 20% threshold
+	}
+
+	var recoverCalls int32
+	recoverManagedBDCommand = func(_ string) error {
+		atomic.AddInt32(&recoverCalls, 1)
+		return nil
+	}
+	beadsExecCommandRunnerWithEnv = func(_ map[string]string) beads.CommandRunner {
+		return func(_ string, _ string, _ ...string) ([]byte, error) {
+			return nil, fmt.Errorf("connection refused")
+		}
+	}
+
+	runner := bdCommandRunnerWithManagedRetry(cityPath, func(_ string) map[string]string {
+		return map[string]string{"GC_DOLT_PORT": "3307"}
+	})
+	_, retErr := runner(t.TempDir(), "bd", "list", "--json")
+
+	if got := atomic.LoadInt32(&recoverCalls); got != 0 {
+		t.Fatalf("recoverManagedBDCommand called %d times while Dolt appeared saturated-not-down, want 0 (ga-a1xsn item 4)", got)
+	}
+	if retErr == nil || !strings.Contains(retErr.Error(), "connection refused") {
+		t.Fatalf("runner error = %v, want the original transport error to still propagate", retErr)
 	}
 }
 

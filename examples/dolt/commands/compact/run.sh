@@ -590,13 +590,31 @@ head_commit() {
 }
 
 # user_tables — emit one user-table name per line (excludes dolt_*
-# system tables and information_schema views).
+# system tables, information_schema views, AND any table the database's own
+# dolt_ignore list excludes from version-control tracking.
+#
+# ga-wfzmk: hq and whatsapp_automation sat quarantined for months (2026-06-06
+# and 2026-07-07 respectively) on false positives traced to this omission.
+# dolt_ignore'd tables (wisps, wisp_%, events, leases, local_metadata,
+# repo_mtimes — this deployment's registered patterns) are, by the
+# database's own declaration, excluded from Dolt's version-control tracking:
+# DOLT_ADD on an ignored table is a no-op, so their committed/versioned state
+# is decoupled from their live content. Several are also high-churn —
+# wisp_events/wisp_labels grow continuously, leases gets renewed in place —
+# so their row count and DOLT_HASHOF_TABLE value can legitimately change
+# within a single flatten's verify window purely from ordinary concurrent
+# traffic (live-confirmed: hq's `leases` table produced two DIFFERENT
+# DOLT_HASHOF_TABLE hashes at the SAME row count 40s apart with zero
+# compact/flatten activity in between). Comparing their pre/post-flatten
+# snapshots carries no integrity signal about whether the flatten preserved
+# any actually-versioned data, and quarantines on volatility the database
+# itself declared out of scope.
 user_tables() {
   db="$1"
   out_tmp=$(mktemp)
   err_tmp=$(mktemp)
   if ! dolt_query "$db" \
-    "SELECT table_name FROM information_schema.tables WHERE table_schema = '$db' AND table_type = 'BASE TABLE' AND table_name NOT LIKE 'dolt\\_%' ESCAPE '\\\\' ORDER BY table_name" \
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = '$db' AND table_type = 'BASE TABLE' AND table_name NOT LIKE 'dolt\\_%' ESCAPE '\\\\' AND NOT EXISTS (SELECT 1 FROM dolt_ignore WHERE ignored = 1 AND table_name LIKE pattern) ORDER BY table_name" \
     > "$out_tmp" 2>"$err_tmp"; then
     printf 'compact: db=%s table list probe failed\n' "$db" >&2
     emit_error_file "$db" "$err_tmp"
