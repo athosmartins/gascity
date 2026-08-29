@@ -12,6 +12,25 @@ set -e
 PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)}"
 . "$PACK_DIR/assets/scripts/runtime.sh"
 
+# rig_discovery_degraded is set to true by metadata_files() whenever it
+# could not positively confirm the full external rig set (gc missing, the
+# bounded `gc rig list` call failed/timed out, or -- lacking jq to verify
+# the response shape -- an empty parse that can't be told apart from a
+# failure). ga-eu2x: an incomplete scan here used to be silently
+# indistinguishable from "confirmed no other rigs" -- every database not
+# in the resulting (HQ-only) referenced set then got reported by the
+# orphan check below as a CONFIRMED orphan, including live production
+# databases whose only "crime" is living in a rig outside
+# $GC_CITY_PATH/rigs (true for every externally-cloned rig in this city:
+# `gc rig list` timing out under Dolt load -- 8-17s measured against a 5s
+# bound -- silently dropped whatsapp_automation/gastown/dc/lexbh/
+# marketing/property_scrapers to "orphan" in the same report a human or
+# agent might act on with `gc dolt cleanup --force`). Consumers of the
+# orphan report MUST treat a degraded scan as "unknown", never as
+# "confirmed absent" -- see the "erro e vazio não podem produzir o mesmo
+# valor" rule this bug is the canonical example of.
+rig_discovery_degraded=false
+
 metadata_files() {
   printf '%s\n' "$GC_CITY_PATH/.beads/metadata.json"
 
@@ -19,22 +38,41 @@ metadata_files() {
     # Bound the gc rig list call: if gc is itself in a bad state (the
     # failure mode this patrol is meant to detect) we must not block
     # here. Degrade to the fallback rig scan below.
-    rig_paths=$(run_bounded 5 gc rig list --json 2>/dev/null \
-      | if command -v jq >/dev/null 2>&1; then
-          jq -r '.rigs[].path' 2>/dev/null
-        else
-          grep '"path"' | sed 's/.*"path": *"//;s/".*//'
-        fi) || true
-    if [ -n "$rig_paths" ]; then
-      printf '%s\n' "$rig_paths" | while IFS= read -r p; do
-        [ -n "$p" ] && printf '%s\n' "$p/.beads/metadata.json"
-      done
-      return
+    if rig_list_json=$(run_bounded 5 gc rig list --json 2>/dev/null); then
+      if command -v jq >/dev/null 2>&1; then
+        rig_paths=$(printf '%s' "$rig_list_json" | jq -r '.rigs[].path' 2>/dev/null) || true
+      else
+        rig_paths=$(printf '%s' "$rig_list_json" | grep '"path"' | sed 's/.*"path": *"//;s/".*//') || true
+      fi
+      if [ -n "$rig_paths" ]; then
+        printf '%s\n' "$rig_paths" | while IFS= read -r p; do
+          [ -n "$p" ] && printf '%s\n' "$p/.beads/metadata.json"
+        done
+        return
+      fi
+      # `gc rig list` ran and exited 0 but produced no paths. With jq
+      # available to have confirmed the response actually parsed as
+      # `.rigs`, an empty result here is a genuine positive "zero external
+      # rigs" and is trusted as such (falls through to the harmless local
+      # fallback below with no degraded flag). Without jq we cannot tell
+      # that apart from "the output didn't look like what grep expected" --
+      # degrade only in that case.
+      if ! command -v jq >/dev/null 2>&1; then
+        rig_discovery_degraded=true
+      fi
+    else
+      # run_bounded killed it (timeout) or `gc rig list` itself exited
+      # non-zero. An empty rig_paths derived from this must NEVER be read
+      # as "confirmed zero rigs".
+      rig_discovery_degraded=true
     fi
+  else
+    rig_discovery_degraded=true
   fi
 
   # Fallback: scan local rigs/ directory only. Cannot discover external rigs
-  # when gc is unavailable — acceptable degradation.
+  # when gc is unavailable/degraded — acceptable degradation, but (per the
+  # flag set above) never presented as a complete rig set.
   find "$GC_CITY_PATH/rigs" -path '*/.beads/metadata.json' 2>/dev/null || true
 }
 
@@ -513,6 +551,7 @@ JSONEOF
   cat <<JSONEOF
 
   ],
+  "orphan_check_degraded": $rig_discovery_degraded,
   "orphans": [
 JSONEOF
   first=true
@@ -588,7 +627,20 @@ if [ -n "$backup_info" ]; then
   done
 fi
 
-if [ "$orphan_count" -gt 0 ]; then
+if [ "$rig_discovery_degraded" = true ]; then
+  echo ""
+  echo "Orphans: UNKNOWN — rig discovery degraded (gc rig list failed, timed out, or gc/jq unavailable)."
+  echo "  The external rig set could not be confirmed, so directories not matched"
+  echo "  to a known rig CANNOT be trusted as orphans — some may be live"
+  echo "  production databases. Do not act on this report (e.g. gc dolt cleanup)."
+  if [ "$orphan_count" -gt 0 ]; then
+    echo "  Unverified candidates ($orphan_count):"
+    echo "$orphan_list" | while IFS='|' read -r name size; do
+      [ -z "$name" ] && continue
+      echo "    ? $name ($size)"
+    done
+  fi
+elif [ "$orphan_count" -gt 0 ]; then
   echo ""
   echo "Orphans: $orphan_count"
   echo "$orphan_list" | while IFS='|' read -r name size; do

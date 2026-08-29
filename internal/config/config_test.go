@@ -1725,7 +1725,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
@@ -1734,7 +1734,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQuery() missing run_target migration fallback: %q", got)
 	}
-	for _, want := range []string{`.metadata`, `.[:1]`} {
+	for _, want := range []string{`.metadata`, `.[0:1]`} {
 		if !strings.Contains(got, want) {
 			t.Errorf("EffectiveWorkQuery() missing run_target migration filter fragment %q: %q", want, got)
 		}
@@ -1747,7 +1747,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --json --sort oldest --limit=20`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
@@ -1999,6 +1999,9 @@ func TestEffectiveRoutedPoolQueryDefault(t *testing.T) {
 		// excluded from routed-pool candidacy the same way — a bead awaiting
 		// Athos's sign-off is not a code-build story regardless of ctx:ready/exec:auto.
 		`--exclude-label "story:needs-approval"`,
+		// ga-7ha7g: exact-match half of the epic-authoring-mismatch gap — see
+		// TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic.
+		`--exclude-label "story:epic"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveRoutedPoolQuery() missing routed pool fragment %q: %q", want, got)
@@ -2036,6 +2039,21 @@ func TestBdReadyPoolDemandExcludeLabelArgsIncludesNeedsApproval(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing %q", got, want)
 		}
+	}
+}
+
+// TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic (ga-7ha7g): story:epic
+// is the exact-match half of the epic-authoring-mismatch gap — --exclude-type=epic
+// only checks issue_type, but bead authors routinely label (and/or title, see
+// poolDemandLabelFilterJQ for that half) a bead as an epic without setting
+// issue_type=epic. Confirmed live: ga-9pyg2 (issue_type=task, label story:epic,
+// title "ÉPICO: migração v55 do engine..." — required a Mayor-coordinated engine
+// rebuild, exactly the class of work a pool worker must never execute off its own
+// hook per ga-vhyd).
+func TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic(t *testing.T) {
+	got := bdReadyPoolDemandExcludeLabelArgs()
+	if !strings.Contains(got, `--exclude-label "story:epic"`) {
+		t.Fatalf("bdReadyPoolDemandExcludeLabelArgs() = %q, missing --exclude-label \"story:epic\"", got)
 	}
 }
 
@@ -2250,7 +2268,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --exclude-label story:needs-human --exclude-label needs-human --exclude-label ctx:thin --exclude-label story:needs-approval --json --sort oldest --limit=20")
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20")
     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
     ;;
   *)
@@ -2399,7 +2417,7 @@ func TestEffectiveWorkQueryExcludesEpics(t *testing.T) {
 	// resume its own assigned ephemeral epic wisp (the patrol-loop pattern).
 	wantPresent := []string{
 		// routed/pool tier still excludes epics (gc-udx guard)
-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json`,
+		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --json`,
 		// assigned tiers carry NO epic exclusion
 		`bd list --status in_progress --assignee="$id" --json`,
 		`bd ready --assignee="$id" --json`,
@@ -2425,7 +2443,7 @@ func TestEffectiveWorkQueryExcludesEpicsControlDispatcher(t *testing.T) {
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	got := a.EffectiveWorkQuery()
 	wantPresent := []string{
-		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --json`,
+		`bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --json`,
 		`bd list --status in_progress --assignee="$cand" --json`,
 		`bd ready --assignee="$cand" --json`,
 		`-- gascity/control-dispatcher gascity/workflow-control`,
@@ -2519,6 +2537,80 @@ esac
 	}
 	if strings.Contains(out, "parent-epic") {
 		t.Fatalf("EffectiveWorkQuery() surfaced the parent epic to the worker: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedPoolExcludesEpicTitledBead (ga-7ha7g): the
+// pool-probe's --exclude-type=epic only checks issue_type — bead authors
+// routinely title a bead as an epic (Portuguese "ÉPICO:", English "EPIC:")
+// without setting issue_type=epic, so a task-typed bead titled this way can
+// still reach the routed pool and be autonomously executed by a worker that
+// has no epic-scale authority. Confirmed live: ga-9pyg2 (issue_type=task,
+// title "ÉPICO: migração v55...", also labeled story:epic — required a
+// Mayor-coordinated engine rebuild, exactly the class of work a pool worker
+// must never execute off its own hook) and gh-ai2 (issue_type=task, title
+// "EPIC: migrar crew GT...", no story:epic label at all — the title-only
+// case only the jq clause below can catch). The fake bd here deliberately
+// ignores --exclude-label (it is a dumb stub matched on --exclude-type=epic
+// only) so this test isolates the NEW poolDemandLabelFilterJQ title-regex
+// clause specifically, independent of bd's own --exclude-label behavior
+// (already covered by TestBdReadyPoolDemandExcludeLabelArgsIncludesStoryEpic).
+func TestEffectiveWorkQueryRoutedPoolExcludesEpicTitledBead(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; pool-demand label filter is a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	env := map[string]string{"GC_SESSION_ORIGIN": "ephemeral"}
+
+	portuguese := runEffectiveWorkQuery(t, a, env, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*"--exclude-type=epic"*)
+    printf '[{"id":"epico-mismatch","issue_type":"task","title":"ÉPICO: migração v55 do engine"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.Contains(portuguese, "epico-mismatch") {
+		t.Fatalf("EffectiveWorkQuery() surfaced a task-typed bead titled \"ÉPICO: ...\" to the routed pool: %q", portuguese)
+	}
+
+	english := runEffectiveWorkQuery(t, a, env, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*"--exclude-type=epic"*)
+    printf '[{"id":"epic-mismatch","issue_type":"task","title":"EPIC: migrar crew GT -> agentes gc"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.Contains(english, "epic-mismatch") {
+		t.Fatalf("EffectiveWorkQuery() surfaced a task-typed bead titled \"EPIC: ...\" to the routed pool: %q", english)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedPoolTitleFilterDoesNotOvermatch (ga-7ha7g): the
+// new title-regex clause is anchored (^(EPIC|ÉPICO)[:\s]) specifically so it
+// does not reject a bead whose title merely contains "epic" outside the
+// leading-prefix position — e.g. this very bug report about the gap itself.
+func TestEffectiveWorkQueryRoutedPoolTitleFilterDoesNotOvermatch(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; pool-demand label filter is a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*"--exclude-type=epic"*)
+    printf '[{"id":"safe-task","issue_type":"task","title":"Pool-probe epic-exclusion checks issue_type only"}]'
+    ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "safe-task") {
+		t.Fatalf("EffectiveWorkQuery() over-matched and dropped a title that only mentions \"epic\" mid-sentence: %q", out)
 	}
 }
 
@@ -2785,7 +2877,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 			if !strings.Contains(wq, migrationWorkPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared migration predicate %q in %q", migrationWorkPredicate, wq)
 			}
-			for _, want := range []string{`.metadata`, `.[:1]`} {
+			for _, want := range []string{`.metadata`, `.[0:1]`} {
 				if !strings.Contains(wq, want) {
 					t.Errorf("EffectiveWorkQuery() missing migration filter fragment %q in %q", want, wq)
 				}

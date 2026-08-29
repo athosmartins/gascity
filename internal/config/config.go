@@ -3261,8 +3261,36 @@ func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string
 // Appended AFTER ctx:thin (not inserted between the pre-existing flags) so the
 // original "story:needs-human" ... "ctx:thin" contiguous substring several
 // tests hardcode stays intact.
+//
+// ga-7ha7g: story:epic is appended last for the same reason. --exclude-type=epic
+// only checks issue_type, but bead authors routinely label a bead story:epic
+// (or title it "EPIC:"/"ÉPICO:", the text-only half of this same gap — see
+// poolDemandLabelFilterJQ) without ever setting issue_type=epic. Confirmed
+// live: ga-9pyg2 (issue_type=task, label story:epic, title "ÉPICO: migração
+// v55 do engine..." — required a Mayor-coordinated engine rebuild, exactly
+// the class of work a pool worker must never execute off its own hook per
+// ga-vhyd).
 func bdReadyPoolDemandExcludeLabelArgs() string {
-	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval"`
+	// ga-5huvs: needs:engine-window, pilot:no-auto-dispatch and story:blocked are
+	// veto labels a pool worker can never satisfy — a bead wearing one is offered,
+	// refused, and re-offered forever (the re-refusal loop observed live on
+	// ga-mww6n). Excluding them at the query is the only place that breaks the
+	// cycle; a worker-side refusal cannot, because the query re-serves the bead.
+	// ga-wvptf: delivery:partial and scope:needs-review mark work whose scope a
+	// human still has to settle — dispatchable-looking, but not actually claimable.
+	// ga-s1d5o: the auto-refino lifecycle set. A bead mid-refinement (or escalated
+	// out of it) has no settled spec yet, so serving it to a pool worker races the
+	// refiner's own writeback. exec:manual is included for the same reason it is a
+	// veto everywhere else: it means "a human dispatches this", not "unclaimed".
+	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic"` +
+		` --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"` +
+		` --exclude-label "delivery:partial" --exclude-label "scope:needs-review"` +
+		` --exclude-label "exec:manual" --exclude-label "needs-human-decision"` +
+		` --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated"` +
+		` --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap"` +
+		` --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress"` +
+		` --exclude-label "story:refino-review" --exclude-label "story:refino-escalado"` +
+		` --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy"`
 }
 
 // poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
@@ -3299,13 +3327,30 @@ func bdReadyPoolDemandExcludeLabelArgs() string {
 // stamped together (imp19 atomicity convention, see
 // _pilot_hold_or_escalate's callers) — so this is not a narrowing of real
 // coverage, only of what the broad prefix accidentally swept in.
+// ga-7ha7g: also excludes titles starting with "EPIC:"/"EPIC "/"ÉPICO:"/"ÉPICO "
+// (case-insensitive) — the title-text half of the epic-authoring-mismatch gap
+// that story:epic (an exact label, handled in bdReadyPoolDemandExcludeLabelArgs)
+// cannot catch alone. Two confirmed live instances carried the mismatch in only
+// one of the two signals — ga-9pyg2 had both label and title; gh-ai2 had the
+// title only ("EPIC: migrar crew GT...", no story:epic label) — so both checks
+// are required, neither is redundant. Anchored at the start with a colon/
+// whitespace delimiter so a title that merely mentions "epic" mid-sentence
+// (e.g. a bug report about this exact gap) is never over-matched.
 func poolDemandLabelFilterJQ() string {
 	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
 		`[ .[] `+
 			`| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) `+
 			`| select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) `+
 			`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) `+
-			`| if length > 0 then (max < $now_ts) else false end)) ]`)
+			`| if length > 0 then (max < $now_ts) else false end)) `+
+			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) `+
+			// ga-5huvs: the PREFIX half of the same three vetoes. blocked:<reason>
+			// and gate:needs-human are open-ended families (the suffix carries the
+			// reason), so an exact --exclude-label cannot enumerate them;
+			// pilot:refused-reason:* likewise. Kept here rather than in
+			// bdReadyPoolDemandExcludeLabelArgs precisely because bd's
+			// --exclude-label is exact-match only.
+			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:"))) | length) == 0) ]`)
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
