@@ -3275,15 +3275,35 @@ func bdReadyPoolDemandExcludeLabelArgs() string {
 //
 //   - pool:refused:* is a PREFIX (pool:refused:engine-rebuild-required, etc.), so
 //     it needs startswith, not equality.
-//   - "held" must be decided by the ABSENCE OF ALL pilot:held* labels first; only
+//   - "held" must be decided by the ABSENCE OF a live-hold signal first; only
 //     then is the expiry branch reachable. And pilot:held-until:<epoch> labels
 //     ACCUMULATE (nothing prunes them), so the bead is still held iff its LATEST
 //     stamp is in the future — use max, never .[0] (ga-4aree).
+//
+// ga-jfz9t1: the live-hold signal is EXACTLY `. == "pilot:held"` or
+// `startswith("pilot:held-until:")` — deliberately NOT a bare
+// `startswith("pilot:held")`, which used to be here and is WRONG: it also
+// matches the unrelated sticky `pilot:held-count:<slug>:<n>` label
+// (pilot-dispatcher.sh's _pilot_hold_or_escalate — an escalation-cap
+// counter documented there as surviving hold expiry, i.e. NEVER cleared
+// once stamped, unlike pilot:held/pilot:held-until:* which get cleared
+// when a hold actually resolves). A bead carrying only pilot:held-count:*
+// has zero pilot:held-until: labels to compute an expiry from, so the old
+// broad match fell into the `else false` branch — no escape hatch — and
+// was excluded from EVERY pool's routed-pool probe forever. Confirmed live
+// on ga-281ri4/ga-fkc1vx: both were re-approved (ctx:ready/exec:auto/
+// story:approved) after an earlier unrelated lane:big refusal, but the
+// leftover held-count label kept them invisible until removed by hand. The
+// two label forms kept here (bare `pilot:held` and `pilot:held-until:`)
+// are the only ones that ever represent an actual hold — they are always
+// stamped together (imp19 atomicity convention, see
+// _pilot_hold_or_escalate's callers) — so this is not a narrowing of real
+// coverage, only of what the broad prefix accidentally swept in.
 func poolDemandLabelFilterJQ() string {
 	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
 		`[ .[] `+
 			`| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) `+
-			`| select((((.labels // []) | map(select(startswith("pilot:held"))) | length) == 0) `+
+			`| select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) `+
 			`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) `+
 			`| if length > 0 then (max < $now_ts) else false end)) ]`)
 }

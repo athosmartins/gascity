@@ -1878,12 +1878,14 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 		`bd list --status in_progress --assignee="$id" --json --limit=20`,
 		`ephemeral=true AND status=in_progress`,
 		// ga-ael6v: the assigned-in-progress ("crash recovery") tier must apply
-		// the same pool:refused:*/pilot:held* prefix filter as the routed-pool
-		// tier (ga-g7yt/ga-y8qh) — otherwise a bead a prior session already
-		// refused gets reassigned to a fresh session by inflight-reclaim-guard
-		// and is re-offered as if it were live work to resume.
+		// the same pool:refused:*/held filter as the routed-pool tier
+		// (ga-g7yt/ga-y8qh) — otherwise a bead a prior session already refused
+		// gets reassigned to a fresh session by inflight-reclaim-guard and is
+		// re-offered as if it were live work to resume.
 		`startswith("pool:refused")`,
-		`startswith("pilot:held")`,
+		// ga-jfz9t1: exact form, not the old bare startswith("pilot:held")
+		// prefix — see poolDemandLabelFilterJQ's doc-comment.
+		`. == "pilot:held" or startswith("pilot:held-until:")`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveAssignedInProgressQuery() missing assigned recovery fragment %q: %q", want, got)
@@ -2700,8 +2702,14 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 				if !strings.Contains(hay.s, `startswith("pool:refused")`) {
 					t.Errorf("%s() missing pool:refused prefix filter in %q", hay.name, hay.s)
 				}
-				if !strings.Contains(hay.s, `startswith("pilot:held")`) {
-					t.Errorf("%s() missing pilot:held prefix filter in %q", hay.name, hay.s)
+				// ga-jfz9t1: this used to assert the bare (and buggy) substring
+				// startswith("pilot:held") — which also matched the unrelated
+				// sticky pilot:held-count:* label (see poolDemandLabelFilterJQ's
+				// doc-comment and TestPoolDemandHeldCountNotTreatedAsVeto). The
+				// live-hold signal is now the exact label plus the timed-hold
+				// prefix; assert both are present instead of the old broad string.
+				if !strings.Contains(hay.s, `. == "pilot:held" or startswith("pilot:held-until:")`) {
+					t.Errorf("%s() missing exact pilot:held / pilot:held-until: prefix filter in %q", hay.name, hay.s)
 				}
 				if !strings.Contains(hay.s, `--exclude-label "needs-human"`) {
 					t.Errorf("%s() missing needs-human exact exclusion in %q", hay.name, hay.s)
@@ -2872,6 +2880,102 @@ esac
 				if demandOut == "0" {
 					t.Errorf("EffectivePoolDemandQuery output = %q, want >0 when work_query reports work", demandOut)
 				}
+			}
+		})
+	}
+}
+
+// TestPoolDemandHeldCountNotTreatedAsVeto is the regression test for
+// ga-jfz9t1: poolDemandLabelFilterJQ's "is this held" check was a bare
+// startswith("pilot:held") prefix match, which ALSO matches the unrelated
+// sticky pilot:held-count:<slug>:<n> label stamped by pilot-dispatcher.sh's
+// _pilot_hold_or_escalate() — an escalation-cap counter explicitly
+// documented there as "sticky... survives hold expiry" (i.e. by design
+// nothing ever clears it once stamped, unlike pilot:held/pilot:held-until:*
+// which a human/the dispatcher can clear when a hold resolves).
+//
+// A bead carrying ONLY pilot:held-count:* (no bare pilot:held, no
+// pilot:held-until:*) fell into the filter's `else false` branch — there
+// are zero pilot:held-until: labels to compute an expiry max from — so the
+// "or expired" escape hatch could never fire. Net effect: permanent,
+// silent exclusion from bd ready's routed-pool result for dog/wa-worker/
+// ps-worker alike (poolDemandLabelFilterJQ is shared verbatim by all
+// three), with no timeout and no way to age out.
+//
+// Confirmed live 2026-08-20 on ga-281ri4/ga-fkc1vx: both carried
+// ctx:ready+exec:auto+story:approved (re-armed for dispatch by the Mayor
+// after an earlier, unrelated lane:big refusal — see that bead's history)
+// plus a stale pilot:held-count:ga-jazy9:3, and were invisible to the
+// routed-pool probe until the label was manually removed.
+//
+// The three sub-cases below also lock down the behavior this fix must NOT
+// regress — the "trap state" the surrounding doc-comment already warns
+// about (a bare pilot:held with no held-until yet must still exclude) and
+// an unexpired pilot:held-until must still exclude.
+func TestPoolDemandHeldCountNotTreatedAsVeto(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; poolDemandLabelFilterJQ is a jq pipeline")
+	}
+	agent := Agent{Name: "worker", Dir: "hello-world"}
+	target := "hello-world/worker"
+	future := time.Now().Add(1 * time.Hour).Unix()
+	past := time.Now().Add(-1 * time.Hour).Unix()
+
+	cases := []struct {
+		name        string
+		labelsJSON  string
+		wantVisible bool
+	}{
+		{
+			name:        "held-count only, no bare held/held-until: must be visible (the bug)",
+			labelsJSON:  `["pilot:held-count:ga-jazy9:3","story:approved"]`,
+			wantVisible: true,
+		},
+		{
+			name:        "bare pilot:held with no held-until yet: trap state, must stay excluded",
+			labelsJSON:  `["pilot:held"]`,
+			wantVisible: false,
+		},
+		{
+			name:        "pilot:held-until in the future: active hold, must stay excluded",
+			labelsJSON:  fmt.Sprintf(`["pilot:held","pilot:held-until:%d"]`, future),
+			wantVisible: false,
+		},
+		{
+			name:        "pilot:held-until in the past: expired hold, must be visible",
+			labelsJSON:  fmt.Sprintf(`["pilot:held","pilot:held-until:%d"]`, past),
+			wantVisible: true,
+		},
+		{
+			// ga-en2s-2's historical trap: held-until can land WITHOUT the bare
+			// pilot:held label yet (non-atomic stamping — held-until first). A
+			// left-branch check that only matched the exact "pilot:held" string
+			// would miss this and let an actively-held bead through. This fix's
+			// left branch OR's in startswith("pilot:held-until:") specifically
+			// so this case stays covered — do not simplify it to a bare
+			// `. == "pilot:held"` exact match.
+			name:        "pilot:held-until only (no bare pilot:held yet), future: must stay excluded",
+			labelsJSON:  fmt.Sprintf(`["pilot:held-until:%d"]`, future),
+			wantVisible: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bdScript := `#!/bin/sh
+case "$*" in
+  *"--metadata-field gc.routed_to=` + target + `"*)
+    printf '[{"id":"bead-1","labels":` + tc.labelsJSON + `,"updated_at":"2026-08-20T00:00:00Z","created_at":"2026-08-20T00:00:00Z"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`
+			out := strings.TrimSpace(runEffectiveWorkQuery(t, agent, nil, bdScript))
+			gotVisible := out != "" && out != "[]"
+			if gotVisible != tc.wantVisible {
+				t.Errorf("EffectiveWorkQuery() = %q, want visible=%v", out, tc.wantVisible)
 			}
 		})
 	}
