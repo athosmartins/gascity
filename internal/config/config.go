@@ -3282,6 +3282,27 @@ func bdReadyPoolDemandExcludeLabelArgs() string {
 	// out of it) has no settled spec yet, so serving it to a pool worker races the
 	// refiner's own writeback. exec:manual is included for the same reason it is a
 	// veto everywhere else: it means "a human dispatches this", not "unclaimed".
+	// ga-6bghe: gate:queued and gate:reviewing are appended last — a bead
+	// carrying either has already had its fix submitted and is under active
+	// quality-gate review; no builder work remains until that review concludes.
+	// Neither was previously excluded, so a bead could be open+unassigned+
+	// gc.routed_to (the source bead legitimately "stays open until the gate
+	// merges" per builder convention) while ALSO mid-review, and this probe
+	// could not tell that apart from genuinely fresh work. Confirmed live twice
+	// independently (ga-nxgxz 2026-08-06, ga-ovw94t 2026-08-17): a fresh dog
+	// claimed a bead whose gate marker was still open/progressing (never
+	// stalled), burning ~10-15 tool calls reconstructing "already in flight"
+	// from scratch before releasing it. gate:needs-fix is deliberately NOT
+	// added here — that label means the gate REJECTED and a builder IS needed
+	// again, so it must stay poolable; the two do not steady-state coexist
+	// because quality-gate-dispatcher.sh's FAIL path clears gate:queued (and
+	// unsets gc.routed_to) in the same edit that sets gate:needs-fix. A third
+	// label from this gap's own bug report, "gate:dispatching", is deliberately
+	// omitted: verified against every gate:* label actually applied to a bead
+	// across packs/town-deltas/assets/*.sh and internal/ — it does not exist.
+	// The real marker-side field is gate-status:dispatching, which lives on the
+	// separate quality-gate-marker bead, never on the story bead this probe
+	// evaluates.
 	return ` --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic"` +
 		` --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked"` +
 		` --exclude-label "delivery:partial" --exclude-label "scope:needs-review"` +
@@ -3290,7 +3311,8 @@ func bdReadyPoolDemandExcludeLabelArgs() string {
 		` --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap"` +
 		` --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress"` +
 		` --exclude-label "story:refino-review" --exclude-label "story:refino-escalado"` +
-		` --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy"`
+		` --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy"` +
+		` --exclude-label "gate:queued" --exclude-label "gate:reviewing"`
 }
 
 // poolDemandLabelFilterJQ is the PREFIX half of the routed-pool predicate: the
