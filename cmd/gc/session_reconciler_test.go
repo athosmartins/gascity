@@ -253,6 +253,43 @@ func (p *lateSuccessStartProvider) Start(ctx context.Context, name string, cfg r
 	return nil
 }
 
+// syncBuffer is a goroutine-safe bytes.Buffer for test stdout/stderr. The
+// reconciler spawns async drain-ack stop goroutines (queueDrainAckAsyncStop)
+// that write to the caller's stderr AFTER the synchronous reconcile call
+// returns; under -race those writes can overlap the next tick's writes to the
+// same buffer. Guarding every access with a mutex makes the shared buffer safe
+// with real synchronization (no time.Sleep timing hacks).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Return a copy so callers cannot read the underlying array while a
+	// concurrent Write mutates it.
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+func (b *syncBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
+}
+
 // reconcilerTestEnv holds common test infrastructure.
 type reconcilerTestEnv struct {
 	store        beads.Store
@@ -260,8 +297,8 @@ type reconcilerTestEnv struct {
 	dt           *drainTracker
 	clk          *clock.Fake
 	rec          events.Recorder
-	stdout       bytes.Buffer
-	stderr       bytes.Buffer
+	stdout       syncBuffer
+	stderr       syncBuffer
 	cfg          *config.City
 	desiredState map[string]TemplateParams
 }

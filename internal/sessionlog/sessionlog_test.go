@@ -1116,6 +1116,13 @@ func TestProjectSlug(t *testing.T) {
 		{"/home/user/project", "-home-user-project"},
 		{"/data/projects/gascity", "-data-projects-gascity"},
 		{"/home/user/.hidden/dir", "-home-user--hidden-dir"},
+		// ga-l2d2: underscores must mangle to "-" too, matching Claude
+		// Code's own /[^a-zA-Z0-9]/g sanitizer — rig dirs like
+		// whatsapp_automation and property_scrapers contain "_", and a
+		// slug that preserves it never matches the real transcript dir.
+		{"/Users/athos/gt/whatsapp_automation/crew/digo", "-Users-athos-gt-whatsapp-automation-crew-digo"},
+		{"/Users/athos/gt/property_scrapers/crew/batista", "-Users-athos-gt-property-scrapers-crew-batista"},
+		{"/data/my-project_v2", "-data-my-project-v2"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {

@@ -487,6 +487,119 @@ func CoreFingerprintDriftFieldsFromJSON(storedJSON string, current Config) []str
 	return diffBreakdownFields(storedFields, CoreFingerprintBreakdown(current).Fields)
 }
 
+// ScriptsCopyRelDst is the RelDst of the CopyFiles entry that stages the city
+// scripts/ directory into each session worktree as .gc/scripts (see the
+// CopyFiles assembly in cmd/gc/template_resolve.go — keep the two in sync).
+// The session reconciler treats a content-only drift of just this entry as
+// non-draining for fresh-wake ephemeral workers: the staged copy is inert for
+// them (never on PATH, no Go consumer reads it; city-scoped scripts are
+// fresh-read at use), so re-copying it via a drain+restart only burns the
+// dispatch.
+const ScriptsCopyRelDst = ".gc/scripts"
+
+// copyFilesBreakdownField is the CoreFingerprintBreakdown field name that
+// aggregates every CopyFiles entry (see CoreFingerprintBreakdown).
+const copyFilesBreakdownField = "CopyFiles"
+
+// ConfigDriftIsCopyEntryContentOnly reports whether the ONLY core-config drift
+// between the stored breakdown (JSON, as written to a session's
+// core_hash_breakdown metadata at start) and the current config is a
+// content-hash change to the single probed CopyFiles entry whose RelDst equals
+// relDst — e.g. ScriptsCopyRelDst for the staged scripts/ tree.
+//
+// It returns true iff ALL of:
+//   - the stored breakdown is a current-format BreakdownV1 (legacy
+//     map[string]string payloads carry no per-entry CopyFiles to diff → false),
+//   - exactly one core field drifted and it is "CopyFiles",
+//   - the CopyFiles entry set is identical on both sides (no entry added or
+//     removed), every entry other than relDst is fingerprint-identical, and the
+//     relDst entry differs ONLY in its content hash while staying probed.
+//
+// This is the deploy-SAFE lever for suppressing scripts/-churn drains: it
+// changes no fingerprint input or algorithm (so no stored hash is invalidated
+// and no mass-rebaseline/drain-storm is provoked), only informs the
+// reconciler's drain DECISION. Any drift that touches a non-scripts field
+// (Command, Env, hooks, the settings CopyFiles entry, …) is not
+// copy-entry-content-only and still drains.
+func ConfigDriftIsCopyEntryContentOnly(storedJSON string, current Config, relDst string) bool {
+	storedFields, storedCopy, isV1 := parseStoredBreakdown(storedJSON)
+	if !isV1 || len(storedFields) == 0 {
+		return false
+	}
+	currentBd := CoreFingerprintBreakdown(current)
+	drifted := diffBreakdownFields(storedFields, currentBd.Fields)
+	if len(drifted) != 1 || drifted[0] != copyFilesBreakdownField {
+		return false
+	}
+	return copyFilesDriftIsSingleEntryContentChange(storedCopy, currentBd.CopyFiles, relDst)
+}
+
+// copyFilesDriftIsSingleEntryContentChange reports whether the only difference
+// between the stored and current per-entry CopyFiles breakdowns is the content
+// hash of the single probed entry whose RelDst == relDst. Entries are keyed by
+// RelDst; any added/removed entry, any change to a different entry, or a
+// probed-mode flip of the target disqualifies the change. Order differences
+// (which the ordered fingerprint would treat as drift) surface as "no entry
+// content changed" here → false → the caller drains, which is the safe default.
+func copyFilesDriftIsSingleEntryContentChange(stored, current []BreakdownCopyEntry, relDst string) bool {
+	storedByDst := make(map[string]BreakdownCopyEntry, len(stored))
+	for _, e := range stored {
+		storedByDst[e.RelDst] = e
+	}
+	currentByDst := make(map[string]BreakdownCopyEntry, len(current))
+	for _, e := range current {
+		currentByDst[e.RelDst] = e
+	}
+	// The RelDst set must be identical — an added or removed copy entry is a
+	// structural change, not a content-only tweak of the target entry.
+	if len(storedByDst) != len(currentByDst) {
+		return false
+	}
+	sawTargetContentChange := false
+	for dst, cur := range currentByDst {
+		st, ok := storedByDst[dst]
+		if !ok {
+			return false // RelDst set differs (present in current, not stored)
+		}
+		if copyEntryFingerprintEqual(st, cur) {
+			continue
+		}
+		// This entry differs. It must be exactly the target, and it must be a
+		// probed content-hash change (not a Src or probed-mode change).
+		if dst != relDst || !st.Probed || !cur.Probed {
+			return false
+		}
+		sawTargetContentChange = true
+	}
+	return sawTargetContentChange
+}
+
+// copyEntryFingerprintEqual reports whether two CopyFiles entries contribute
+// identically to the core fingerprint. Mirrors the hashing in hashCoreFields /
+// CoreFingerprintBreakdown: probed entries fold RelDst + content hash (empty
+// hash → the HASH_UNAVAILABLE sentinel), non-probed entries fold Src + RelDst.
+// Callers pass entries already matched by RelDst, so RelDst equality is implied.
+func copyEntryFingerprintEqual(a, b BreakdownCopyEntry) bool {
+	if a.Probed != b.Probed {
+		return false
+	}
+	if a.Probed {
+		return normalizeCopyContentHash(a.ContentHash) == normalizeCopyContentHash(b.ContentHash)
+	}
+	return a.Src == b.Src
+}
+
+// normalizeCopyContentHash maps an empty probed content hash to the same stable
+// sentinel the fingerprint uses (see hashCoreFields), so a transient
+// hash-unavailable read compares equal to another transient one rather than
+// registering as drift.
+func normalizeCopyContentHash(h string) string {
+	if h == "" {
+		return "HASH_UNAVAILABLE"
+	}
+	return h
+}
+
 // LogCoreFingerprintDrift writes diagnostic output when config-drift is
 // detected. The stored breakdown is supplied as a JSON-encoded string;
 // the renderer first attempts to decode it as a current-format

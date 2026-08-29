@@ -1093,9 +1093,20 @@ func addDarwinClaudePathAliases(path string, add func(string)) {
 }
 
 // ProjectSlug converts an absolute path to the project directory slug
-// convention: all "/" and "." are replaced with "-".
+// convention used by the Claude Code CLI: every character other than an
+// ASCII letter or digit is replaced with "-" (Claude Code's own sanitizer
+// is the regex /[^a-zA-Z0-9]/g). This must stay in exact sync with that
+// regex — gc reads transcripts Claude Code itself wrote under
+// ~/.claude/projects/<slug>/, so any divergence (e.g. previously missing
+// "_") makes real transcripts permanently unresolvable rather than merely
+// mismatched. Confirmed live: rig paths containing "_" (whatsapp_automation,
+// property_scrapers) mangle their "_" to "-" on disk; a slug that preserves
+// "_" never matches (ga-l2d2).
 func ProjectSlug(absPath string) string {
-	s := strings.ReplaceAll(absPath, "/", "-")
-	s = strings.ReplaceAll(s, ".", "-")
-	return s
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return '-'
+	}, absPath)
 }

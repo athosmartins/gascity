@@ -189,6 +189,25 @@ func sessionStartRequested(session beads.Bead, clk clock.Clock) bool {
 // reached preWakeCommit use pendingCreateNeverStartedTimeout instead.
 const staleCreatingStateTimeout = time.Minute
 
+// asyncStartDriftExemptionTimeout is the (longer) window that gates ONLY the
+// fresh-wake async-start config-drift exemption in the session reconciler.
+//
+// Why it is deliberately SEPARATE from staleCreatingStateTimeout: under a
+// Dolt-hot cold start (observed CPU bursts 168–251%), gc-prime plus the first
+// patrol can legitimately exceed one minute. With the exemption keyed to the
+// 1-minute staleCreatingStateTimeout, that window lapsed mid-startup and the
+// next config-drift (a routine scripts/ CopyFiles content change) DRAINED the
+// session before it did any work → NEVERSTARTED. Measured 2026-07-09: ~34% of
+// worker dispatches wasted in a 24h window (37/108), plus 163 distinct
+// gate-reviewer sessions drained at startup.
+//
+// Five minutes covers a Dolt-hot startup while remaining self-limiting: a
+// genuinely-stuck creating session with real config drift still drains once
+// this elapses. Keeping it OFF staleCreatingStateTimeout leaves reap/sweep
+// rollback semantics (build_desired_state.go, city_runtime.go sweep) exactly
+// as they were.
+const asyncStartDriftExemptionTimeout = 5 * time.Minute
+
 // stalePendingCreateTimeout is the longer grace window applied by
 // reapStaleSessionBeads to a started pending-create bead — one that holds
 // pending_create_claim=true AND has a last_woke_at (it reached preWakeCommit).

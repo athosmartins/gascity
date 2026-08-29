@@ -42,6 +42,15 @@ type CachingStore struct {
 	mutationSeq     uint64
 	primePartialErr error
 
+	// lastHydrationWatermark is the DB-clock max(updated_at) observed across the
+	// most recent successful reconcile's complete scan (ga-ftmci). The next
+	// reconcile hydrates only rows with updated_at strictly greater than this,
+	// leaving unchanged rows to carry their cached content forward. It is a
+	// DB-sourced timestamp (never gc wall-clock) so gc/DB clock skew cannot
+	// shift the hydration boundary. Zero (boot, or after a degraded cycle)
+	// forces a full hydration on the next reconcile.
+	lastHydrationWatermark time.Time
+
 	reconciling  atomic.Bool
 	syncFailures int
 	stats        CacheStats

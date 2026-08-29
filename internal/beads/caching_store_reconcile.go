@@ -253,30 +253,26 @@ func (c *CachingStore) runReconciliation() {
 
 	c.mu.RLock()
 	startSeq := c.mutationSeq
+	watermark := c.lastHydrationWatermark
+	// Snapshot the cache atomically with startSeq so carry-forward content and
+	// the "seq advanced during reconcile" guards agree on the same baseline.
+	cachedSnap := make(map[string]Bead, len(c.beads))
+	for id, b := range c.beads {
+		cachedSnap[id] = cloneBead(b)
+	}
 	c.mu.RUnlock()
 
 	bdStart := time.Now()
-	// ga-ftmci: SkipBody drops the three large LONGTEXT body columns
-	// (design, acceptance_criteria, notes) from the per-cycle full-table
-	// hydration scan. The reconcile diff (beadChanged) never inspects them and
-	// gc's Bead does not carry them, so hydrating them was pure CPU/IO waste
-	// that drove Dolt :52756 to sustained high CPU and stalled reviewer boots.
-	reconcileQuery := ListQuery{AllowScan: true, SkipLabels: true, SkipBody: true, TierMode: TierBoth}
-	fresh, err := c.backing.List(reconcileQuery)
-	// gc-aov9u: the reconciler runs on the supervisor's long-lived Dolt pool.
-	// If an idle pooled connection was reaped server-side (Dolt 30s timeout)
-	// before the Go pool retired it, the first List inherits a dead socket and
-	// fails with "invalid connection". Retry ONCE — the retry pulls a fresh
-	// connection — so a single stale socket doesn't flip the cache to degraded.
-	if err != nil && IsBadConnError(err) {
-		fresh, err = c.backing.List(reconcileQuery)
-	}
+	freshByID, freshWatermark, err := c.gatherReconcileState(watermark, cachedSnap)
 	bdLatency := time.Since(bdStart)
 	if err != nil {
 		c.mu.Lock()
 		c.syncFailures++
 		if (IsPartialResult(err) || c.syncFailures >= maxCacheSyncFailures) && (c.state == cacheLive || c.state == cachePartial) {
 			c.state = cacheDegraded
+			// Force a full re-hydrate on recovery: a degraded cache may have
+			// drifted, so the incremental watermark can no longer be trusted.
+			c.lastHydrationWatermark = time.Time{}
 		}
 		c.recordProblemLocked("reconcile cache", err)
 		c.recordReconcileLatencyLocked(bdLatency)
@@ -284,11 +280,6 @@ func (c *CachingStore) runReconciliation() {
 		c.updateStatsLocked()
 		c.mu.Unlock()
 		return
-	}
-
-	freshByID := make(map[string]Bead, len(fresh))
-	for _, b := range fresh {
-		freshByID[b.ID] = cloneBead(b)
 	}
 
 	confirmedClosed := c.recoverMissingFromList(freshByID)
@@ -393,6 +384,7 @@ func (c *CachingStore) runReconciliation() {
 		}
 		durMs := float64(time.Since(start).Microseconds()) / 1000.0
 		c.stats.LastReconcileAt = now
+		c.lastHydrationWatermark = freshWatermark
 		c.stats.LastReconcileMs = durMs
 		c.stats.Adds += adds
 		c.stats.Removes += removes
@@ -494,6 +486,7 @@ func (c *CachingStore) runReconciliation() {
 
 	durMs := float64(time.Since(start).Microseconds()) / 1000.0
 	c.stats.LastReconcileAt = now
+	c.lastHydrationWatermark = freshWatermark
 	c.stats.LastReconcileMs = durMs
 	c.stats.Adds += adds
 	c.stats.Removes += removes
@@ -508,6 +501,187 @@ func (c *CachingStore) runReconciliation() {
 		log.Print(logLine)
 	}
 	c.notifyChanges(notifications)
+}
+
+// reconcileHydrationQuery is the full-content reconcile projection: it skips
+// labels and the three large LONGTEXT body columns (design/acceptance_criteria/
+// notes) but retains every field gc's Bead and change-detection read. Shared by
+// the boot full-hydrate and the incremental hydration scan so their projections
+// cannot drift. The scope is non-closed (Status="" + IncludeClosed=false): a
+// bead leaving the non-closed set is precisely the close signal, so this must
+// never pin Status or set IncludeClosed.
+func reconcileHydrationQuery() ListQuery {
+	// ga-ftmci: SkipBody drops design/acceptance_criteria/notes from the scan.
+	// The reconcile diff (beadChanged) never inspects them and gc's Bead does
+	// not carry them, so streaming them was pure CPU/IO waste that drove Dolt
+	// to sustained high CPU and stalled reviewer boots.
+	return ListQuery{AllowScan: true, SkipLabels: true, SkipBody: true, TierMode: TierBoth}
+}
+
+// reconcileListWithRetry runs a reconcile List, retrying once on a bad pooled
+// connection.
+//
+// gc-aov9u: the reconciler runs on the supervisor's long-lived Dolt pool. If an
+// idle pooled connection was reaped server-side (Dolt 30s timeout) before the Go
+// pool retired it, the first List inherits a dead socket and fails with "invalid
+// connection". Retrying once pulls a fresh connection so a single stale socket
+// does not flip the cache to degraded.
+func (c *CachingStore) reconcileListWithRetry(query ListQuery) ([]Bead, error) {
+	fresh, err := c.backing.List(query)
+	if err != nil && IsBadConnError(err) {
+		fresh, err = c.backing.List(query)
+	}
+	return fresh, err
+}
+
+// gatherReconcileState produces the freshByID map the reconcile diff consumes —
+// the COMPLETE set of currently non-closed beads, each with full content — plus
+// the DB-clock watermark (max updated_at over that set) for the next cycle.
+//
+// ga-ftmci incremental hydration. On the first reconcile after boot (zero
+// watermark) it runs a single full-content scan, preserving the pre-incremental
+// behavior. On later cycles it runs two queries:
+//
+//  1. a CHEAP COMPLETE scan (id/status/updated_at only — SkipDescription drops
+//     the last streamed text column) that yields the exact non-closed ID set.
+//     This is the load-bearing invariant: the ID set drives removal/close/delete
+//     detection, so it must stay complete. A naive `updated_at > watermark`
+//     filter on THIS scan would drop every unchanged open row and synthesize
+//     bead.closed for the whole corpus.
+//  2. a hydration scan bounded by `updated_at > watermark` that streams full
+//     content only for rows changed since the last cycle.
+//
+// Unchanged rows carry their cached content forward. The ID set is never
+// narrowed by the watermark, so no unchanged bead is mistaken for a close.
+//
+// Hydration selection is per-row (updated_at advanced, or status differs, or the
+// row is new) rather than trusting the global watermark alone; any selected row
+// the watermark scan does not return — a change on the DATETIME second boundary,
+// or a new row — is fetched explicitly via Get so its content is never stale and
+// it is never dropped from the complete set.
+func (c *CachingStore) gatherReconcileState(watermark time.Time, cachedSnap map[string]Bead) (map[string]Bead, time.Time, error) {
+	if watermark.IsZero() {
+		fresh, err := c.reconcileListWithRetry(reconcileHydrationQuery())
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		freshByID := make(map[string]Bead, len(fresh))
+		var maxUpdatedAt time.Time
+		for _, b := range fresh {
+			freshByID[b.ID] = cloneBead(b)
+			if b.UpdatedAt.After(maxUpdatedAt) {
+				maxUpdatedAt = b.UpdatedAt
+			}
+		}
+		return freshByID, maxUpdatedAt, nil
+	}
+
+	// Query 1: cheap complete scan. Drives the ID set for close/delete detection.
+	// It also carries fresh dependencies (nativeIssueFilterFromListQuery sets
+	// IncludeDependencies), which we reuse below so carried-forward rows never
+	// keep stale deps — a dep add/remove does NOT bump issues.updated_at (deps
+	// live in a separate table), so such rows are never in needHydrate.
+	idScanQuery := reconcileHydrationQuery()
+	idScanQuery.SkipDescription = true
+	idScan, err := c.reconcileListWithRetry(idScanQuery)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+
+	// watermarkSecond is the second-resolution floor of the watermark. Because
+	// issues.updated_at is DATETIME (second resolution), a second content write
+	// within the same wall-clock second as the previous frontier does NOT advance
+	// updated_at, so an updated_at-only comparison would carry the stale content
+	// forward forever. Rows at or after this second are re-hydrated every cycle so
+	// a same-second content change is picked up on the next reconcile. The next
+	// frontier advances past this second, so the re-hydrated cohort stays small
+	// (the rows sharing the single most-recent second).
+	watermarkSecond := watermark.Truncate(time.Second)
+
+	idScanByID := make(map[string]Bead, len(idScan))
+	needHydrate := make(map[string]struct{})
+	var maxUpdatedAt time.Time
+	for _, b := range idScan {
+		idScanByID[b.ID] = b
+		if b.UpdatedAt.After(maxUpdatedAt) {
+			maxUpdatedAt = b.UpdatedAt
+		}
+		cached, ok := cachedSnap[b.ID]
+		if !ok || b.UpdatedAt.After(cached.UpdatedAt) || b.Status != cached.Status ||
+			!b.UpdatedAt.Before(watermarkSecond) {
+			needHydrate[b.ID] = struct{}{}
+		}
+	}
+
+	// Query 2: hydration scan for changed rows only. Skipped entirely when
+	// nothing needs hydrating — the steady-state fast path that eliminates the
+	// per-cycle full-content stream. The bound is `watermarkSecond - 1ns` so the
+	// predicate is effectively `updated_at >= watermarkSecond`: it RETURNS the
+	// same-second boundary cohort (whose second-resolution updated_at equals
+	// watermarkSecond and would be excluded by a strict `> watermark`), while
+	// still excluding genuinely older settled rows. On the real second-resolution
+	// DB this formats (RFC3339) to the previous whole second, i.e. `updated_at >
+	// prevSecond`, which is exactly `>= watermarkSecond`.
+	hydratedByID := make(map[string]Bead)
+	if len(needHydrate) > 0 {
+		hydrateQuery := reconcileHydrationQuery()
+		hydrateQuery.UpdatedAfter = watermarkSecond.Add(-time.Nanosecond)
+		hydrated, herr := c.reconcileListWithRetry(hydrateQuery)
+		if herr != nil {
+			return nil, time.Time{}, herr
+		}
+		for _, b := range hydrated {
+			if _, open := idScanByID[b.ID]; open {
+				hydratedByID[b.ID] = cloneBead(b)
+			}
+		}
+	}
+
+	// Assemble freshByID over the COMPLETE non-closed ID set.
+	freshByID := make(map[string]Bead, len(idScanByID))
+	var fallbackIDs []string
+	for id, scanned := range idScanByID {
+		if hb, ok := hydratedByID[id]; ok {
+			freshByID[id] = hb
+			continue
+		}
+		if _, changed := needHydrate[id]; !changed {
+			if cb, ok := cachedSnap[id]; ok {
+				// Carry unchanged content forward, but refresh dependencies from
+				// the complete scan: a dep add/remove does not bump updated_at, so
+				// the cached bead's dep fields may be stale even though its scalar
+				// content is current. Deriving deps from the carried cached bead
+				// (the completeness-store path) would miss the change.
+				carried := cloneBead(cb)
+				carried.Dependencies = cloneDeps(scanned.Dependencies)
+				carried.Needs = append([]string(nil), scanned.Needs...)
+				freshByID[id] = carried
+				continue
+			}
+		}
+		fallbackIDs = append(fallbackIDs, id)
+	}
+
+	// A row that needs hydration but the watermark scan did not return (a change
+	// or new row exactly on the second-resolution updated_at boundary) is fetched
+	// explicitly. It must never be dropped from the complete set — that would
+	// spuriously close it.
+	for _, id := range fallbackIDs {
+		b, gerr := c.backing.Get(id)
+		if gerr == nil && b.ID == id {
+			freshByID[id] = cloneBead(b)
+			continue
+		}
+		if cb, ok := cachedSnap[id]; ok {
+			// Could not confirm fresh content; keep the cached row so the diff
+			// does not close a bead the complete scan just reported as open.
+			freshByID[id] = cloneBead(cb)
+		}
+		// else: a brand-new row we could not hydrate this cycle — omit it; the
+		// next reconcile re-observes it. Its absence closes nothing (not cached).
+	}
+
+	return freshByID, maxUpdatedAt, nil
 }
 
 // reconcileSuccessLogLocked composes the per-reconcile success log line

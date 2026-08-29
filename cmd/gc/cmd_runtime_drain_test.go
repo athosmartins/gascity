@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -636,6 +637,75 @@ func TestProviderDrainOpsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestProviderDrainOpsSetDrainAckPersistsDrainWithoutPriorSetDrain reproduces
+// ga-sm5p: an agent that self-initiates drain-ack (the documented pool-worker
+// shutdown pattern — "execute it, close it, and drain when complete" — never
+// calls "gc runtime drain" first) must see drain-check report draining=true
+// immediately after the ack. Before the fix, setDrainAck wrote only
+// GC_DRAIN_ACK, leaving isDraining (which reads only GC_DRAIN) false —
+// ack succeeded but the drain state did not persist.
+func TestProviderDrainOpsSetDrainAckPersistsDrainWithoutPriorSetDrain(t *testing.T) {
+	sp := runtime.NewFake()
+	_ = sp.Start(context.Background(), "worker", runtime.Config{})
+	dops := newDrainOps(sp)
+
+	if draining, _ := dops.isDraining("worker"); draining {
+		t.Fatal("should not be draining initially")
+	}
+
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatalf("setDrainAck: %v", err)
+	}
+
+	acked, _ := dops.isDrainAcked("worker")
+	if !acked {
+		t.Error("should be acked after setDrainAck")
+	}
+	if draining, _ := dops.isDraining("worker"); !draining {
+		t.Error("should be draining after setDrainAck even without a prior setDrain — ack→check must be consistent")
+	}
+}
+
+// TestProviderDrainOpsSetDrainAckPreservesControllerDrainStart pins the
+// set-if-absent contract for ga-sm5p: when the controller has ALREADY begun the
+// drain (GC_DRAIN set at T0), an agent's setDrainAck must persist the ack
+// WITHOUT overwriting GC_DRAIN with a fresh timestamp. Overwriting would reset
+// the drain clock (drainStartTime), letting a slow drain restart its deadline on
+// every ack. drainStartTime must still report the controller's original T0.
+func TestProviderDrainOpsSetDrainAckPreservesControllerDrainStart(t *testing.T) {
+	sp := runtime.NewFake()
+	_ = sp.Start(context.Background(), "worker", runtime.Config{})
+	dops := newDrainOps(sp)
+
+	// The controller started draining at T0, an hour ago. Seed GC_DRAIN directly
+	// with that timestamp (distinct from "now" so a reset is unambiguously
+	// detectable — setDrain() itself only writes time.Now() at 1s granularity).
+	t0 := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := sp.SetMeta("worker", "GC_DRAIN", strconv.FormatInt(t0.Unix(), 10)); err != nil {
+		t.Fatalf("seeding GC_DRAIN at T0: %v", err)
+	}
+
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatalf("setDrainAck: %v", err)
+	}
+
+	got, err := dops.drainStartTime("worker")
+	if err != nil {
+		t.Fatalf("drainStartTime: %v", err)
+	}
+	if !got.Equal(t0) {
+		t.Errorf("setDrainAck reset the drain clock: drainStartTime = %v, want controller's original T0 %v", got, t0)
+	}
+
+	// The ack itself must still be recorded and the session still draining.
+	if acked, _ := dops.isDrainAcked("worker"); !acked {
+		t.Error("should be acked after setDrainAck")
+	}
+	if draining, _ := dops.isDraining("worker"); !draining {
+		t.Error("should still be draining after setDrainAck")
+	}
+}
+
 func TestProviderDrainOpsReportsMetadataErrors(t *testing.T) {
 	sp := runtime.NewFailFake()
 	dops := newDrainOps(sp)
@@ -721,6 +791,7 @@ func TestProviderDrainOpsSetDrainAckAttemptsAckAfterCleanupErrors(t *testing.T) 
 	}
 	wantSet := []string{
 		reconcilerDrainAckSourceKey,
+		"GC_DRAIN",
 		"GC_DRAIN_ACK",
 	}
 	if !slices.Equal(sp.setKeys, wantSet) {

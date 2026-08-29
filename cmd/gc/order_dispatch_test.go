@@ -1576,6 +1576,100 @@ func TestOrderDispatchExecDue(t *testing.T) {
 	}
 }
 
+// storeCloseRaceStore wraps a beads.Store and, like NativeDoltStore, rejects
+// CloseAll once CloseStore has been called -- used to prove dispatch() never
+// closes a store while a dispatchOne goroutine it handed that store to is
+// still using it (ga-z6uo: order executors racing a closed Dolt bead-store
+// handle).
+type storeCloseRaceStore struct {
+	beads.Store
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *storeCloseRaceStore) CloseStore() error {
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *storeCloseRaceStore) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+func (s *storeCloseRaceStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
+	if s.isClosed() {
+		return 0, fmt.Errorf("native Dolt store: %w", beads.ErrStoreClosed)
+	}
+	return s.Store.CloseAll(ids, metadata)
+}
+
+// TestOrderDispatchDoesNotCloseStoreWhileAsyncDispatchInFlight reproduces
+// ga-z6uo. dispatch() opens a store, hands it to a detached dispatchOne
+// goroutine, and returns from its own synchronous loop while that goroutine
+// is still running its exec/wisp work. The store must not be closed until
+// every dispatchOne goroutine it was handed to has finished using it.
+func TestOrderDispatchDoesNotCloseStoreWhileAsyncDispatchInFlight(t *testing.T) {
+	store := &storeCloseRaceStore{Store: beads.NewMemStore()}
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+	blockingExec := func(context.Context, string, string, []string) ([]byte, error) {
+		close(started)
+		<-unblock
+		return nil, nil
+	}
+
+	aa := []orders.Order{{
+		Name:     "slow-order",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     "true",
+		Source:   "/city/orders/slow-order.toml",
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, blockingExec, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+
+	ad.dispatch(context.Background(), t.TempDir(), time.Now())
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exec runner was never invoked")
+	}
+
+	// dispatch() has already returned synchronously at this point. The
+	// blocked exec call proves its dispatchOne goroutine is still in
+	// flight and still holds a reference to store.
+	if store.isClosed() {
+		t.Fatal("dispatch() closed the store while its dispatchOne goroutine was still using it")
+	}
+	close(unblock)
+
+	if !ad.drain(context.Background()) {
+		t.Fatal("drain did not complete")
+	}
+
+	all := trackingBeads(t, store, "order-run:slow-order")
+	if len(all) == 0 {
+		t.Fatal("expected tracking bead to be created")
+	}
+	for _, b := range all {
+		if !slicesContain(b.Labels, "order-run:slow-order") {
+			continue
+		}
+		if b.Status != "closed" {
+			t.Errorf("tracking bead %s status = %q, want closed (CloseAll must succeed before the store is closed)", b.ID, b.Status)
+		}
+	}
+}
+
 func TestOrderDispatchExecFailure(t *testing.T) {
 	store := beads.NewMemStore()
 	var rec memRecorder
@@ -8013,17 +8107,32 @@ func TestOrderDispatchSingleFlightLockFailsClosedOnPartialTierError(t *testing.T
 // dispatch() must close every store handle it opens each pass via
 // closeBeadStoreHandle, which type-asserts for interface{ CloseStore() error }.
 
-// dispatchCloseStoreSpy wraps MemStore and counts CloseStore() calls. The
-// method is invoked by dispatch()'s deferred cleanup; not called concurrently.
+// dispatchCloseStoreSpy wraps MemStore and counts CloseStore() calls. dispatch()
+// closes the handles it opened this tick on a detached background goroutine (the
+// deferred storesWG.Wait() in dispatch()), so CloseStore runs off the test
+// goroutine. Guard closed with mu and read it via closedCount() so the -race
+// detector has a happens-before edge (ga-z6uo).
 type dispatchCloseStoreSpy struct {
 	*beads.MemStore
-	closed   int
 	closeErr error
+
+	mu     sync.Mutex
+	closed int
 }
 
 func (s *dispatchCloseStoreSpy) CloseStore() error {
+	s.mu.Lock()
 	s.closed++
+	s.mu.Unlock()
 	return s.closeErr
+}
+
+// closedCount returns how many times CloseStore() has been called, synchronized
+// against dispatch()'s background close goroutine.
+func (s *dispatchCloseStoreSpy) closedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 // newDispatchCloseStoreSpyFn returns an orderStoreFunc that appends a fresh
@@ -8033,6 +8142,29 @@ func newDispatchCloseStoreSpyFn(spies *[]*dispatchCloseStoreSpy) orderStoreFunc 
 		spy := &dispatchCloseStoreSpy{MemStore: beads.NewMemStore()}
 		*spies = append(*spies, spy)
 		return spy, nil
+	}
+}
+
+// waitForStoreCloses polls until every spy has recorded exactly wantEach
+// CloseStore() calls, or a 2s deadline elapses. dispatch() closes the stores it
+// opened on a background goroutine that runs after dispatch() returns, so tests
+// must wait on that goroutine via the synchronized closedCount() getter rather
+// than sleeping a fixed interval and reading closed unsynchronized (ga-z6uo).
+func waitForStoreCloses(t *testing.T, spies []*dispatchCloseStoreSpy, wantEach int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		allClosed := true
+		for _, spy := range spies {
+			if spy.closedCount() != wantEach {
+				allClosed = false
+				break
+			}
+		}
+		if allClosed || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -8054,15 +8186,18 @@ func TestDispatchClosesEveryOpenedStoreHandle(t *testing.T) {
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now())
 
+	// spies is populated synchronously by dispatch()'s store-opening loop, so
+	// its length is settled once dispatch() returns.
 	if len(spies) == 0 {
 		t.Fatal("storeFn never called: expected at least one store to be opened")
 	}
+	// The close happens on dispatch()'s background goroutine; poll for it.
+	waitForStoreCloses(t, spies, 1)
 	for i, spy := range spies {
-		if spy.closed != 1 {
-			t.Errorf("store[%d]: CloseStore() called %d times, want 1", i, spy.closed)
+		if got := spy.closedCount(); got != 1 {
+			t.Errorf("store[%d]: CloseStore() called %d times, want 1", i, got)
 		}
 	}
-	time.Sleep(50 * time.Millisecond) // let dispatchOne goroutines finish
 }
 
 func TestDispatchClosesRigAndLegacyCityStoreHandles(t *testing.T) {
@@ -8089,15 +8224,17 @@ func TestDispatchClosesRigAndLegacyCityStoreHandles(t *testing.T) {
 
 	m.dispatch(context.Background(), cityPath, time.Now())
 
+	// spies is populated synchronously by dispatch()'s store-opening loop.
 	if len(spies) != 2 {
 		t.Fatalf("storeFn called %d times, want 2 (rig + legacy city fallback)", len(spies))
 	}
+	// The closes happen on dispatch()'s background goroutine; poll for them.
+	waitForStoreCloses(t, spies, 1)
 	for i, spy := range spies {
-		if spy.closed != 1 {
-			t.Errorf("store[%d]: CloseStore() called %d times, want 1", i, spy.closed)
+		if got := spy.closedCount(); got != 1 {
+			t.Errorf("store[%d]: CloseStore() called %d times, want 1", i, got)
 		}
 	}
-	time.Sleep(50 * time.Millisecond)
 }
 
 func TestDispatchDeduplicatesStoreHandlesAcrossOrders(t *testing.T) {
@@ -8116,13 +8253,15 @@ func TestDispatchDeduplicatesStoreHandlesAcrossOrders(t *testing.T) {
 
 	m.dispatch(context.Background(), t.TempDir(), time.Now())
 
+	// spies is populated synchronously by dispatch()'s store-opening loop.
 	if len(spies) != 1 {
 		t.Fatalf("storeFn called %d times, want 1 (same target deduped across orders)", len(spies))
 	}
-	if spies[0].closed != 1 {
-		t.Errorf("CloseStore() called %d times, want 1", spies[0].closed)
+	// The close happens on dispatch()'s background goroutine; poll for it.
+	waitForStoreCloses(t, spies, 1)
+	if got := spies[0].closedCount(); got != 1 {
+		t.Errorf("CloseStore() called %d times, want 1", got)
 	}
-	time.Sleep(50 * time.Millisecond)
 }
 
 func TestDispatchClosesNoStoresWhenCitySuspended(t *testing.T) {

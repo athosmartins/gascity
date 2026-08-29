@@ -1303,6 +1303,7 @@ func nativeIssueFilterFromListQuery(query ListQuery) beadslib.IssueFilter {
 		Limit:               limit,
 		MetadataFields:      query.Metadata,
 		CreatedBefore:       zeroTimePtr(query.CreatedBefore),
+		UpdatedAfter:        zeroTimePtr(query.UpdatedAfter),
 		IncludeDependencies: true,
 		// ga-9ae7o / ga-hdfbux: beads 1.1.0 removed IssueFilter.SkipBody with no
 		// replacement (internal/types/types.go), so the projection narrowing

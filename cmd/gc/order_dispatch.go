@@ -401,12 +401,31 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	}
 
 	stores := make(map[string]beads.Store)
-	defer func() {
+	closeStores := func() {
 		for _, st := range stores {
 			if err := closeBeadStoreHandle(st); err != nil {
 				logDispatchError(m.stderr, "gc: order dispatch: closing store: %v", err)
 			}
 		}
+	}
+	// Stores opened this tick may be handed to a detached dispatchOne
+	// goroutine (below). Closing them the instant this synchronous loop
+	// returns races that goroutine's still-in-flight store calls
+	// (ga-z6uo: "native Dolt store: bead store closed"). storesWG counts
+	// only the goroutines THIS tick launched against THIS tick's stores
+	// map, so the close waits for exactly those instead of either closing
+	// early or blocking on unrelated in-flight work from other ticks.
+	var storesWG sync.WaitGroup
+	launchedAny := false
+	defer func() {
+		if !launchedAny {
+			closeStores()
+			return
+		}
+		go func() {
+			storesWG.Wait()
+			closeStores()
+		}()
 	}()
 	trackingIndex := newOrderDispatchTrackingIndex()
 	budgetSpent := 0
@@ -583,9 +602,12 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 
 		// Fire with timeout; inflight tracks the spawned goroutine so
 		// drain can wait for tracking-bead outcome persistence before
-		// controller exit or config reload.
+		// controller exit or config reload. storesWG additionally gates
+		// this tick's own store closes (see the defer above).
 		m.addInflight()
-		m.launchDispatchOne(ctx, store, target, a, cityPath, trackingBead.ID)
+		storesWG.Add(1)
+		launchedAny = true
+		m.launchDispatchOne(ctx, store, target, a, cityPath, trackingBead.ID, storesWG.Done)
 		if spendDispatchBudget(idx) {
 			return
 		}
@@ -597,14 +619,23 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 // cancel() reaches goroutines whose tick ctx was context.Background().
 // Falls back to the bare caller ctx when m.dispatchCtx is nil (test
 // sites that don't initialize the cancel fields).
-func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string) {
+//
+// release is called after dispatchOne fully returns (i.e. after its own
+// deferred store use — closeOrderTrackingBead, doneInflight — has already
+// completed), letting the caller's tick know it may now be safe to close
+// the store it handed to this goroutine (see dispatch's storesWG).
+func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, release func()) {
 	if m.dispatchCtx == nil {
-		go m.dispatchOne(ctx, store, target, a, cityPath, trackingID)
+		go func() {
+			defer release()
+			m.dispatchOne(ctx, store, target, a, cityPath, trackingID)
+		}()
 		return
 	}
 	mergedCtx, cancelMerged := context.WithCancel(ctx)
 	stopAfter := context.AfterFunc(m.dispatchCtx, cancelMerged)
 	go func() {
+		defer release()
 		defer stopAfter()
 		defer cancelMerged()
 		m.dispatchOne(mergedCtx, store, target, a, cityPath, trackingID)

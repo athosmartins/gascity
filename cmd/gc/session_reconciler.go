@@ -2025,19 +2025,55 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							// (wa-worker, ps-worker) whose spawn-wake-active
 							// lifecycle suffered the same race.
 							wasCreating := stateBeforeHeal == sessionpkg.StateCreating
-							if wasCreating && !isStaleCreating(*session) {
+							if wasCreating {
 								ephemeralTemplate := normalizedSessionTemplate(*session, cfg)
 								ephemeralAgent := findAgentByTemplate(cfg, ephemeralTemplate)
 								isFreshWake := sessionIsGateReviewerTemplate(*session, cfg) ||
 									(ephemeralAgent != nil && ephemeralAgent.EffectiveWakeMode() == "fresh")
 								if isFreshWake {
-									if trace != nil {
-										trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredActive), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
-											"active_reason": "ephemeral_async_start",
-										}), nil, "")
+									// Exemption 1 (time-based async-start). Keyed to the LONGER
+									// asyncStartDriftExemptionTimeout (not the 1-minute
+									// staleCreatingStateTimeout that reap/sweep use), so a
+									// Dolt-hot slow startup cannot lapse this exemption mid-spawn
+									// and let a routine scripts/ CopyFiles drift drain the worker
+									// before it does any work. See the const doc in
+									// session_reconcile.go.
+									if !isStaleForAsyncStartDriftExemption(*session) {
+										if trace != nil {
+											trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredActive), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+												"active_reason": "ephemeral_async_start",
+											}), nil, "")
+										}
+										fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': ephemeral worker in async-start (fresh creating, wake_mode=fresh)\n", name) //nolint:errcheck
+										continue
 									}
-									fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': ephemeral worker in async-start (fresh creating, wake_mode=fresh)\n", name) //nolint:errcheck
-									continue
+									// Exemption 2 (content-based scripts-only, ga-n9bw). Once the
+									// async-start window above lapses, the single most common
+									// config-drift on a fresh-wake ephemeral worker is a content-
+									// hash change to the staged city scripts/ tree (.gc/scripts):
+									// editing ANY scripts/ file re-hashes the whole CopyFiles
+									// fingerprint input. That staged copy is inert for these
+									// workers (never on PATH, no Go consumer reads it; city
+									// scripts are fresh-read at use), so draining+restarting just
+									// to re-stage it only burns the dispatch — the same
+									// NEVERSTARTED/drained-reviewer churn this bead targets. Defer
+									// iff the ONLY drift is the scripts entry's content hash.
+									// Self-limiting and deploy-safe: any co-occurring
+									// Command/Env/hook/settings change, or any structural
+									// CopyFiles change (entry added/removed, Src or probed-mode
+									// flip), makes this false and still drains (see
+									// runtime.ConfigDriftIsCopyEntryContentOnly). Scoped to the
+									// same fresh-wake ephemeral class as Exemption 1 — resume-wake
+									// named sessions and non-creating sessions are untouched.
+									if runtime.ConfigDriftIsCopyEntryContentOnly(session.Metadata["core_hash_breakdown"], agentCfg, runtime.ScriptsCopyRelDst) {
+										if trace != nil {
+											trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredActive), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+												"active_reason": "ephemeral_scripts_content_only",
+											}), nil, "")
+										}
+										fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': ephemeral worker scripts-only content drift (.gc/scripts inert for fresh-wake)\n", name) //nolint:errcheck
+										continue
+									}
 								}
 							}
 							ddt := driftDrainTimeout

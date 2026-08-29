@@ -78,7 +78,13 @@ type ListQuery struct {
 	// Legacy beads with zero UpdatedAt fall back to CreatedAt. Purge callers
 	// using CachingStore must also set Live: true to avoid stale cached timestamps.
 	UpdatedBefore time.Time
-	Limit         int
+	// UpdatedAfter matches beads whose UpdatedAt is strictly after this
+	// timestamp (mirrors the DB `updated_at > ?` predicate). Legacy beads with
+	// zero UpdatedAt fall back to CreatedAt. The cache reconcile path (ga-ftmci)
+	// sets this to the DB-clock watermark so only rows changed since the last
+	// scan are hydrated. A zero value imposes no filter (full hydration).
+	UpdatedAfter time.Time
+	Limit        int
 	IncludeClosed bool
 	AllowScan     bool
 	// SkipLabels tells backing stores and cache reconciliation that the
@@ -93,6 +99,16 @@ type ListQuery struct {
 	// the DB on every full-table scan is pure waste. Ignoring it stays
 	// correct — the store just returns the full body.
 	SkipBody bool
+	// SkipDescription tells backing stores the caller does not need the
+	// `description` column either (it implies SkipBody-level narrowing). Set by
+	// the cache reconcile's CHEAP COMPLETE scan (ga-ftmci): that scan only reads
+	// id/status/updated_at to drive the ID-set / close / delete diff, so
+	// streaming description for every open row every cycle is the remaining CPU
+	// cost after SkipBody. Stores that can narrow the projection NULL-fill
+	// description; stores that cannot may ignore it — ignoring it stays correct,
+	// the scan is just less cheap. Never set this on a hydration path whose
+	// result is written to the cache as authoritative content.
+	SkipDescription bool
 	// Live bypasses CachingStore and reads from the backing store. Other Store
 	// implementations ignore it. Use it only for lifecycle gates that must
 	// observe external mutations immediately.
@@ -142,7 +158,8 @@ func (q ListQuery) HasFilter() bool {
 		q.ParentID != "" ||
 		len(q.Metadata) > 0 ||
 		!q.CreatedBefore.IsZero() ||
-		!q.UpdatedBefore.IsZero()
+		!q.UpdatedBefore.IsZero() ||
+		!q.UpdatedAfter.IsZero()
 }
 
 // IncludesClosed reports whether the query may return closed beads.
@@ -202,6 +219,9 @@ func (q ListQuery) Matches(b Bead) bool {
 		return false
 	}
 	if !q.UpdatedBefore.IsZero() && !beadUpdatedReferenceTime(b).Before(q.UpdatedBefore) {
+		return false
+	}
+	if !q.UpdatedAfter.IsZero() && !beadUpdatedReferenceTime(b).After(q.UpdatedAfter) {
 		return false
 	}
 	return true

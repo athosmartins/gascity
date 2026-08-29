@@ -1686,6 +1686,10 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if !serverQuery.CreatedBefore.IsZero() {
 		args = append(args, "--created-before", serverQuery.CreatedBefore.Format(time.RFC3339Nano))
 	}
+	// ga-ftmci: the reconcile hydration scan bounds by `updated_at > watermark`.
+	if !serverQuery.UpdatedAfter.IsZero() {
+		args = append(args, "--updated-after", serverQuery.UpdatedAfter.Format(time.RFC3339Nano))
+	}
 	args = append(args, "--include-infra", "--include-gates")
 	if bdListShouldIncludeTemplates(query) {
 		args = append(args, "--include-templates")
@@ -1729,7 +1733,7 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	// ask the installed bd what it supports, and pass the flag only if it does. An
 	// unsupported projection costs a slower query; an unsupported FLAG costs the
 	// entire call. Those must never again be the same failure.
-	if query.SkipBody {
+	if query.SkipBody || query.SkipDescription {
 		if s.bdSupportsFlag("list", "--skip-body") {
 			args = append(args, "--skip-body")
 		}
@@ -1766,7 +1770,7 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if serverQuery.Sort == SortCreatedAsc || clientFilteredAssignees {
 		return true
 	}
-	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
+	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() || !serverQuery.UpdatedAfter.IsZero() {
 		return true
 	}
 	return false
