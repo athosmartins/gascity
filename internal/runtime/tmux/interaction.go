@@ -34,8 +34,14 @@ func (p *Provider) Respond(name string, response runtime.InteractionResponse) er
 
 // approvalPatterns detect Claude Code's interactive prompts in tmux pane output.
 var (
-	// "This command requires approval" or "Approve edits?" patterns
-	requiresApprovalRe = regexp.MustCompile(`(?m)(This command requires approval|Approve edits\?)`)
+	// "This command requires approval" or "Approve edits?" are the default
+	// approval-flow prompts. "Permission rule ... requires confirmation for
+	// this command" is a DIFFERENT prompt shape produced by an explicit
+	// per-rule "ask" permission override (e.g. Bash(rm -rf:*) in
+	// settings.json) — bypassPermissions skips the default flow but not
+	// these forced rules. Same Options/keystroke mapping applies (see
+	// Pending/Respond below), so one shared pattern covers both shapes.
+	requiresApprovalRe = regexp.MustCompile(`(?m)(This command requires approval|Approve edits\?|Permission rule .+ requires confirmation for this command)`)
 
 	// Tool call header: "● ToolName(args)" or "● ToolName"
 	// Uses greedy match to last ")" to handle nested parens in args.

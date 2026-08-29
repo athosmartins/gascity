@@ -1667,10 +1667,11 @@ func newMailDeleteCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "delete <id>...",
-		Short: "Delete one or more messages (closes the beads)",
-		Long: `Delete one or more messages by closing the beads. Same effect as archive
-but with different user intent. When multiple IDs are passed, they are
-deleted in a single batch round-trip.`,
+		Short: "Permanently delete one or more messages (irreversible)",
+		Long: `Delete one or more messages by permanently removing the beads — this does
+NOT close them, and cannot be undone. Same effect as archive but with
+different user intent. When multiple IDs are passed, they are deleted in a
+single batch round-trip.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0

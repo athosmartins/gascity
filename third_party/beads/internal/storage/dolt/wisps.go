@@ -308,6 +308,18 @@ func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
 		return fmt.Errorf("wisp not found: %s", id)
 	}
 
+	// wisps carries no version-control history (dolt_ignored, unlike issues),
+	// so this row is the only surviving trace that id existed and when it was
+	// removed — record it even though the wisp itself is gone. No FK ties
+	// wisp_events to wisps (see 0021_create_wisp_auxiliary.up.sql), so writing
+	// this after the DELETE above is safe. Actor is intentionally not
+	// captured here: DeleteIssue's public signature carries no actor
+	// parameter (unlike UpdateIssue/AddDependency), and widening it touches
+	// every Storage implementer — out of scope for this fix.
+	if err := issueops.RecordEventInTable(ctx, tx, "wisp_events", id, types.EventDeleted, "", ""); err != nil {
+		return fmt.Errorf("failed to record wisp delete event: %w", err)
+	}
+
 	if err := issueops.DeleteWispFromDependenciesInTx(ctx, tx, id); err != nil {
 		return err
 	}

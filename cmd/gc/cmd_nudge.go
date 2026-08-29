@@ -185,6 +185,27 @@ func (t nudgeTarget) providerName() string {
 	return ""
 }
 
+// errNudgeTargetSuspended marks a refusal to queue a nudge for an agent
+// that is suspended in city.toml (config.Agent.Suspended, set via
+// [[patches.agent]] suspended = true). A suspended agent has no
+// reconciler-spawned session that will ever drain the queue, so queuing
+// here would only grow the backlog forever instead of failing fast — the
+// structural gap behind ga-clgc2's 379-nudge flood (ga-7sy6j).
+var errNudgeTargetSuspended = errors.New("nudge target is suspended")
+
+// refuseIfSuspended reports a non-nil error when t's agent is suspended.
+// Callers must check this before queuing a nudge (enqueueQueuedNudge,
+// enqueueQueuedNudgeWithStore, or the managed-wake path). It intentionally
+// does not gate an already-attempted live delivery to a session observed
+// running — a suspended config flag racing a still-live session is a
+// separate, unreported scenario this fix does not touch.
+func (t nudgeTarget) refuseIfSuspended() error {
+	if !t.agent.Suspended {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", errNudgeTargetSuspended, t.agentKey())
+}
+
 type queuedNudgeOptions struct {
 	ID                string
 	SessionID         string
@@ -659,6 +680,10 @@ func canRequestManagedNudgeWake(target nudgeTarget, store beads.Store) bool {
 }
 
 func queueManagedSessionNudgeWake(target nudgeTarget, store beads.Store, message string, mode nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
+	if err := target.refuseIfSuspended(); err != nil {
+		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
+		return 1
+	}
 	item := newQueuedNudgeWithOptions(target.agentKey(), message, "session", time.Now(), queuedNudgeOptionsFromTarget(target))
 	if err := enqueueManagedNudgeThenWake(target, store, item); err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
@@ -822,6 +847,10 @@ func deliverSessionNudgeWithProvider(target nudgeTarget, sp runtime.Provider, mo
 }
 
 func queueSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, message string, mode nudgeDeliveryMode, jsonOutput bool, stdout, stderr io.Writer) int {
+	if err := target.refuseIfSuspended(); err != nil {
+		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
+		return 1
+	}
 	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), message, "session", time.Now(), queuedNudgeOptionsFromTarget(target))); err != nil {
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
@@ -883,6 +912,9 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 				return nil
 			}
 		}
+	}
+	if err := target.refuseIfSuspended(); err != nil {
+		return err
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
 		item := newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))

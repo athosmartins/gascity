@@ -675,7 +675,7 @@ case "$query" in
     exit 0
     ;;
   *"DOLT_HASHOF_TABLE('wisp_events')"*)
-    if [ "$mode" = "dolt_ignored_table_false_positive" ] && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "dolt_ignored_table_false_positive" ] || [ "$mode" = "ignored_table_db_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       print_cell hash-wispevents-after-writer
       exit 0
     fi
@@ -687,6 +687,27 @@ case "$query" in
       printf 'information_schema unavailable\n' >&2
       exit 43
     fi
+    # ignored_tables() and user_tables() share this query text apart from one
+    # word (EXISTS vs NOT EXISTS ... dolt_ignore), told apart by that NOT.
+    # Every mode branch below this point was written for user_tables() alone,
+    # before ignored_tables() existed. Answer ignored_tables()'s query here,
+    # once, up front: empty (no ignored tables) for every mode except
+    # ignored_table_db_hash_drift, the one scenario that models a real
+    # ignored table's content drifting. Empty is the correct default — most
+    # databases have none — and it leaves every branch below answering
+    # user_tables()'s query exactly as it did before ignored_tables() existed.
+    case "$query" in
+      *"NOT EXISTS"*dolt_ignore*)
+        ;;
+      *dolt_ignore*)
+        if [ "$mode" = "ignored_table_db_hash_drift" ]; then
+          print_cell wisp_events
+        else
+          print_cells
+        fi
+        exit 0
+        ;;
+    esac
     if [ "$mode" = "dolt_ignored_table_false_positive" ]; then
       # Simulates a real dolt_ignore-aware query: once the query text itself
       # references dolt_ignore (i.e. the fix is present), the ignored table
@@ -820,7 +841,7 @@ case "$query" in
     if [ "$mode" = "same_row_count_writer" ]; then
       set_hash hash-after-writer
     fi
-    if [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "same_count_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "writer_race_db_hash_during_verify" ]; then
+    if [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "same_count_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "ignored_table_db_hash_drift" ]; then
       set_hash hash-after-writer
     fi
     exit 0
@@ -2483,6 +2504,47 @@ func TestCompactScriptPreservesNoGainReasonForDatabaseHashDrift(t *testing.T) {
 	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
 	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten value hash changed without row-count increase" {
 		t.Fatalf("quarantine reason should identify DB hash drift without row-count gain, got %q", reason)
+	}
+}
+
+// ga-qu0hi: a dolt_ignore'd table (wisp_events) can drift DOLT_HASHOF_DB()
+// even though ga-wfzmk's fix already excludes it from the per-table loop —
+// db_value_hash() has no table-scoping argument, so it sees ignored tables
+// user_tables()/verify_counts never do. Same benign class as
+// TestCompactScriptExcludesDoltIgnoredTablesFromIntegrityVerification, but
+// reached via the aggregate-hash code path that fix never touched. Contrast
+// with TestCompactScriptPreservesNoGainReasonForDatabaseHashDrift immediately
+// above: same "no row-count gain, no writer race" shape, but that scenario's
+// drift is unexplained by anything and must still quarantine — this one's
+// drift is fully attributable to the known ignored table and must defer.
+func TestCompactScriptDefersIgnoredTableAttributedDatabaseHashDrift(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "ignored_table_db_hash_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("ignored-table-attributed database hash drift must exit 0 (defer, not failure): %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "aggregate value hash drift fully attributed to ignored-table churn") ||
+		!strings.Contains(out, "not corruption; deferring, will retry next run") {
+		t.Fatalf("output missing the ignored-table-attributed defer message:\n%s", out)
+	}
+	data, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	log := string(data)
+	if !strings.Contains(log, "DOLT_HASHOF_TABLE('wisp_events')") {
+		t.Fatalf("fix should probe the ignored table's own hash to attribute the drift:\n%s", log)
+	}
+	if strings.Contains(log, "DOLT_GC") {
+		t.Fatalf("ignored-table-attributed drift must skip GC this run, same as any other defer:\n%s", log)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("ignored-table-attributed defer must NOT write a quarantine marker; stat=%v", statErr)
+	}
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if reason := compactMarkerValue(t, pendingGC, "reason"); reason != "ignored-table churn during flatten deferred full GC" {
+		t.Fatalf("ignored-table-attributed defer should record its own pending-GC retry reason, got %q", reason)
 	}
 }
 

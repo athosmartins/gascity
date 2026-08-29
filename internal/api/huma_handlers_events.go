@@ -52,12 +52,24 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 
 	index := s.latestIndex()
 
-	// Fast path: no cursor → most clients just want the N newest events.
-	// Use ListTail when the provider supports it so we don't parse the
-	// entire events.jsonl (which is O(file size), ~4s on 100 MB) just to
-	// throw away all but the tail. Same pattern as the supervisor
-	// handler's optimizedTail branch.
-	if input.Cursor == "" {
+	// Fast path: no cursor and no Since bound → most such clients just
+	// want the N newest (matching) events, e.g. `gc events`, `gc events
+	// --seq`, or `gc events --type=X --limit=N`. Use ListTail when the
+	// provider supports it so we don't parse the entire events.jsonl
+	// (which is O(file size), ~4s on 100 MB) just to throw away all but
+	// the tail. Same pattern as the supervisor handler's optimizedTail
+	// branch.
+	//
+	// Since must gate this separately from Type/Actor: ListTail returns
+	// the trailing N *matching* events with no notion of "there were
+	// more before the window I was asked to cover", and this branch
+	// never sets NextCursor — so a `--since` request wider than N events
+	// was silently truncated to its most recent slice, with no
+	// truncation signal and no way to page further back (ga-jl8rz). A
+	// bare Type/Actor filter has no such window to violate: "the last N
+	// session events" is exactly what ListTail promises, so that case
+	// keeps the fast path (see TestEventListLimitWithTypeFilterReturnsTail).
+	if input.Cursor == "" && filter.Since.IsZero() {
 		if tp, ok := ep.(events.TailProvider); ok {
 			evts, err := tp.ListTail(filter, limit)
 			if err != nil {
@@ -65,7 +77,7 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 			}
 			wires := toWireEvents(evts)
 			// Total is best-effort here: when the caller narrowed with
-			// Type/Actor/Since we cannot cheaply compute the full match
+			// Type/Actor we cannot cheaply compute the full match
 			// count, so report the returned slice length. When the
 			// filter is empty, LatestSeq is authoritative since the log
 			// is append-only and gap-free.
@@ -82,15 +94,18 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 		}
 	}
 
-	// Cursor pagination (or provider without TailProvider): we still
-	// need the full materialized list to honor offset-based cursors.
-	// Cap the scan at (offset+limit) matching events so this path is
-	// bounded by caller pagination depth rather than file size.
-	scanLimit := limit
-	if input.Cursor != "" {
-		scanLimit = decodeCursor(input.Cursor) + limit
-	}
-	filter.Limit = scanLimit
+	// Cursor pagination — provider without TailProvider, or a Since
+	// bound took this out of the fast path above. Materialize matches
+	// up to one past this page so paginate() can tell "exactly `limit`
+	// matches" apart from "more than `limit`, walked off the end of
+	// this scan": ep.List stops as soon as filter.Limit matches are
+	// found, so without the +1 probe, a full page always looks
+	// indistinguishable from the last page and NextCursor never fires
+	// (ga-jl8rz). This runs for the FIRST page too (offset 0), not just
+	// once the caller already holds a cursor — otherwise pagination
+	// could never start from a bare `--since` query.
+	offset := decodeCursor(input.Cursor)
+	filter.Limit = offset + limit + 1
 
 	evts, err := ep.List(filter)
 	if err != nil {
@@ -98,30 +113,14 @@ func (s *Server) humaHandleEventList(ctx context.Context, input *EventListInput)
 	}
 	wires := toWireEvents(evts)
 
-	if input.Cursor != "" {
-		pp := pageParams{
-			Offset: decodeCursor(input.Cursor),
-			Limit:  limit,
-		}
-		page, total, nextCursor := paginate(wires, pp)
-		if page == nil {
-			page = []WireEvent{}
-		}
-		return &ListOutput[WireEvent]{
-			Index: index,
-			Body:  ListBody[WireEvent]{Items: page, Total: total, NextCursor: nextCursor},
-		}, nil
-	}
-
-	// Capture the full match count BEFORE truncating so clients can tell
-	// how many items match vs. fit the page.
-	total := len(wires)
-	if limit < len(wires) {
-		wires = wires[:limit]
+	pp := pageParams{Offset: offset, Limit: limit}
+	page, total, nextCursor := paginate(wires, pp)
+	if page == nil {
+		page = []WireEvent{}
 	}
 	return &ListOutput[WireEvent]{
 		Index: index,
-		Body:  ListBody[WireEvent]{Items: wires, Total: total},
+		Body:  ListBody[WireEvent]{Items: page, Total: total, NextCursor: nextCursor},
 	}, nil
 }
 

@@ -235,6 +235,52 @@ func TestConfiguredRigNameMatchesSymlinkAliasPath(t *testing.T) {
 	}
 }
 
+func TestConfiguredRigNameFallsBackToWorkDirWhenDirLess(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "whatsapp_automation")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Pool-template agents (wa-worker, ps-worker) are defined via
+	// agents/<name>/agent.toml with no `dir` field at all -- WorkDir is the
+	// only field carrying a real filesystem location, and it commonly
+	// points at a subdirectory of the rig (crew/worker), not the rig root
+	// itself.
+	got := ConfiguredRigName(cityPath, config.Agent{
+		Name:    "wa-worker",
+		WorkDir: filepath.Join(rigPath, "crew", "worker"),
+	}, []config.Rig{{Name: "whatsapp_automation", Path: rigPath}})
+	if got != "whatsapp_automation" {
+		t.Fatalf("ConfiguredRigName() = %q, want %q", got, "whatsapp_automation")
+	}
+}
+
+func TestConfiguredRigNameWorkDirFallbackPicksMostSpecificRig(t *testing.T) {
+	cityPath := t.TempDir()
+	outerPath := filepath.Join(cityPath, "outer")
+	innerPath := filepath.Join(outerPath, "inner")
+	if err := os.MkdirAll(innerPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := ConfiguredRigName(cityPath, config.Agent{
+		Name:    "worker",
+		WorkDir: filepath.Join(innerPath, "crew", "worker"),
+	}, []config.Rig{
+		{Name: "outer", Path: outerPath},
+		{Name: "inner", Path: innerPath},
+	})
+	if got != "inner" {
+		t.Fatalf("ConfiguredRigName() = %q, want %q (most specific containing rig)", got, "inner")
+	}
+}
+
+func TestConfiguredRigNameDirLessNoWorkDirStillEmpty(t *testing.T) {
+	got := ConfiguredRigName(t.TempDir(), config.Agent{Name: "city-scoped"}, []config.Rig{{Name: "demo", Path: "/anywhere"}})
+	if got != "" {
+		t.Fatalf("ConfiguredRigName() = %q, want empty for an agent with neither Dir nor WorkDir", got)
+	}
+}
+
 func TestSamePathUsesSharedPathNormalization(t *testing.T) {
 	a := "/private/tmp/gc-home"
 	b := "/tmp/gc-home"

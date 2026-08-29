@@ -617,6 +617,123 @@ func TestDeliverSessionNudgeWithWorkerManagedNonRunningQueuesWakeForController(t
 	}
 }
 
+// TestDeliverSessionNudgeWithWorkerManagedNonRunningRefusesSuspendedAgent
+// covers ga-7sy6j: a suspended agent (config.Agent.Suspended, set via
+// [[patches.agent]] suspended = true) has no reconciler-spawned session
+// that will ever drain the queue, so the managed-wake path must refuse
+// instead of queuing forever — mirrors the sibling
+// ...QueuesWakeForController test above but with target.agent.Suspended
+// = true, asserting the opposite outcome at every observation point.
+func TestDeliverSessionNudgeWithWorkerManagedNonRunningRefusesSuspendedAgent(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+
+	info, err := mgr.Create(context.Background(), "worker", "Worker", "claude", dir, "claude", nil, session.ProviderResume{}, runtime.Config{})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Suspend(info.ID); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+
+	prevManaged := nudgeCityUsesManagedReconciler
+	prevPoke := nudgePokeController
+	pokes := 0
+	nudgeCityUsesManagedReconciler = func(cityPath string) bool { return cityPath == dir }
+	nudgePokeController = func(cityPath string) error {
+		pokes++
+		return nil
+	}
+	t.Cleanup(func() {
+		nudgeCityUsesManagedReconciler = prevManaged
+		nudgePokeController = prevPoke
+	})
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		cfg:         &config.City{Agents: []config.Agent{{Name: "worker", Provider: "claude", Suspended: true}}},
+		sessionID:   info.ID,
+		sessionName: info.SessionName,
+		identity:    "worker",
+		agent:       config.Agent{Name: "worker", Provider: "claude", Suspended: true},
+	}
+	beforeCalls := len(fake.Calls)
+
+	var stdout, stderr bytes.Buffer
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 1 (refused); stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "suspended") {
+		t.Fatalf("stderr = %q, want mention of suspended target", stderr.String())
+	}
+	if pokes != 0 {
+		t.Fatalf("pokes = %d, want 0 — must not wake a suspended agent", pokes)
+	}
+
+	updated, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := updated.Metadata["wake_request"]; got != "" {
+		t.Fatalf("wake_request = %q, want empty — refused before requesting a wake", got)
+	}
+
+	pending, inFlight, dead, err := listQueuedNudgesForTarget(dir, target, time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudgesForTarget: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 0/0/0 — refusal must not queue", len(pending), len(inFlight), len(dead))
+	}
+
+	for _, call := range fake.Calls[beforeCalls:] {
+		switch call.Method {
+		case "Start", "Nudge", "NudgeNow":
+			t.Fatalf("refused suspended nudge must not start or deliver; saw call %+v", call)
+		}
+	}
+}
+
+// TestDeliverSessionNudgeWithWorkerQueueModeRefusesSuspendedAgent covers
+// ga-7sy6j's second call site: the plain (non-managed) --delivery=queue
+// path through queueSessionNudgeWithWorker, which called enqueueQueuedNudge
+// directly with zero Suspended check before this fix.
+func TestDeliverSessionNudgeWithWorkerQueueModeRefusesSuspendedAgent(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "worker", Suspended: true},
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionID:   "gc-worker",
+		sessionName: "worker-session",
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryQueue, false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 1 (refused); stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "suspended") {
+		t.Fatalf("stderr = %q, want mention of suspended target", stderr.String())
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, target.agentKey(), time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 0/0/0 — refusal must not queue", len(pending), len(inFlight), len(dead))
+	}
+}
+
 func TestDeliverSessionNudgeWithWorkerManagedQueueFailureDoesNotWake(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()
@@ -2174,6 +2291,58 @@ func TestSendMailNotifyWithWorkerQueuesWhenRuntimeIsGone(t *testing.T) {
 	}
 }
 
+// TestSendMailNotifyWithWorkerRefusesSuspendedAgent covers ga-7sy6j's third
+// call site: sendMailNotifyWithWorker's fallback queue path. Mirrors
+// ...QueuesWhenRuntimeIsGone above (dead runtime, must fall back to
+// queuing) but with target.agent.Suspended = true, asserting the mail
+// notify refuses (returning errNudgeTargetSuspended) instead of queuing a
+// nudge nothing will ever drain.
+func TestSendMailNotifyWithWorkerRefusesSuspendedAgent(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+	mgr := newSessionManagerWithConfig(dir, store, fake, nil)
+
+	info, err := mgr.Create(context.Background(), "mayor", "Mayor", "claude", dir, "claude", nil, session.ProviderResume{}, runtime.Config{WorkDir: dir})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := fake.Stop(info.SessionName); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	target := nudgeTarget{
+		cityPath:    dir,
+		agent:       config.Agent{Name: "mayor", Suspended: true},
+		sessionID:   info.ID,
+		resolved:    &config.ResolvedProvider{Name: "claude"},
+		sessionName: info.SessionName,
+	}
+
+	startCalls := len(fake.Calls)
+	err = sendMailNotifyWithWorker(target, store, fake, "human")
+	if !errors.Is(err, errNudgeTargetSuspended) {
+		t.Fatalf("sendMailNotifyWithWorker error = %v, want errNudgeTargetSuspended", err)
+	}
+	for _, call := range fake.Calls[startCalls:] {
+		if call.Method == "Start" || call.Method == "WaitForIdle" || call.Method == "Nudge" || call.Method == "NudgeNow" {
+			t.Fatalf("calls = %#v, want no delivery attempt for a suspended agent", fake.Calls[startCalls:])
+		}
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, target.agentKey(), time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending/inFlight/dead = %d/%d/%d, want 0/0/0 — refusal must not queue", len(pending), len(inFlight), len(dead))
+	}
+}
+
 func TestSendMailNotifyWithWorkerQueuesWhenDirectProviderMisses(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
@@ -2760,6 +2929,59 @@ func TestDeliverSlingNudgeQueuesFencedReminderAndStartsPollerForAsleepSession(t 
 	}
 	if pollerCityPath != dir || pollerAgent != target.sessionID || pollerSession != target.sessionName {
 		t.Fatalf("startNudgePoller = (%q, %q, %q), want (%q, %q, %q)", pollerCityPath, pollerAgent, pollerSession, dir, target.sessionID, target.sessionName)
+	}
+}
+
+// TestDeliverSlingNudgeRefusesSuspendedAgent covers ga-7sy6j's fourth call
+// site: gc sling's work-assignment nudge, which shares the exact same
+// enqueueQueuedNudgeWithStore funnel as the session-nudge paths above and
+// had the identical gap (not cited in the original bead body, which only
+// grepped cmd_nudge.go/nudge_dispatcher.go/nudge_beads.go/nudgequeue, but
+// deliverSlingNudge lives in cmd_sling.go and shares the same nudgeTarget
+// shape). Mirrors ...QueuesFencedReminderAndStartsPollerForAsleepSession
+// above but with target.agent.Suspended = true.
+func TestDeliverSlingNudgeRefusesSuspendedAgent(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	store := openNudgeBeadStore(dir)
+	fake := runtime.NewFake()
+
+	target := nudgeTarget{
+		cityPath:          dir,
+		agent:             config.Agent{Name: "worker", Suspended: true},
+		resolved:          &config.ResolvedProvider{Name: "claude"},
+		sessionID:         "gc-worker",
+		continuationEpoch: "7",
+		sessionName:       "worker-session",
+	}
+
+	pollerCalled := false
+	prev := startNudgePoller
+	startNudgePoller = func(cityPath, agentName, sessionName string) error {
+		pollerCalled = true
+		return nil
+	}
+	t.Cleanup(func() { startNudgePoller = prev })
+
+	var stdout, stderr bytes.Buffer
+	deliverSlingNudge(target, fake, store, dir, &stdout, &stderr)
+
+	if !strings.Contains(stderr.String(), "suspended") {
+		t.Fatalf("stderr = %q, want mention of suspended target", stderr.String())
+	}
+	if pollerCalled {
+		t.Fatal("startNudgePoller called, want no poller for a refused suspended target")
+	}
+
+	pending, inFlight, dead, err := listQueuedNudges(dir, target.agent.QualifiedName(), time.Now())
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	if len(pending) != 0 || len(inFlight) != 0 || len(dead) != 0 {
+		t.Fatalf("pending=%d inFlight=%d dead=%d, want 0/0/0 — refusal must not queue", len(pending), len(inFlight), len(dead))
 	}
 }
 

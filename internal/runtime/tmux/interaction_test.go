@@ -151,6 +151,34 @@ func TestParseApprovalPrompt_MultipleToolHeaders_BindsToNearest(t *testing.T) {
 	}
 }
 
+func TestParseApprovalPrompt_PermissionRuleAskConfirmation(t *testing.T) {
+	// An explicit per-rule "ask" permission override (e.g. Bash(rm -rf:*) in
+	// settings.json) produces a DIFFERENT prompt shape than the default
+	// approval flow: "Permission rule ... requires confirmation for this
+	// command" instead of "This command requires approval" / "Approve
+	// edits?". Confirmed wording per code.claude.com/docs/en/permissions
+	// (CLI v2.1.220: "bypassPermissions ... Skips permission prompts,
+	// except those forced by explicit `ask` rules") and observed live in
+	// ga-q640n, where this exact prompt shape froze a pool worker for 7h
+	// because nothing recognized it as a pending interaction.
+	pane := `● Bash(rm -rf /tmp/scratch/__pycache__)
+
+ Permission rule Bash(rm -rf:*) requires confirmation for this command.
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again
+   3. No`
+
+	a := parseApprovalPrompt(pane)
+	if a == nil {
+		t.Fatal("expected approval prompt for ask-rule confirmation, got nil")
+	}
+	if a.ToolName != "Bash" {
+		t.Errorf("expected ToolName=Bash, got %q", a.ToolName)
+	}
+}
+
 func TestApprovalDedup(t *testing.T) {
 	d := &approvalDedup{lastHash: make(map[string]string)}
 

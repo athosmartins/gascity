@@ -1527,6 +1527,9 @@ const (
 	// EventLeaseReclaimed records that a stale lease was reverted to ready by
 	// bd reclaim (dead-worker recovery). old_value is the previous owner.
 	EventLeaseReclaimed EventType = "lease_reclaimed"
+	// EventDeleted records that a row was permanently removed (id + when
+	// survive in the events table even though the row itself does not).
+	EventDeleted EventType = "deleted"
 )
 
 // BlockedIssue extends Issue with blocking information

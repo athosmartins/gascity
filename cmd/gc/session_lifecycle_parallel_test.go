@@ -2712,6 +2712,91 @@ func TestRunningSessionMatchesPendingCreateAcceptsIDOnlyRuntime(t *testing.T) {
 	}
 }
 
+// flakyGetMetaProvider wraps a runtime.Provider and fails the first
+// failCount calls to GetMeta with a generic (non-sentinel) error before
+// delegating to the wrapped provider -- simulating the ga-s9sk5 transient
+// tmux read glitch (a momentarily wedged tmux server, ga-h9z class) against
+// an otherwise-healthy, correctly-identified live session.
+type flakyGetMetaProvider struct {
+	runtime.Provider
+	failCount int
+}
+
+func (f *flakyGetMetaProvider) GetMeta(name, key string) (string, error) {
+	if f.failCount > 0 {
+		f.failCount--
+		return "", errors.New("simulated transient tmux read failure")
+	}
+	return f.Provider.GetMeta(name, key)
+}
+
+// TestRunningSessionMatchesPendingCreateRetriesTransientBlankRead is the
+// ga-s9sk5 regression test: a session that IS this bead's own live runtime
+// must not be declared "belongs to another session" just because its
+// FIRST identity read comes back completely blank (both GC_SESSION_ID and
+// GC_INSTANCE_TOKEN failing to read -- the "total signal vacuum" case, see
+// runningSessionMatchesPendingCreate's doc comment). Without the retry,
+// this test fails: the one and only attempt sees liveID=="" and
+// liveToken=="" throughout and returns false -- exactly what it would
+// return for a genuinely foreign runtime -- even though the runtime's real
+// identity vars, set underneath, DO match this bead.
+func TestRunningSessionMatchesPendingCreateRetriesTransientBlankRead(t *testing.T) {
+	session := &beads.Bead{
+		ID: "gc-worker",
+		Metadata: map[string]string{
+			"session_name":   "worker",
+			"generation":     "2",
+			"instance_token": "tok-worker",
+		},
+	}
+	base := runtime.NewFake()
+	if err := base.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.SetMeta("worker", "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.SetMeta("worker", "GC_INSTANCE_TOKEN", "tok-worker"); err != nil {
+		t.Fatal(err)
+	}
+	// Fail exactly the two GetMeta calls the first attempt makes
+	// (GC_SESSION_ID, then GC_INSTANCE_TOKEN) so attempt 1 reads a total
+	// blank; the retry's calls fall through to the real, matching data
+	// set on the base fake above.
+	sp := &flakyGetMetaProvider{Provider: base, failCount: 2}
+
+	if !runningSessionMatchesPendingCreate(session, "worker", sp) {
+		t.Fatal("a session whose identity read transiently failed once must still match its own live runtime on retry, not be treated as belonging to another session")
+	}
+}
+
+// TestRunningSessionMatchesPendingCreateRejectsPersistentBlankRead proves
+// the retry added for ga-s9sk5 is bounded: a read that stays blank across
+// BOTH attempts (indistinguishable, from this function alone, from a
+// runtime that genuinely never had gc's identity vars set) still resolves
+// to "no match." The pending-create-rollback mechanism this function gates
+// must keep working for a real mismatch/foreign-runtime case -- the retry
+// must not silently disable it.
+func TestRunningSessionMatchesPendingCreateRejectsPersistentBlankRead(t *testing.T) {
+	session := &beads.Bead{
+		ID: "gc-worker",
+		Metadata: map[string]string{
+			"session_name":   "worker",
+			"generation":     "2",
+			"instance_token": "tok-worker",
+		},
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "worker", runtime.Config{}); err != nil {
+		t.Fatal(err)
+	}
+	// Never set GC_SESSION_ID/GC_INSTANCE_TOKEN: both the first attempt
+	// and the retry read a genuine, persistent blank.
+	if runningSessionMatchesPendingCreate(session, "worker", sp) {
+		t.Fatal("a runtime with no readable identity on either attempt must still resolve to no-match, or pool-slot-reuse mismatches would never be detected")
+	}
+}
+
 func TestReconcileSessionBeads_SkipsPendingCreateStartAlreadyInFlight(t *testing.T) {
 	store := beads.NewMemStore()
 	clk := &clock.Fake{Time: time.Date(2026, 4, 26, 12, 0, 30, 0, time.UTC)}

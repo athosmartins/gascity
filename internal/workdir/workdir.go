@@ -43,23 +43,52 @@ func ResolveDirPath(cityPath, dir string) string {
 }
 
 // ConfiguredRigName returns the rig associated with an agent, preferring the
-// legacy dir-as-rig convention and falling back to path matching.
+// legacy dir-as-rig convention and falling back to path matching. Dir-less
+// agents (Dir == "" — pool-template agents defined via agents/<name>/agent.toml,
+// e.g. wa-worker, ps-worker, commonly have no dir field at all) fall back to
+// matching WorkDir against each configured rig's root, since WorkDir is the
+// only field carrying a real filesystem location for such agents. Without
+// this fallback, a dir-less rig-scoped agent looks identical to a city-scoped
+// one to every caller keyed off ConfiguredRigName (e.g. the cross-store route
+// guard in internal/sling), which misclassifies it as reaching only the city
+// store and refuses legitimate rig-scoped routes.
 func ConfiguredRigName(cityPath string, a config.Agent, rigs []config.Rig) string {
-	if a.Dir == "" {
+	if a.Dir != "" {
+		for _, rig := range rigs {
+			if a.Dir == rig.Name {
+				return rig.Name
+			}
+		}
+		abs := ResolveDirPath(cityPath, a.Dir)
+		for _, rig := range rigs {
+			if samePath(abs, rig.Path) {
+				return rig.Name
+			}
+		}
 		return ""
 	}
+	if a.WorkDir == "" {
+		return ""
+	}
+	// WorkDir commonly points at a subdirectory of the rig (e.g.
+	// ".../whatsapp_automation/crew/worker"), not the rig root itself, so
+	// this is a within-tree check, not an exact match — and the most
+	// specific (deepest) containing rig wins if more than one rig's root
+	// contains it (nested rig roots are possible in principle even if not
+	// observed in any city today).
+	abs := ResolveDirPath(cityPath, a.WorkDir)
+	best := ""
+	bestLen := -1
 	for _, rig := range rigs {
-		if a.Dir == rig.Name {
-			return rig.Name
+		if !pathutil.PathWithin(rig.Path, abs) {
+			continue
+		}
+		if l := len(rig.Path); l > bestLen {
+			best = rig.Name
+			bestLen = l
 		}
 	}
-	abs := ResolveDirPath(cityPath, a.Dir)
-	for _, rig := range rigs {
-		if samePath(abs, rig.Path) {
-			return rig.Name
-		}
-	}
-	return ""
+	return best
 }
 
 // RigRootForName returns the configured root path for rigName.

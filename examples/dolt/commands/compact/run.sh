@@ -625,6 +625,30 @@ user_tables() {
   rm -f "$out_tmp" "$err_tmp"
 }
 
+# ignored_tables — the exact complement user_tables() excludes: dolt_ignore'd
+# user tables (dolt_ prefixed system tables aside, excluded from both). Exists
+# because db_value_hash() below has no table-scoping argument (DOLT_HASHOF_DB
+# takes only an optional branch/ref spec — verified live: passing a table name
+# errors "invalid ref spec"), so unlike the per-table loop it cannot itself
+# skip these tables. Callers use this to prove a whole-database hash drift is
+# fully attributable to the same known-benign volatility user_tables() already
+# excludes, instead of quarantining on it blind (ga-qu0hi).
+ignored_tables() {
+  db="$1"
+  out_tmp=$(mktemp)
+  err_tmp=$(mktemp)
+  if ! dolt_query "$db" \
+    "SELECT table_name FROM information_schema.tables WHERE table_schema = '$db' AND table_type = 'BASE TABLE' AND table_name NOT LIKE 'dolt\\_%' ESCAPE '\\\\' AND EXISTS (SELECT 1 FROM dolt_ignore WHERE ignored = 1 AND table_name LIKE pattern) ORDER BY table_name" \
+    > "$out_tmp" 2>"$err_tmp"; then
+    printf 'compact: db=%s ignored table list probe failed\n' "$db" >&2
+    emit_error_file "$db" "$err_tmp"
+    rm -f "$out_tmp" "$err_tmp"
+    return 1
+  fi
+  awk 'NR>=4 && /^\|/ {gsub(/^\| | \|$/, ""); gsub(/ /, ""); if ($0 != "") print}' "$out_tmp"
+  rm -f "$out_tmp" "$err_tmp"
+}
+
 # row_count — COUNT(*) for one table. Returns "" on error.
 row_count() {
   db="$1"
@@ -644,6 +668,47 @@ db_value_hash() {
   db="$1"
   query_single_cell "$db" "database value hash probe failed" \
     "SELECT DOLT_HASHOF_DB()"
+}
+
+# ignored_tables_fingerprint — row-count+value-hash for every dolt_ignore'd
+# table, concatenated in ignored_tables()'s sorted order. Comparable only
+# against another fingerprint from this same function (opaque token — same
+# contract as DirtyGraphFingerprint in beads' issueops package). Two captures
+# comparing equal proves no ignored table changed in between; comparing
+# unequal proves at least one did. This is the two-way split db_value_hash()
+# itself cannot make, since DOLT_HASHOF_DB() cannot be scoped away from these
+# tables the way user_tables() scopes the per-table loop. Returns "" (not an
+# error) when the database has no ignored tables, so pre/post naturally
+# compare equal in that case — this function is a no-op for any database
+# without dolt_ignore'd tables. Returns 1 only on a genuine probe failure.
+ignored_tables_fingerprint() {
+  db="$1"
+  tables_tmp=$(mktemp)
+  if ! ignored_tables "$db" > "$tables_tmp"; then
+    rm -f "$tables_tmp"
+    return 1
+  fi
+  fp=""
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    if ! valid_table_name "$t"; then
+      printf 'compact: db=%s invalid ignored table name from information_schema table=%s — fail\n' \
+        "$db" "$t" >&2
+      rm -f "$tables_tmp"
+      return 1
+    fi
+    if ! cnt=$(row_count "$db" "$t"); then
+      rm -f "$tables_tmp"
+      return 1
+    fi
+    if ! ignored_hash=$(table_value_hash "$db" "$t"); then
+      rm -f "$tables_tmp"
+      return 1
+    fi
+    fp="$fp $t:$cnt:$ignored_hash"
+  done < "$tables_tmp"
+  rm -f "$tables_tmp"
+  printf '%s' "$fp"
 }
 
 remote_count() {
@@ -1481,6 +1546,49 @@ defer_writer_race_after_flatten() {
   return 0
 }
 
+preserve_head_after_ignored_table_drift_defer() {
+  db="$1"
+  flatten_head="$2"
+  current_head=$(head_commit "$db" || true)
+  if [ -z "$current_head" ]; then
+    current_head="$flatten_head"
+  fi
+  printf 'compact: db=%s leaving post-flatten HEAD=%s in place after ignored-table drift; pending-GC marker will retry full GC next run\n' \
+    "$db" "${current_head:-<empty>}" >&2
+  return 0
+}
+
+# defer_ignored_table_drift_after_flatten — the aggregate-hash sibling of
+# defer_writer_race_after_flatten. Reuses the same pending-GC marker
+# mechanism (full GC retried next run instead of a blocking quarantine) but
+# with its own reason string: this path fires with zero HEAD movement, so
+# labeling it "writer race" in the marker would be false — the marker is
+# where a future operator looks for why GC was deferred, and it must say
+# what was actually proven, not borrow another path's wording (ga-qu0hi).
+defer_ignored_table_drift_after_flatten() {
+  db="$1"
+  flatten_head="$2"
+  defer_remote="$3"
+  defer_expected_remote_head="$4"
+  defer_expected_remote_head_verified="$5"
+  defer_compacted_from_head="$6"
+  defer_local_branch="$7"
+  defer_remote_branch="$8"
+  if ! write_pending_gc_marker "$db" "ignored-table churn during flatten deferred full GC" \
+    "$defer_remote" "$defer_expected_remote_head" "$defer_expected_remote_head_verified" \
+    "$defer_compacted_from_head" "$defer_local_branch" "$defer_remote_branch"; then
+    current_head=$(head_commit "$db" || true)
+    if [ -z "$current_head" ]; then
+      current_head="$flatten_head"
+    fi
+    printf 'compact: db=%s leaving post-flatten HEAD=%s in place after ignored-table drift; pending-GC marker write failed, manual repair required before compaction or GC\n' \
+      "$db" "${current_head:-<empty>}" >&2
+    return 1
+  fi
+  preserve_head_after_ignored_table_drift_defer "$db" "$flatten_head" || true
+  return 0
+}
+
 flatten_database() {
   db="$1"
   verify_counts_saw_gain=0
@@ -1846,6 +1954,11 @@ flatten_database() {
     return 1
   fi
 
+  if ! preflight_ignored_fp=$(ignored_tables_fingerprint "$db"); then
+    rm -f "$preflight_tmp"
+    return 1
+  fi
+
   table_count=$(wc -l < "$preflight_tmp")
   printf 'compact: db=%s commits=%s root=%s tables=%s — flattening...\n' \
     "$db" "$count" "$root" "$table_count"
@@ -2034,6 +2147,21 @@ flatten_database() {
   if [ "$db_hash_writer_race_detected" = "1" ]; then
     writer_race_detected=1
   fi
+  # Captured after the HEAD-bracket above (not inside it) so the extra
+  # ignored-table queries below never widen the writer-race detection window
+  # around the db_value_hash probe itself.
+  if ! postflight_ignored_fp=$(ignored_tables_fingerprint "$db"); then
+    printf 'compact: db=%s post-flatten ignored-table fingerprint probe failed — quarantine and investigate before GC\n' \
+      "$db" >&2
+    write_compact_marker "$quarantine_dir" "$db" "post-flatten ignored-table fingerprint probe failed" || {
+      preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+      rm -f "$preflight_tmp"
+      return 1
+    }
+    preserve_head_after_integrity_failure "$db" "$flatten_head" || true
+    rm -f "$preflight_tmp"
+    return 1
+  fi
   if [ "$postflight_hash" != "$preflight_hash" ]; then
     if [ "$db_hash_writer_race_detected" = "1" ]; then
       # The DB hash probe runs after table-level verification has already
@@ -2090,6 +2218,30 @@ flatten_database() {
       rm -f "$preflight_tmp"
       return 1
     else
+      if [ "$postflight_ignored_fp" != "$preflight_ignored_fp" ]; then
+        # verify_counts already passed clean (row counts and per-table value
+        # hashes matched for every user_tables()-scoped table, no gain seen
+        # either) and db_hash_writer_race_detected is 0, so HEAD never moved
+        # around either db_value_hash probe. The only tables DOLT_HASHOF_DB
+        # can see that user_tables()/verify_counts cannot are exactly this
+        # db's ignored tables (db_value_hash has no table-scoping argument to
+        # exclude them the way user_tables() does — see its definition). A
+        # changed ignored-table fingerprint fully attributes the aggregate
+        # drift to that same already-known-benign class (ga-wfzmk):
+        # DOLT_ADD is a no-op on an ignored table, so its content can churn
+        # without ever advancing HEAD — exactly why no writer-race signal
+        # fired here. Defer instead of quarantining (ga-qu0hi).
+        printf 'compact: db=%s aggregate value hash drift fully attributed to ignored-table churn (ignored-table fingerprint before=%s after=%s) — same benign class as ga-wfzmk, not corruption; deferring, will retry next run\n' \
+          "$db" "${preflight_ignored_fp:-<empty>}" "${postflight_ignored_fp:-<empty>}" >&2
+        if ! defer_ignored_table_drift_after_flatten "$db" "$flatten_head" \
+          "$remote" "$expected_remote_head" "$expected_remote_head_verified" \
+          "$compacted_from_head" "$local_branch" "$remote_branch"; then
+          rm -f "$preflight_tmp"
+          return 1
+        fi
+        rm -f "$preflight_tmp"
+        return 0
+      fi
       printf 'compact: db=%s value hash changed without row-count increase before=%s after=%s — quarantine and investigate before GC\n' \
         "$db" "$preflight_hash" "$postflight_hash" >&2
       write_compact_marker "$quarantine_dir" "$db" "post-flatten value hash changed without row-count increase" || {

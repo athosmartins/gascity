@@ -1905,15 +1905,70 @@ func shouldRollbackPendingCreate(session *beads.Bead) bool {
 	return strings.TrimSpace(session.Metadata["pending_create_claim"]) == "true"
 }
 
+// identityReadRetryDelay bounds the single retry in
+// runningSessionMatchesPendingCreate. Short enough to stay well inside a
+// reconciler tick's budget even if several pending-create sessions hit the
+// retry in the same tick; long enough to ride out a momentary tmux command
+// hiccup of the kind probeServerAlive's doc comment (ga-h9z) already
+// documents as a real, observed failure mode ("wedged tmux server").
+const identityReadRetryDelay = 150 * time.Millisecond
+
+// runningSessionMatchesPendingCreate reports whether the live runtime named
+// sessionName currently belongs to session, by comparing GC_SESSION_ID /
+// GC_INSTANCE_TOKEN (and, on a token mismatch, GC_RUNTIME_EPOCH) read from
+// the runtime's environment against the bead's own recorded identity.
+//
+// ga-s9sk5: runtime.Provider.GetMeta's documented contract is "returns
+// ("", nil) if the key is not set" -- but the tmux implementation collapses
+// ANY read failure that isn't a session-not-found/no-server error (a
+// command timeout, an unexpected show-environment output, ...) into that
+// same ("", nil). This function additionally only ever checks GetMeta's
+// error for == nil, so even the two sentinel errors GetMeta does propagate
+// are discarded here too. The caller of this function
+// (session_reconciler.go's pending-create-rollback branch) only reaches it
+// after independently confirming the runtime IS alive; treating a blank
+// read as a confirmed "belongs to another session" verdict can therefore
+// close this session's own bead out from under its own still-running,
+// still-writing runtime (rollbackPendingCreate -> closeBead never stops
+// the runtime -- see the call chain this bug is filed against).
+//
+// A real signal -- a non-empty ID or token successfully read, matching or
+// not -- is trusted immediately, on the first attempt: this is what lets a
+// genuine pool-slot-reuse mismatch keep being detected and rolled back
+// exactly as before. Retrying is narrowly scoped to the one case that is
+// truly ambiguous: NEITHER key produced any value at all. That specific
+// "total blank" gets a single short retry before being treated as a
+// confirmed mismatch. This can only ever turn an ambiguous "false" into a
+// "true" (when the retry recovers real, matching data) or into a more
+// confidently-grounded "false" (when the retry recovers real, mismatching
+// data) -- it never turns an already-real signal into its opposite, because
+// any attempt that reads a real signal returns immediately without
+// reaching the retry at all.
 func runningSessionMatchesPendingCreate(session *beads.Bead, sessionName string, sp runtime.Provider) bool {
+	matched, blank := attemptRunningSessionMatchesPendingCreate(session, sessionName, sp)
+	if !blank {
+		return matched
+	}
+	time.Sleep(identityReadRetryDelay)
+	matched, _ = attemptRunningSessionMatchesPendingCreate(session, sessionName, sp)
+	return matched
+}
+
+// attemptRunningSessionMatchesPendingCreate is a single read-and-compare
+// pass for runningSessionMatchesPendingCreate. blank reports whether
+// NEITHER GC_SESSION_ID nor GC_INSTANCE_TOKEN produced any value on this
+// attempt -- the specific "total signal vacuum" that is indistinguishable,
+// from this read alone, between "confirmed foreign runtime" and "transient
+// read failure against our own runtime."
+func attemptRunningSessionMatchesPendingCreate(session *beads.Bead, sessionName string, sp runtime.Provider) (matched, blank bool) {
 	if session == nil || sp == nil {
-		return false
+		return false, false
 	}
 	liveID := ""
 	if value, err := sp.GetMeta(sessionName, "GC_SESSION_ID"); err == nil {
 		liveID = strings.TrimSpace(value)
 		if liveID != "" && liveID != session.ID {
-			return false
+			return false, false
 		}
 	}
 	expectedToken := strings.TrimSpace(session.Metadata["instance_token"])
@@ -1925,20 +1980,25 @@ func runningSessionMatchesPendingCreate(session *beads.Bead, sessionName string,
 			liveGeneration, _ := sp.GetMeta(sessionName, "GC_RUNTIME_EPOCH")
 			expectedGeneration := strings.TrimSpace(session.Metadata["generation"])
 			if strings.TrimSpace(liveGeneration) != "" && expectedGeneration != "" && strings.TrimSpace(liveGeneration) != expectedGeneration {
-				return false
+				return false, false
 			}
 			if liveID == "" {
-				return false
+				return false, false
 			}
 		}
 	}
 	if liveID != "" {
-		return liveID == session.ID
+		return liveID == session.ID, false
+	}
+	if liveToken == "" {
+		// Total blank: neither key produced any value. liveID == "" is
+		// already guaranteed here (the only way past the block above).
+		return false, true
 	}
 	if expectedToken == "" {
-		return false
+		return false, false
 	}
-	return expectedToken != "" && liveToken == expectedToken
+	return expectedToken != "" && liveToken == expectedToken, false
 }
 
 // recordPendingCreateRollback persists WHY a pending-create session bead is

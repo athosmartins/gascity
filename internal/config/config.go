@@ -3373,6 +3373,18 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 // reads the first ready, unassigned, routed bead for the supplied target,
 // prints it, and exits 0. The caller appends a terminal fallthrough
 // (printf "[]") for the empty case.
+//
+// ga-zgfxx / ga-avvu2 AC1: the PRIMARY tier (routedReadyTierCommand) applies
+// poolDemandLabelFilterJQ, but until this fix the two LEGACY fallback tiers
+// below it did not — a bead already refused via pool:refused:<reason> (or
+// held via pilot:held*, or EPIC-titled) that only surfaces through
+// gc.run_target migration or the ephemeral-wisp query kept coming back to
+// the same worker that had just refused it. Both legacy tiers now request an
+// UNSLICED survivor set, run it through poolDemandLabelFilterJQ, and only
+// THEN take the first row — same "filter-then-slice, not slice-then-filter"
+// shape already used for the primary tier (ga-g7yt) and the assigned
+// in-progress tiers (ga-ael6v), for the same reason: slicing before the
+// prefix filter can hide a real candidate behind a filtered-out head.
 func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
@@ -3380,10 +3392,10 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
-		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(1) + ` 2>/dev/null); ` +
+		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
-		`r=$(printf "%s" "$legacy_ephemeral_candidates" | jq '.[0:1]' 2>/dev/null); ` +
+		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`return 1; ` +
 		`}; `
@@ -3399,7 +3411,24 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// believing the pool had nothing. A dog hit exactly this and only found the
 	// real bead by re-running the query by hand with a wider limit. So: ask for a
 	// WINDOW and take the first SURVIVOR, never the first row.
-	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null; }`
+	//
+	// ga-w4k2z: taking .[0:1] straight off the created_at-sorted survivor list
+	// made a bead that keeps getting reclaimed re-occupy position 0 forever —
+	// reclaim doesn't change created_at, so the SAME poisoned head is offered to
+	// every dog that polls, while every newer bead behind it starves (measured
+	// live: 13 candidates spanning ~36h, only the head ever served). bd's --sort
+	// only knows priority/hybrid/oldest, no updated-at mode, so the re-rank
+	// happens here instead: survivors are re-sorted by updated_at (which every
+	// reclaim DOES bump — label/metadata/status writes all touch it) before
+	// taking the head. A bead nobody has touched since creation still sorts by
+	// its original created_at (unchanged behavior — updated_at == created_at for
+	// anything never reclaimed), but a bead that just cycled through a reclaim
+	// sorts to the BACK of the survivor list instead of re-claiming the front on
+	// the very next poll, so other ready work gets a turn. Deliberately not a
+	// switch to --sort newest (see bead body: that starves the old backlog
+	// instead) and not a new label/state — LRU-by-existing-timestamp is the
+	// minimal change that stops one bead from monopolizing the only slot served.
+	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3421,12 +3450,35 @@ func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 	// filter. (Both the reconciler count and the worker probe must apply the same
 	// filter or they disagree: the reconciler would count parked beads as demand
 	// and spawn a pool for work no worker is allowed to claim.)
+	//
+	// ga-zgfxx / ga-avvu2 AC1: the two LEGACY tiers (legacy_json, from the
+	// gc.run_target migration probe, and legacy_ephemeral_json, from the
+	// ephemeral-wisp query) get the same poolDemandLabelFilterJQ pass as
+	// ready_json above, each on its own line for the same $?-preservation
+	// reason. Without this the reconciler counted a pool:refused legacy/
+	// ephemeral bead as demand and kept the pool scaled up for work every
+	// worker had already refused — the count-side half of the same gap
+	// poolDemandFirstRowFunctionScript fixes on the worker-claim side.
+	// legacy_ephemeral_json's OWN capture line (below) skips `|| exit $?`
+	// because legacyEphemeralPoolDemandShell already resolves internally to
+	// `... || printf "[]"` and so always exits 0 — there is no failure left
+	// for `|| exit $?` to catch on that specific line. Its NEW filter stage
+	// is a different command (a plain jq pipe) that has no such built-in
+	// fallback, so per this function's own no-masking doc-comment above it
+	// gets `|| exit $?` like every other filter stage in this script — a
+	// bare `2>/dev/null` here would silently turn a genuine jq failure into
+	// an empty string, i.e. exactly the "masquerade as no demand" this
+	// function exists to prevent (caught live by
+	// TestEffectiveScaleCheckUsesReadyOnly, which asserts the generated
+	// script never contains "2>/dev/null").
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
+		`legacy_json=$(printf "%s" "$legacy_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
+		`legacy_ephemeral_json=$(printf "%s" "$legacy_ephemeral_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
@@ -3465,10 +3517,21 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
 		`done; `
 }
 
+// ga-ox2yw: applies poolDemandLabelFilterJQ to the assigned-ready tier — the
+// third and last instance of the same bug class ga-ael6v fixed for
+// assigned-in-progress and ga-avvu2 fixed for routed-pool. A refused bead
+// (pool:refused:<reason>) keeps its assignee after reclaim; Step 1a now
+// filters that case for the in-progress tier, but Step 1b (this function)
+// read straight from `bd ready` with no filter, so the SAME refused bead
+// re-surfaces here the moment reclaim flips status back to open. Observed
+// live 3+ times in one day on the same bead/pool-slot (ga-mww6n, dog pool
+// gastown.dog-3) before this fix. --limit=1 widened to 20 for the same
+// reason as routedReadyTierCommand/standardAssignedInProgressWorkQueryScript:
+// a filtered-out top row must not hide real ready work behind it.
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=1 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -3496,13 +3559,16 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 		`done; `
 }
 
+// ga-ox2yw: same fix as standardAssignedReadyWorkQueryScript, applied to the
+// control-dispatcher/workflow-control legacy identity fallback — mirrors how
+// ga-ael6v treated its in-progress counterpart (legacyControlAssignedInProgressWorkQueryScript).
 func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=1 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3521,13 +3587,20 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
+// ga-ox2yw: filter-then-slice, not slice-then-filter (same reasoning as
+// ephemeralAssignedInProgressProbeScript/routedReadyTierCommand). The prior
+// version baked assignee-match + slice-to-1 into a single legacyEphemeralReadyFilterJQ
+// call with no pool:refused check at all; limit widened to 0 (no pre-slice) so
+// the pool:refused/pilot:held predicate sees every assignee-matched candidate
+// before anything is dropped, then a separate jq call takes the first survivor.
 func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bool) string {
 	if includeEphemeralReady {
 		return ""
 	}
-	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1)
+	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 0)
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
-		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null | ` +
+		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 

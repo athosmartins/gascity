@@ -549,3 +549,78 @@ func TestEventListLimitWithTypeFilterReturnsTail(t *testing.T) {
 		t.Fatalf("subject = %v, want \"woke-new\" (newest matching); tail regressed", got)
 	}
 }
+
+// TestEventListSinceWindowPagesPastLimit is a regression test for ga-jl8rz:
+// `gc events --since=<wide window>` silently capped results at `limit`,
+// returning only the most recent slice of the window with no signal that
+// data was dropped and no way to page back further. Root cause was two
+// compounding bugs in this handler: (1) the ListTail fast path fired for
+// any Cursor=="" request regardless of a Since bound, even though
+// ListTail has no notion of "there were more matches before the tail
+// window" and never sets NextCursor; (2) even the slow/paginated path
+// never populated NextCursor on the first page (only the Cursor!=""
+// branch did), so pagination could never start from a bare `--since`
+// query. A client that pages by following NextCursor until it's empty
+// (as the `gc events` CLI does) must be able to walk every event in the
+// Since window, not just the newest `limit` of them.
+func TestEventListSinceWindowPagesPastLimit(t *testing.T) {
+	state := newFakeState(t)
+	ep := state.eventProv.(*events.Fake)
+	now := time.Now()
+	// Oldest-to-newest, spread an hour apart. "oldest" is exactly what a
+	// tail-of-N read silently drops first — the bug's reported symptom.
+	subjects := []string{"oldest", "second", "third", "fourth", "newest"}
+	for i, subject := range subjects {
+		ep.Record(events.Event{
+			Type:    events.SessionWoke,
+			Actor:   "gc",
+			Subject: subject,
+			Ts:      now.Add(-time.Duration(len(subjects)-i) * time.Hour),
+		})
+	}
+	h := newTestCityHandler(t, state)
+
+	// since=6h covers all 5 events (oldest is ~5h back); limit=2 forces
+	// the full result to span at least 3 pages.
+	seen := map[string]bool{}
+	cursor := ""
+	for page := 1; ; page++ {
+		if page > 10 {
+			t.Fatalf("walked more than 10 pages without an empty next_cursor — probable infinite loop; seen so far: %v", seen)
+		}
+		url := cityURL(state, "/events?since=6h&limit=2")
+		if cursor != "" {
+			url += "&cursor=" + cursor
+		}
+		req := httptest.NewRequest("GET", url, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("page %d: status = %d, want %d; body=%s", page, rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		var resp struct {
+			Items      []map[string]any `json:"items"`
+			Total      int              `json:"total"`
+			NextCursor string           `json:"next_cursor"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("page %d: decode: %v", page, err)
+		}
+		for _, item := range resp.Items {
+			if subject, ok := item["subject"].(string); ok {
+				seen[subject] = true
+			}
+		}
+		if resp.NextCursor == "" {
+			break
+		}
+		cursor = resp.NextCursor
+	}
+
+	for _, subject := range subjects {
+		if !seen[subject] {
+			t.Errorf("subject %q missing after walking all pages; seen=%v (since-window pagination dropped events instead of paging through them)", subject, seen)
+		}
+	}
+}

@@ -96,16 +96,42 @@ gc rig list
 
 **2. For each rig, collect:**
 
-a) **Issues filed and closed:**
+a) **Issues filed and closed** — bounded on both ends, [SINCE, UNTIL). A
+`--created-after` with no `--created-before`/`--closed-before` silently
+extends the window through "now", inflating counts by whatever fraction of
+today has already elapsed (ga-swvjo: measured ~40% inflation from this
+exact gap on the live town-deltas override of this formula):
 ```bash
-gc bd list --created-after=$SINCE --json --limit=0
-gc bd list --status=closed --closed-after=$SINCE --json --limit=0
+gc bd list --created-after=$SINCE --created-before=$UNTIL --json --limit=0
+gc bd list --status=closed --closed-after=$SINCE --closed-before=$UNTIL --json --limit=0
 ```
 
-b) **Merge activity:**
+b) **Commit activity** — also bounded, or today's not-yet-elapsed commits
+bleed in. Not `--merges`: gate-workflow-driven cities commonly land via
+fast-forward/squash, never a 2-parent merge commit, so a `--merges` query
+can structurally return 0 on every rig, always, regardless of real
+activity (ga-x3b4ro, confirmed live on the town-deltas override of this
+formula: a 14+64-real-commit day still measured 0 merges — a digest
+reporting "Merges: 0" then reads as "nothing shipped" when the opposite is
+true). Count plain commits instead:
 ```bash
-git -C <rig-path> log --merges --since=$SINCE --oneline main
+LOG_OUT=$(git -C <rig-path> log --since=$SINCE --until=$UNTIL --oneline main)
+# Check git log's own exit status with NO pipe in between -- piping
+# straight into `wc -l` and checking $? after reflects wc's exit status,
+# not git log's, so a failed git log and a genuinely quiet rig would both
+# read as "0" (empty pipeline output either way).
+if [ $? -ne 0 ]; then
+  COMMIT_COUNT="?"
+elif [ -z "$LOG_OUT" ]; then
+  COMMIT_COUNT=0
+else
+  COMMIT_COUNT=$(printf '%s\n' "$LOG_OUT" | wc -l | tr -d ' ')
+fi
 ```
+A failed `git log` above renders `COMMIT_COUNT="?"`, never `0` — a failed
+command and a genuinely quiet rig must never collapse into the same
+number. If a rig shows `?`, say so in Highlights instead of asserting no
+activity happened.
 
 c) **Incidents:**
 ```bash
@@ -148,9 +174,9 @@ Transform data into a formatted digest and deliver it.
 - **Net change**: +/-N
 
 ## By Rig
-| Rig | Filed | Closed | Merges |
-|-----|-------|--------|--------|
-| ... | ...   | ...    | ...    |
+| Rig | Filed | Closed | Commits |
+|-----|-------|--------|---------|
+| ... | ...   | ...    | ...     |
 
 ## Highlights
 - Notable completions
