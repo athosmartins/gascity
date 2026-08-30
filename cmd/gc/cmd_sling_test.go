@@ -963,6 +963,76 @@ func TestDoSlingImplicitTargetWarnsAtCLI(t *testing.T) {
 	assertStoreRoutedTo(t, deps.Store, "BL-1", "whatsapp_automation/claude-headless")
 }
 
+// TestDoSlingCannotReceiveWorkFailsHardAtCLI is a regression test for
+// ga-66wc/ga-a2w4h: `gc sling <target> <bead>` used to print success and
+// silently no-op when the target had no live session and its provider
+// could never spawn one unattended (e.g. a plain interactive "claude"
+// worker nobody has attached to yet) — the CLI output was indistinguishable
+// from a real success. Unlike TestDoSlingSuspendedAgentWarns/
+// TestDoSlingMultiSessionMaxZeroWarns/TestDoSlingImplicitTargetWarnsAtCLI
+// above (all warn-only, still route, exit 0), this condition must fail
+// hard: exit != 0, and the bead must not end up routed.
+func TestDoSlingCannotReceiveWorkFailsHardAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{
+			"attached": {
+				Command:                 "attached-cmd",
+				RequiresAttachedSession: boolPtr(true),
+			},
+		},
+	}
+	a := config.Agent{Name: "solo-claude", Provider: "attached", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code == 0 {
+		t.Fatalf("doSling returned 0, want non-zero (target has no live session and cannot spawn unattended)")
+	}
+	if !strings.Contains(stderr.String(), "no live session") {
+		t.Errorf("stderr = %q, want a message about no live session", stderr.String())
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("got %d runner calls, want 0 — must not attempt to route a target that cannot receive work", len(runner.calls))
+	}
+	bead, err := deps.Store.Get("BL-1")
+	if err == nil && bead.Metadata["gc.routed_to"] != "" {
+		t.Errorf("bead should not be routed on hard failure, got gc.routed_to=%q", bead.Metadata["gc.routed_to"])
+	}
+}
+
+// TestDoSlingCannotReceiveWorkAllowsHeadlessProviderAtCLI verifies a
+// provider that CAN spawn unattended (the claude-headless shape) is
+// unaffected by the new check even with no live session yet — the
+// documented ~10s async-spawn path (see ga-66wc) must keep working.
+func TestDoSlingCannotReceiveWorkAllowsHeadlessProviderAtCLI(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Providers: map[string]config.ProviderSpec{
+			"headless": {
+				Command:                 "headless-cmd",
+				RequiresAttachedSession: boolPtr(false),
+			},
+		},
+	}
+	a := config.Agent{Name: "headless-worker", Provider: "headless", MaxActiveSessions: intPtr(1)}
+
+	deps, stdout, stderr := testDeps(cfg, sp, runner.run)
+	opts := testOpts(a, "BL-1")
+	code := doSling(opts, deps, nil, stdout, stderr)
+
+	if code != 0 {
+		t.Fatalf("doSling returned %d, want 0 (headless provider can spawn unattended)", code)
+	}
+	assertStoreRoutedTo(t, deps.Store, "BL-1", "headless-worker")
+}
+
 func TestDoSlingImplicitTargetForceSuppressesWarningAtCLI(t *testing.T) {
 	runner := newFakeRunner()
 	sp := runtime.NewFake()

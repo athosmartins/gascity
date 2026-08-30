@@ -93,6 +93,13 @@ type ProviderSpec struct {
 	// SupportsHooks indicates the provider has an executable hook mechanism
 	// (settings.json, plugins, etc.) for lifecycle events.
 	SupportsHooks *bool `toml:"supports_hooks,omitempty"`
+	// RequiresAttachedSession is tri-state: nil = inherit/unknown, &true =
+	// the provider only runs inside a session a human has already attached
+	// to and cannot be spawned unattended, &false = the provider can spawn
+	// and run on its own (e.g. a headless preset). Consulted by `gc sling`
+	// to fail loudly instead of silently stranding a bead when the target
+	// has no live session and cannot spawn one itself. See ga-a2w4h.
+	RequiresAttachedSession *bool `toml:"requires_attached_session,omitempty"`
 	// InstructionsFile is the filename the provider reads for project instructions
 	// (e.g., "CLAUDE.md", "AGENTS.md"). Empty defaults to "AGENTS.md".
 	InstructionsFile string `toml:"instructions_file,omitempty"`
@@ -203,17 +210,22 @@ type ResolvedProvider struct {
 	Env                    map[string]string
 	SupportsACP            bool
 	SupportsHooks          bool
-	InstructionsFile       string
-	ResumeFlag             string
-	ResumeStyle            string
-	ResumeCommand          string
-	SessionIDFlag          string
-	PermissionModes        map[string]string
-	OptionsSchema          []ProviderOption
-	PrintArgs              []string
-	TitleModel             string
-	ACPCommand             string
-	ACPArgs                []string
+	// RequiresAttachedSession mirrors ProviderSpec's tri-state field, fully
+	// resolved (defaults to false — "can spawn unattended" — when no layer
+	// in the chain set it explicitly; see derefBool). Consulted by `gc
+	// sling` preflight; see ga-a2w4h.
+	RequiresAttachedSession bool
+	InstructionsFile        string
+	ResumeFlag              string
+	ResumeStyle             string
+	ResumeCommand           string
+	SessionIDFlag           string
+	PermissionModes         map[string]string
+	OptionsSchema           []ProviderOption
+	PrintArgs               []string
+	TitleModel              string
+	ACPCommand              string
+	ACPArgs                 []string
 	// EffectiveDefaults is the fully-merged option default map.
 	// Computed from: schema Default -> provider OptionDefaults -> agent OptionDefaults.
 	// Used by ResolveDefaultArgs() to produce CLI flags and by the API to
@@ -415,35 +427,36 @@ func BuiltinProviderAlias(name string) ProviderSpec {
 
 func providerSpecFromWorker(spec workerbuiltin.BuiltinProviderSpec) ProviderSpec {
 	return ProviderSpec{
-		Base:                   nil,
-		ArgsAppend:             nil,
-		OptionsSchemaMerge:     "",
-		DisplayName:            spec.DisplayName,
-		Command:                spec.Command,
-		Args:                   cloneStrings(spec.Args),
-		PromptMode:             spec.PromptMode,
-		PromptFlag:             spec.PromptFlag,
-		ReadyDelayMs:           spec.ReadyDelayMs,
-		ReadyPromptPrefix:      spec.ReadyPromptPrefix,
-		ProcessNames:           cloneStrings(spec.ProcessNames),
-		EmitsPermissionWarning: boolPtr(spec.EmitsPermissionWarning),
-		AcceptStartupDialogs:   cloneBoolPtr(spec.AcceptStartupDialogs),
-		Env:                    cloneStringMap(spec.Env),
-		PathCheck:              spec.PathCheck,
-		SupportsACP:            boolPtr(spec.SupportsACP),
-		SupportsHooks:          boolPtr(spec.SupportsHooks),
-		InstructionsFile:       spec.InstructionsFile,
-		ResumeFlag:             spec.ResumeFlag,
-		ResumeStyle:            spec.ResumeStyle,
-		ResumeCommand:          spec.ResumeCommand,
-		SessionIDFlag:          spec.SessionIDFlag,
-		PermissionModes:        cloneStringMap(spec.PermissionModes),
-		OptionDefaults:         cloneStringMap(spec.OptionDefaults),
-		OptionsSchema:          providerOptionsFromWorker(spec.OptionsSchema),
-		PrintArgs:              cloneStrings(spec.PrintArgs),
-		TitleModel:             spec.TitleModel,
-		ACPCommand:             spec.ACPCommand,
-		ACPArgs:                cloneStrings(spec.ACPArgs),
+		Base:                    nil,
+		ArgsAppend:              nil,
+		OptionsSchemaMerge:      "",
+		DisplayName:             spec.DisplayName,
+		Command:                 spec.Command,
+		Args:                    cloneStrings(spec.Args),
+		PromptMode:              spec.PromptMode,
+		PromptFlag:              spec.PromptFlag,
+		ReadyDelayMs:            spec.ReadyDelayMs,
+		ReadyPromptPrefix:       spec.ReadyPromptPrefix,
+		ProcessNames:            cloneStrings(spec.ProcessNames),
+		EmitsPermissionWarning:  boolPtr(spec.EmitsPermissionWarning),
+		AcceptStartupDialogs:    cloneBoolPtr(spec.AcceptStartupDialogs),
+		Env:                     cloneStringMap(spec.Env),
+		PathCheck:               spec.PathCheck,
+		SupportsACP:             boolPtr(spec.SupportsACP),
+		SupportsHooks:           boolPtr(spec.SupportsHooks),
+		RequiresAttachedSession: cloneBoolPtr(spec.RequiresAttachedSession),
+		InstructionsFile:        spec.InstructionsFile,
+		ResumeFlag:              spec.ResumeFlag,
+		ResumeStyle:             spec.ResumeStyle,
+		ResumeCommand:           spec.ResumeCommand,
+		SessionIDFlag:           spec.SessionIDFlag,
+		PermissionModes:         cloneStringMap(spec.PermissionModes),
+		OptionDefaults:          cloneStringMap(spec.OptionDefaults),
+		OptionsSchema:           providerOptionsFromWorker(spec.OptionsSchema),
+		PrintArgs:               cloneStrings(spec.PrintArgs),
+		TitleModel:              spec.TitleModel,
+		ACPCommand:              spec.ACPCommand,
+		ACPArgs:                 cloneStrings(spec.ACPArgs),
 	}
 }
 

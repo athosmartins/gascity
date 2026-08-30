@@ -658,6 +658,9 @@ func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
 	if result.TargetImplicit {
 		fmt.Fprintf(stderr, "warning: %q is an implicit provider-derived agent, not an explicitly configured worker for this rig — it has no dedicated sessions and may take a long time (or never) to pick up this work; verify this is the intended target (use --force to suppress)\n", result.Target) //nolint:errcheck
 	}
+	if result.CannotReceiveWork {
+		fmt.Fprintf(stderr, "warning: %q has no live session and its provider cannot spawn one unattended\n", result.Target) //nolint:errcheck
+	}
 	for _, w := range result.BeadWarnings {
 		fmt.Fprintln(stderr, w) //nolint:errcheck
 	}

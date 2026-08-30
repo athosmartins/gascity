@@ -59,6 +59,13 @@ type BuiltinProviderSpec struct {
 	TitleModel             string
 	ACPCommand             string
 	ACPArgs                []string
+	// RequiresAttachedSession is tri-state: nil = unknown/not yet audited,
+	// &true = the provider only runs inside a session a human has already
+	// attached to (e.g. claude — a bare `gc sling` to an unattended target
+	// silently strands the bead, see gastownhall/gascity#ga-66wc), &false =
+	// the provider can be spawned unattended (e.g. claude-headless). Only
+	// "claude" sets this explicitly today; see ga-a2w4h.
+	RequiresAttachedSession *bool
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -93,19 +100,20 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 			"permission_mode": "unrestricted",
 			"effort":          "max",
 		},
-		PromptMode:             "arg",
-		ReadyDelayMs:           10000,
-		ReadyPromptPrefix:      "\u276f ",
-		ProcessNames:           []string{"node", "claude"},
-		EmitsPermissionWarning: true,
-		SupportsACP:            true,
-		SupportsHooks:          true,
-		InstructionsFile:       "CLAUDE.md",
-		ResumeFlag:             "--resume",
-		ResumeStyle:            "flag",
-		SessionIDFlag:          "--session-id",
-		PrintArgs:              []string{"-p"},
-		TitleModel:             "haiku",
+		PromptMode:              "arg",
+		ReadyDelayMs:            10000,
+		ReadyPromptPrefix:       "\u276f ",
+		ProcessNames:            []string{"node", "claude"},
+		EmitsPermissionWarning:  true,
+		SupportsACP:             true,
+		SupportsHooks:           true,
+		RequiresAttachedSession: boolPtr(true),
+		InstructionsFile:        "CLAUDE.md",
+		ResumeFlag:              "--resume",
+		ResumeStyle:             "flag",
+		SessionIDFlag:           "--session-id",
+		PrintArgs:               []string{"-p"},
+		TitleModel:              "haiku",
 		PermissionModes: map[string]string{
 			"unrestricted": "--dangerously-skip-permissions",
 			"plan":         "--permission-mode plan",

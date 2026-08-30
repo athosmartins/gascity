@@ -128,6 +128,18 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 		}
 		result.BeadWarnings = append(result.BeadWarnings, check.Warnings...)
 	}
+
+	// Hard-fail (unlike the three warn-only checks above) when the target
+	// has no live session and its provider cannot spawn one unattended —
+	// routing here would silently strand the bead (ga-66wc). Placed after
+	// the idempotency short-circuit above so a harmless re-sling of an
+	// already-routed bead never fails just because its session happens to
+	// be down at this instant.
+	if !opts.Force && cannotReceiveWork(a, deps) {
+		result.CannotReceiveWork = true
+		return result, &CannotReceiveWorkError{Target: a.QualifiedName()}
+	}
+
 	if shouldValidateBuiltInRouteStoreReachable(opts, deps) {
 		if err := validateBuiltInRouteStoreReachable(deps, opts.BeadOrFormula, a); err != nil {
 			return result, fmt.Errorf("%w", err)
@@ -162,6 +174,42 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 	}
 
 	return result, nil
+}
+
+// alwaysFoundLookPath is a permissive config.LookPathFunc used only to
+// resolve a provider's capability flags (see cannotReceiveWork below) — it
+// never fails a PATH lookup. Whether the provider's binary happens to be
+// installed on this host is an orthogonal, pre-existing failure mode a real
+// launch attempt already surfaces separately; this check only cares what
+// the provider's config declares. Using a real exec.LookPath here would
+// also make the check depend on the host's PATH at test time.
+func alwaysFoundLookPath(string) (string, error) { return "ok", nil }
+
+// cannotReceiveWork reports whether the sling target has no live session
+// and its resolved provider cannot spawn one unattended. Deliberately
+// conservative: any ambiguity (provider doesn't resolve, target is a
+// multi-session/pool agent, no session provider wired) resolves to false so
+// this can never introduce a false hard-failure — it only fires for the
+// documented shape of ga-66wc: a single-session target whose provider
+// explicitly requires an attached session and has none running.
+//
+// Multi-session/pool agents are out of scope here: there is no single
+// deterministic session name to check liveness against, and a pool
+// inherently supports the supervisor spawning a fresh session on demand
+// regardless of what the provider capability flag says.
+func cannotReceiveWork(a config.Agent, deps SlingDeps) bool {
+	if deps.SP == nil || deps.Cfg == nil {
+		return false
+	}
+	if agentutil.IsMultiSessionAgent(&a) {
+		return false
+	}
+	resolved, err := config.ResolveProvider(&a, &deps.Cfg.Workspace, deps.Cfg.Providers, alwaysFoundLookPath)
+	if err != nil || resolved == nil || !resolved.RequiresAttachedSession {
+		return false
+	}
+	name := agentutil.LookupSessionName(deps.Store, deps.CityName, a.QualifiedName(), deps.Cfg.Workspace.SessionTemplate)
+	return !deps.SP.IsRunning(name)
 }
 
 func shouldValidateExistingBead(opts SlingOpts) bool {

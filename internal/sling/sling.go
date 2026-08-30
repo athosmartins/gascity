@@ -155,6 +155,15 @@ type SlingResult struct {
 	MetadataErrors []string // non-fatal metadata write failures
 	BeadWarnings   []string // pre-flight bead state warnings
 
+	// CannotReceiveWork is true when the target has no live session and its
+	// resolved provider cannot spawn one unattended (ResolvedProvider.
+	// RequiresAttachedSession) — unlike the three warn-only fields above,
+	// this is a hard failure: preflight returns a non-nil *CannotReceiveWorkError
+	// alongside a result with this set, so routing does not silently strand
+	// the bead. Only evaluated for single-session targets with a provider
+	// that resolves and explicitly opts in; see ga-a2w4h and ga-66wc.
+	CannotReceiveWork bool
+
 	// Batch fields (populated by DoSlingBatch).
 	ContainerType string // "convoy", "epic", etc. (batch only)
 	Routed        int
@@ -769,6 +778,21 @@ type MissingBeadError struct {
 // Error returns the missing-bead diagnostic.
 func (e *MissingBeadError) Error() string {
 	return fmt.Sprintf("bead %q not found in store %s", e.BeadID, e.StoreRef)
+}
+
+// CannotReceiveWorkError reports that a sling target has no live session and
+// its provider cannot spawn one unattended, so routing would silently strand
+// the bead (see ga-66wc). Distinct from the three warn-only preflight
+// conditions (AgentSuspended, PoolEmpty, TargetImplicit): those still route
+// the bead because the target COULD eventually pick it up; this one means it
+// never will without human intervention.
+type CannotReceiveWorkError struct {
+	Target string
+}
+
+// Error returns the cannot-receive-work diagnostic.
+func (e *CannotReceiveWorkError) Error() string {
+	return fmt.Sprintf("target %q has no live session and cannot spawn unattended — attach a session first, or route to a headless-capable target (use --force to route anyway)", e.Target)
 }
 
 // BeadLookupError reports an operational failure while checking whether a bead

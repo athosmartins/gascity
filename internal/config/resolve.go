@@ -286,6 +286,9 @@ func MergeProviderOverBuiltin(base, city ProviderSpec) ProviderSpec {
 	if city.SupportsHooks != nil {
 		result.SupportsHooks = city.SupportsHooks
 	}
+	if city.RequiresAttachedSession != nil {
+		result.RequiresAttachedSession = city.RequiresAttachedSession
+	}
 	if city.InstructionsFile != "" {
 		result.InstructionsFile = city.InstructionsFile
 	}
@@ -567,23 +570,24 @@ func detectProviderName(lookPath LookPathFunc) (string, error) {
 // specToResolved converts a ProviderSpec to a ResolvedProvider.
 func specToResolved(name string, spec *ProviderSpec) *ResolvedProvider {
 	rp := &ResolvedProvider{
-		Name:                   name,
-		Command:                spec.Command,
-		PromptMode:             spec.PromptMode,
-		PromptFlag:             spec.PromptFlag,
-		ReadyDelayMs:           spec.ReadyDelayMs,
-		ReadyPromptPrefix:      spec.ReadyPromptPrefix,
-		EmitsPermissionWarning: derefBool(spec.EmitsPermissionWarning),
-		AcceptStartupDialogs:   cloneBoolPtr(spec.AcceptStartupDialogs),
-		SupportsACP:            derefBool(spec.SupportsACP),
-		SupportsHooks:          derefBool(spec.SupportsHooks),
-		InstructionsFile:       spec.InstructionsFile,
-		ResumeFlag:             spec.ResumeFlag,
-		ResumeStyle:            spec.ResumeStyle,
-		ResumeCommand:          spec.ResumeCommand,
-		SessionIDFlag:          spec.SessionIDFlag,
-		TitleModel:             spec.TitleModel,
-		ACPCommand:             spec.ACPCommand,
+		Name:                    name,
+		Command:                 spec.Command,
+		PromptMode:              spec.PromptMode,
+		PromptFlag:              spec.PromptFlag,
+		ReadyDelayMs:            spec.ReadyDelayMs,
+		ReadyPromptPrefix:       spec.ReadyPromptPrefix,
+		EmitsPermissionWarning:  derefBool(spec.EmitsPermissionWarning),
+		AcceptStartupDialogs:    cloneBoolPtr(spec.AcceptStartupDialogs),
+		SupportsACP:             derefBool(spec.SupportsACP),
+		SupportsHooks:           derefBool(spec.SupportsHooks),
+		RequiresAttachedSession: derefBool(spec.RequiresAttachedSession),
+		InstructionsFile:        spec.InstructionsFile,
+		ResumeFlag:              spec.ResumeFlag,
+		ResumeStyle:             spec.ResumeStyle,
+		ResumeCommand:           spec.ResumeCommand,
+		SessionIDFlag:           spec.SessionIDFlag,
+		TitleModel:              spec.TitleModel,
+		ACPCommand:              spec.ACPCommand,
 	}
 	// Deep-copy OptionsSchema to avoid aliasing the spec's slice.
 	if len(spec.OptionsSchema) > 0 {
@@ -796,6 +800,10 @@ func resolvedChainToSpec(r ResolvedProvider, leaf ProviderSpec) ProviderSpec {
 	if leaf.SupportsHooks == nil && providerBoolFieldSet(r, "supports_hooks") {
 		v := r.SupportsHooks
 		out.SupportsHooks = &v
+	}
+	if leaf.RequiresAttachedSession == nil && providerBoolFieldSet(r, "requires_attached_session") {
+		v := r.RequiresAttachedSession
+		out.RequiresAttachedSession = &v
 	}
 	if r.InstructionsFile != "" {
 		out.InstructionsFile = r.InstructionsFile
