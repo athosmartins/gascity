@@ -2146,7 +2146,7 @@ func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
 	// so it's filtered by bd's own --exclude-label (bdReadyPoolDemandExcludeLabelArgs,
 	// covered by TestBdReadyPoolDemandExcludeLabelArgsIncludesEngineWindowAndParkLabels)
 	// before this jq filter ever sees the bead, not by poolDemandLabelFilterJQ itself.
-	input := `[{"id":"blocked-reason","labels":["blocked:external-quota-motherduck"]},{"id":"refused-reason","labels":["pilot:refused-reason:oracle-named-executor"]},{"id":"gate-bare","labels":["gate:needs-human"]},{"id":"gate-suffixed","labels":["gate:needs-human:technical"]},{"id":"blocked-by-survives","labels":["blocked-by:wa-10srb"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
+	input := `[{"id":"blocked-hyphen-family","labels":["blocked-reason:decision/feasibility"]},{"id":"blocked-reason","labels":["blocked:external-quota-motherduck"]},{"id":"refused-reason","labels":["pilot:refused-reason:oracle-named-executor"]},{"id":"gate-bare","labels":["gate:needs-human"]},{"id":"gate-suffixed","labels":["gate:needs-human:technical"]},{"id":"blocked-by-survives","labels":["blocked-by:wa-10srb"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
 
 	shellCmd := "printf '%s' '" + input + "' | " + poolDemandLabelFilterJQ()
 	cmd := exec.Command("sh", "-c", shellCmd)
@@ -2156,7 +2156,10 @@ func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
 	}
 
 	got := strings.TrimSpace(string(out))
-	for _, wantAbsent := range []string{`"blocked-reason"`, `"refused-reason"`, `"gate-bare"`, `"gate-suffixed"`} {
+	// ga-87cgp: blocked-reason:<slug> (HYPHEN family, e.g. the Sua-vez park
+	// marker) is not matched by startswith("blocked:") — one-character gap that
+	// kept a human-parked bead dispatchable. Case guards the widened filter.
+	for _, wantAbsent := range []string{`"blocked-hyphen-family"`, `"blocked-reason"`, `"refused-reason"`, `"gate-bare"`, `"gate-suffixed"`} {
 		if strings.Contains(got, wantAbsent) {
 			t.Errorf("poolDemandLabelFilterJQ() output = %s, must not contain park-labeled id %s", got, wantAbsent)
 		}

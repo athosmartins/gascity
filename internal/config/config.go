@@ -3367,12 +3367,19 @@ func poolDemandLabelFilterJQ() string {
 			`| if length > 0 then (max < $now_ts) else false end)) `+
 			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) `+
 			// ga-5huvs: the PREFIX half of the same three vetoes. blocked:<reason>
+			// ga-87cgp: blocked-reason:<slug> is a SEPARATE family (hyphen, not
+			// colon — e.g. blocked-reason:decision/feasibility, the Sua-vez park
+			// marker from wa-0wvss). startswith("blocked:") does NOT match it, so
+			// a human-parked bead stayed dispatchable and the Pilot held it 3x
+			// with no successor (ga-lfvs6 escalation). One-character gap; both
+			// forms kept explicit rather than a bare startswith("blocked") — the
+			// ga-jfz9t1 lesson: broad prefixes sweep in unrelated sticky labels.
 			// and gate:needs-human are open-ended families (the suffix carries the
 			// reason), so an exact --exclude-label cannot enumerate them;
 			// pilot:refused-reason:* likewise. Kept here rather than in
 			// bdReadyPoolDemandExcludeLabelArgs precisely because bd's
 			// --exclude-label is exact-match only.
-			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:"))) | length) == 0) ]`)
+			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:"))) | length) == 0) ]`)
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
