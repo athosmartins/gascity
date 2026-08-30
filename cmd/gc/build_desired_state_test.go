@@ -610,6 +610,193 @@ func TestDefaultScaleCheckCountsCountsUnassignedRoutedPoolWork(t *testing.T) {
 	}
 }
 
+// ga-kojez: defaultScaleCheckCounts must not count a bead as fresh pool
+// demand when it carries a deliberate park/veto label, even though it is
+// ready, unassigned, and routed to the template. Before poolDemandBeadVetoed
+// existed, the only exclusion was poolDemandBeadInFlight (story:in-flight /
+// pilot:dispatched), so a bead parked via pilot:no-auto-dispatch (or any of
+// the other veto labels every pool worker's own self-probe already respects)
+// was counted as demand forever — this test fails red on pre-fix HEAD
+// (count comes back 1, not 0) and green once poolDemandBeadVetoed is wired
+// into the Source 1 (Ready()) loop.
+func TestDefaultScaleCheckCountsExcludesVetoLabeledBead(t *testing.T) {
+	const template = "gastown.dog"
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:  "parked, never actually dispatchable",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+		},
+		Labels: []string{"pilot:no-auto-dispatch"},
+	}); err != nil {
+		t.Fatalf("create veto-labeled bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gastown",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts[template]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts[%q] = %d, want 0 for pilot:no-auto-dispatch veto-labeled bead", template, got)
+	}
+}
+
+// ga-kojez: pool:refused:<reason> is a PREFIX veto (the reason/slug is
+// open-ended), not a plain label equality — bd's --exclude-label cannot
+// express it, so poolDemandLabelFilterJQ (internal/config/config.go) matches
+// it with startswith("pool:refused"). poolDemandBeadVetoed must mirror that
+// prefix match, not just exact labels.
+func TestDefaultScaleCheckCountsExcludesPoolRefusedPrefixVeto(t *testing.T) {
+	const template = "gastown.dog"
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:  "refused by a worker, re-offered forever without this fix",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+		},
+		Labels: []string{"pool:refused:engine-rebuild-required"},
+	}); err != nil {
+		t.Fatalf("create prefix-veto-labeled bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gastown",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts[template]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts[%q] = %d, want 0 for pool:refused:* prefix veto-labeled bead", template, got)
+	}
+}
+
+// ga-kojez: pilot:held-until:<epoch> is a TIMED veto — it must exclude the
+// bead only while the epoch has not yet passed. This is the unexpired half;
+// TestDefaultScaleCheckCountsCountsExpiredPilotHeldUntilVeto below covers the
+// expired half (bead becomes countable demand again once the hold lapses).
+func TestDefaultScaleCheckCountsExcludesUnexpiredPilotHeldUntilVeto(t *testing.T) {
+	const template = "gastown.dog"
+	future := time.Now().UTC().Add(time.Hour).Unix()
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:  "held pending a still-future checkpoint",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+		},
+		Labels: []string{"pilot:held-until:" + strconv.FormatInt(future, 10)},
+	}); err != nil {
+		t.Fatalf("create held bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gastown",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts[template]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts[%q] = %d, want 0 for an unexpired pilot:held-until veto", template, got)
+	}
+}
+
+// ga-kojez: the expired-hold complement of the test above — once every
+// pilot:held-until:<epoch> stamp on a bead is in the past, the hold has
+// lapsed and the bead must become countable demand again (matching
+// poolDemandLabelFilterJQ's ga-jfz9t1 semantics: held is decided by the
+// LATEST stamp, never an unconditional veto).
+func TestDefaultScaleCheckCountsCountsExpiredPilotHeldUntilVeto(t *testing.T) {
+	const template = "gastown.dog"
+	past := time.Now().UTC().Add(-time.Hour).Unix()
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:  "hold expired, dispatchable again",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": template,
+		},
+		Labels: []string{"pilot:held-until:" + strconv.FormatInt(past, 10)},
+	}); err != nil {
+		t.Fatalf("create expired-hold bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gastown",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts[template]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts[%q] = %d, want 1 once pilot:held-until has expired", template, got)
+	}
+}
+
+// ga-kojez: Source 2 (the explicit gc.pool_demand metadata path used by
+// cron-fired pool orders) shares poolDemandBeadInFlight with Source 1 and
+// must share poolDemandBeadVetoed the same way, or a veto-labeled pool-order
+// wisp would still be counted as demand through this second path even though
+// Source 1 now excludes it.
+func TestDefaultScaleCheckCountsExcludesVetoLabeledCronPoolDemand(t *testing.T) {
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(beads.Bead{
+		Title:    "parked pool-order wisp",
+		Type:     "molecule",
+		Status:   "open",
+		Metadata: poolWispMetadata("cat"),
+		Labels:   []string{"pilot:no-auto-dispatch"},
+	}); err != nil {
+		t.Fatalf("create veto-labeled pool-order wisp: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template: "cat",
+		storeKey: "city",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts["cat"]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts[%q] = %d, want 0 for veto-labeled gc.pool_demand wisp", "cat", got)
+	}
+}
+
 func TestDefaultScaleCheckCountsCountsUnassignedRoutedTaskWisp(t *testing.T) {
 	const template = "gascity/reviewer"
 	backing := beads.NewMemStore()

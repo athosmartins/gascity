@@ -1202,11 +1202,138 @@ func poolDemandBeadInFlight(b beads.Bead) bool {
 	return false
 }
 
+// poolDemandVetoLabels are labels that mark a bead as deliberately parked —
+// explicitly refused, awaiting a human decision, mid-refinement, needing a
+// device, or otherwise not real claimable demand — even though the bead is
+// open, unassigned, and routed. They are the EXACT-MATCH half of the
+// predicate every pool worker's own self-serve probe already applies before
+// claiming routed work: bdReadyPoolDemandExcludeLabelArgs
+// (internal/config/config.go), rendered into each session's
+// probe_pool_demand() shell function via bdReadyPoolDemandShell.
+//
+// Mirroring this list here closes the "scale_check ↔ work_query
+// correspondence" gap documented in engdocs/architecture/dispatch.md: without
+// it, defaultScaleCheckCounts counts a bead every worker would immediately
+// refuse as live demand forever, so the supervisor never stops spawning
+// replacement sessions for it — confirmed live spawning a fresh gastown.dog
+// every ~30-40s against 13-14 permanently-parked beads (ga-kojez).
+//
+// Deliberately a SEPARATE slice from poolDemandInFlightLabels: that one is
+// reused by session_lifecycle_parallel.go (RemoveLabels:
+// poolDemandInFlightLabels) to strip in-flight markers on an unrelated
+// lifecycle transition. Folding this broader "don't count as demand" set
+// into it would expose these veto labels to being stripped by that code path.
+//
+// Keep in sync with bdReadyPoolDemandExcludeLabelArgs (internal/config/config.go).
+var poolDemandVetoLabels = []string{
+	"story:needs-human",
+	"needs-human",
+	"ctx:thin",
+	"story:needs-approval",
+	"story:epic",
+	"needs:engine-window",
+	"pilot:no-auto-dispatch",
+	"story:blocked",
+	"delivery:partial",
+	"scope:needs-review",
+	"exec:manual",
+	"needs-human-decision",
+	"auto-refino:refining",
+	"auto-refino:escalated",
+	"refino:info-gap",
+	"refino:policy-gap",
+	"story:unrefined",
+	"story:refinement-in-progress",
+	"story:refino-review",
+	"story:refino-escalado",
+	"story:needs-device",
+	"on-device",
+	"phone-proxy",
+	"gate:queued",
+	"gate:reviewing",
+}
+
+// poolDemandVetoLabelPrefixes are label PREFIXES that veto a bead the same
+// way poolDemandVetoLabels does, but cannot be expressed as plain equality
+// because the reason/slug is open-ended and carried in the label suffix
+// (e.g. "pool:refused:engine-rebuild-required"). This mirrors the prefix
+// half of poolDemandLabelFilterJQ (internal/config/config.go) — everything
+// there except the pilot:held / pilot:held-until: handling, which needs its
+// own timed-expiry logic and is implemented separately in
+// poolDemandBeadVetoed below (not a plain prefix veto).
+//
+// Keep in sync with poolDemandLabelFilterJQ (internal/config/config.go).
+var poolDemandVetoLabelPrefixes = []string{
+	"pool:refused",
+	"pilot:refused-reason:",
+	"blocked:",
+	"blocked-reason:",
+	"gate:needs-human",
+}
+
+// poolDemandBeadVetoed reports whether a bead carries a deliberate park/veto
+// signal that must exclude it from default scale_check demand counting, even
+// though it is otherwise ready, unassigned, and routed. It is the Go-side
+// mirror of poolDemandLabelFilterJQ + bdReadyPoolDemandExcludeLabelArgs
+// (internal/config/config.go) — the predicate every pool worker's own
+// self-serve probe already applies — so defaultScaleCheckCounts stops
+// treating beads no worker would ever claim as live demand (ga-kojez).
+//
+// held-until handling mirrors poolDemandLabelFilterJQ's ga-jfz9t1 fix
+// exactly: pilot:held-until:<epoch> labels ACCUMULATE (nothing prunes old
+// ones), so a bead can carry several — it is vetoed only while its LATEST
+// (max) timestamp has not yet passed; once every stamped hold has expired the
+// bead becomes countable demand again. A bare "pilot:held" label with no
+// held-until timestamp at all is an indefinite hold (always vetoed). Do NOT
+// widen this to a bare startswith("pilot:held") prefix — that also matches
+// the unrelated sticky pilot:held-count:<slug>:<n> escalation counter, which
+// must never veto on its own (ga-jfz9t1).
+func poolDemandBeadVetoed(b beads.Bead, now time.Time) bool {
+	for _, label := range poolDemandVetoLabels {
+		if hasBeadLabel(b.Labels, label) {
+			return true
+		}
+	}
+
+	hasBareHeld := false
+	sawHeldUntil := false
+	var latestHeldUntil int64
+
+	for _, label := range b.Labels {
+		for _, prefix := range poolDemandVetoLabelPrefixes {
+			if strings.HasPrefix(label, prefix) {
+				return true
+			}
+		}
+		if label == "pilot:held" {
+			hasBareHeld = true
+			continue
+		}
+		if rest, ok := strings.CutPrefix(label, "pilot:held-until:"); ok {
+			if epoch, err := strconv.ParseInt(rest, 10, 64); err == nil {
+				sawHeldUntil = true
+				if epoch > latestHeldUntil {
+					latestHeldUntil = epoch
+				}
+			}
+		}
+	}
+
+	if sawHeldUntil {
+		return latestHeldUntil >= now.Unix()
+	}
+	return hasBareHeld
+}
+
 // defaultScaleCheckCounts reports ready, unassigned, routed work as fresh
 // generic pool demand. Assigned beads are handled by assigned-work collection
 // and named-session demand so they are intentionally excluded here. Beads
-// already in flight (story:in-flight / pilot:dispatched) are likewise excluded
-// so an in-flight bead can never be re-counted as fresh demand (ga-lx7om).
+// already in flight (story:in-flight / pilot:dispatched) are likewise
+// excluded so an in-flight bead can never be re-counted as fresh demand
+// (ga-lx7om). Beads carrying a deliberate park/veto label (pilot:no-auto-dispatch,
+// needs-human, pool:refused:*, an unexpired pilot:held*, etc.) are likewise
+// excluded so a permanently-parked bead can never be re-counted as fresh
+// demand either (ga-kojez) — see poolDemandBeadVetoed.
 func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int, map[string]bool, []error) {
 	counts := make(map[string]int, len(targets))
 	if len(targets) == 0 {
@@ -1256,6 +1383,11 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 		// flag) is counted exactly once per template.
 		counted := make(map[string]struct{})
 		liveReader := beads.HandlesFor(group.store).Live
+		// Shared by both demand sources below (ga-kojez): the same instant
+		// decides pilot:held-until:<epoch> expiry for every bead considered
+		// in this group, so Source 1 and Source 2 agree on which held beads
+		// have expired back into countable demand within a single sweep.
+		now := time.Now().UTC()
 
 		// Source 1: Ready()/CachedReady() iteration. Surfaces actionable
 		// work (task, etc.) from both durable and ephemeral tiers matched
@@ -1275,6 +1407,9 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 				continue
 			}
 			if poolDemandBeadInFlight(b) {
+				continue
+			}
+			if poolDemandBeadVetoed(b, now) {
 				continue
 			}
 			template := controllerDemandRouteTarget(b, group.templates)
@@ -1324,7 +1459,6 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 				demand = nil
 			}
 		}
-		now := time.Now().UTC()
 		for _, b := range demand {
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
@@ -1333,6 +1467,9 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 				continue
 			}
 			if poolDemandBeadInFlight(b) {
+				continue
+			}
+			if poolDemandBeadVetoed(b, now) {
 				continue
 			}
 			template := controllerDemandRouteTarget(b, group.templates)

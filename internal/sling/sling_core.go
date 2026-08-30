@@ -370,7 +370,13 @@ func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID 
 		}
 		result.WispRootID = wispRootID
 		result.FormulaName = opts.OnFormula
-		return finalize(opts, deps, beadID, method, result)
+		finalResult, finalErr := finalize(opts, deps, beadID, method, result)
+		if finalErr != nil {
+			if rollbackErr := rollbackOrphanedMoleculeAttachment(deps.Store, beadID, wispRootID); rollbackErr != nil {
+				return finalResult, errors.Join(finalErr, rollbackErr)
+			}
+		}
+		return finalResult, finalErr
 	}
 	runGraph := func() (pendingSourceWorkflowLaunch, error) {
 		mResult, err := InstantiateSlingFormula(context.Background(), opts.OnFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
@@ -471,7 +477,13 @@ func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 		}
 		result.WispRootID = wispRootID
 		result.FormulaName = defaultFormula
-		return finalize(opts, deps, beadID, method, result)
+		finalResult, finalErr := finalize(opts, deps, beadID, method, result)
+		if finalErr != nil {
+			if rollbackErr := rollbackOrphanedMoleculeAttachment(deps.Store, beadID, wispRootID); rollbackErr != nil {
+				return finalResult, errors.Join(finalErr, rollbackErr)
+			}
+		}
+		return finalResult, finalErr
 	}
 	runGraph := func() (pendingSourceWorkflowLaunch, error) {
 		mResult, err := InstantiateSlingFormula(context.Background(), defaultFormula, SlingFormulaSearchPaths(deps, a), molecule.Options{
@@ -600,6 +612,28 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 	}
 
 	return result, nil
+}
+
+// rollbackOrphanedMoleculeAttachment undoes a molecule attachment created by
+// InstantiateSlingFormula when the subsequent finalize call (the step that
+// actually routes the bead) fails. Without this, the just-created molecule
+// stays attached via molecule_id with no route ever recorded --
+// checkNoMoleculeChildren's auto-burn only fires for an unassigned parent, so
+// any assigned bead (or a parent whose assignee predates this attempt) hits
+// "already has attached molecule" on retry for a molecule that never routed
+// anything.
+func rollbackOrphanedMoleculeAttachment(store beads.Store, beadID, wispRootID string) error {
+	if store == nil || strings.TrimSpace(wispRootID) == "" {
+		return nil
+	}
+	var rollbackErr error
+	if _, err := molecule.CloseSubtree(store, wispRootID); err != nil {
+		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("closing orphaned molecule %s: %w", wispRootID, err))
+	}
+	if err := store.SetMetadata(beadID, "molecule_id", ""); err != nil {
+		rollbackErr = errors.Join(rollbackErr, fmt.Errorf("clearing molecule_id on %s: %w", beadID, err))
+	}
+	return rollbackErr
 }
 
 func validateBuiltInRouteStoreReachable(deps SlingDeps, beadID string, a config.Agent) error {
