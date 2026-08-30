@@ -196,7 +196,13 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 	}
 
 	filter := types.IssueFilter{
-		Limit:          SQLLimit(in),
+		Limit: SQLLimit(in),
+		// The offset is carried for the callers that consume this filter as a
+		// VALUE and run their own query — `bd list --watch` and the proxied
+		// hierarchical --parent walk — where the seam beneath them renders it.
+		// Both implementations of issueops.Reader take it back off
+		// (WithRowsBeforeThePage) and skip in the shared page epilogue instead;
+		// FinishPageAt says why the role cannot leave it here.
 		Offset:         in.Offset,
 		SortBy:         in.SortBy,
 		SortDesc:       in.Reverse,
@@ -400,7 +406,11 @@ func BuildListFilter(in issueops.ListRequest, cfg ListConfig) (types.IssueFilter
 		return filter, err
 	}
 
-	if !in.IncludeInfra && (in.IssueType == "" || !cfg.IsInfra(in.IssueType)) {
+	// The plane bit. Three requests admit the wisp table: an explicit
+	// IncludeEphemeral, IncludeInfra (which admits the plane AND drops the
+	// infra-type exclusions above), and naming an infra type (which routed to
+	// the plane alone a few lines up). Everything else is the durable listing.
+	if !in.IncludeEphemeral && !in.IncludeInfra && (in.IssueType == "" || !cfg.IsInfra(in.IssueType)) {
 		filter.SkipWisps = true
 	}
 

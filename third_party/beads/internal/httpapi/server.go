@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -170,8 +171,14 @@ type Config struct {
 	// one reason — so the units of work they open land in that request's uow_ms
 	// (see Server.reader) — and a role reached this way opens none through this
 	// server, so a rebuild would buy nothing.
-	Reader            issueops.Reader
-	Claimer           issueops.Claimer
+	Reader  issueops.Reader
+	Claimer issueops.Claimer
+	// Lifecycle is the guarded-mutation role behind the issue lifecycle
+	// operations. Required on the same terms as every field here, and the
+	// hook-firing refusal below bites hardest on it: a store's own
+	// IssueLifecycle() returns a role that fires on_create, on_update and the
+	// close hooks for every mutation it lands.
+	Lifecycle         issueops.Lifecycle
 	Settings          issueops.WorkspaceConfig
 	Stats             issueops.StatsReporter
 	CycleDetector     issueops.CycleDetector
@@ -188,6 +195,27 @@ type Config struct {
 	// Deleter is the OTHER destructive one, required for the same reason.
 	Deleter      issueops.Deleter
 	BatchCreator issueops.BatchCreator
+	// DependencyEditor is the graph's write side. Required on the same terms as
+	// the two destructive roles above: whether this build can rewire the
+	// dependency graph is a decision for the operator who chose to run bd serve,
+	// not a consequence of whether a caller remembered a field.
+	DependencyEditor issueops.DependencyEditor
+	// MetadataCAS is the conditional single-key metadata write behind
+	// POST /v0/beads/issues/{id}:casMetadata. Required on the same terms as
+	// every other role: a Config missing it would bind and nil-dereference on
+	// the first request that reached that handler.
+	MetadataCAS issueops.MetadataCAS
+	// BatchApplier is the ordered, heterogeneous plan behind
+	// POST /v0/beads/issues:batchApply. Required on the same terms as every
+	// other role: a Config missing it would bind and nil-dereference on the
+	// first request that reached that handler.
+	//
+	// It is the field where the hook-firing refusal below bites HARDEST. A
+	// store's own accessor returns an applier that fires on_create, on_update
+	// AND the close hooks — once per landed item, plus once per distinct edge
+	// source — so a single hundred-item request served unpeeled would run a
+	// hundred of the workspace's subprocesses inside one HTTP call.
+	BatchApplier issueops.BatchApplier
 	// Memories is the workspace's persistent memory plane, and the one field
 	// here that is not an issueops role: memories are user data riding in the
 	// config table under their own merge class, not settings, so they have
@@ -195,6 +223,38 @@ type Config struct {
 	// a partial set is refused, so the field and the operations that reach it
 	// land together.
 	Memories memoryops.Memories
+	// EventsJournal is the durable mutation journal's READ side, and the ONE
+	// role here that is required CONDITIONALLY — which is why it is absent from
+	// sourceRoles and checked on its own. Like Memories it is not an issueops
+	// role: the journal is engine state on a dolt_ignored table, not a bead
+	// query, so its seam lives in internal/storage beside the rows it yields.
+	//
+	// Required exactly when EventsJournalEnabled. A workspace that records
+	// nothing needs no reader, and a storage backend that cannot read the
+	// journal at all is a perfectly ordinary backend as long as nobody asked it
+	// to journal — the same deal eventsjournal.Apply takes when it binds
+	// activation to a store. Demanding it unconditionally would make a
+	// capability nothing uses a precondition for running the server.
+	//
+	// It is a storage.EventsJournalCursor and deliberately NOT the wider
+	// storage.EventsJournalAccessor the CLI takes. That interface also prunes,
+	// and a server that is documented to publish the journal and never retain
+	// it should not be holding a delete it merely promises not to call.
+	EventsJournal storage.EventsJournalCursor
+	// EventsJournalEnabled is whether the served workspace actually records
+	// mutations, resolved by the caller through eventsjournal.EnabledFor.
+	//
+	// It is a resolved BOOLEAN rather than something this package works out,
+	// for the reason Config gives at the top: activation reads the target
+	// workspace's own config.yaml and the BD_EVENTS_JOURNAL environment
+	// override, which is workspace state, and this package resolves none.
+	//
+	// It cannot be inferred from the data either, which is the whole reason the
+	// field exists. A disabled journal presents as zero rows and a head of
+	// zero — byte-identical to an enabled journal nothing has written yet — so
+	// a server without this flag would answer "you are caught up" to a consumer
+	// polling a workspace that will never emit a record.
+	EventsJournalEnabled bool
 	// Workspace is the startup snapshot GET /v0/beads/context answers from.
 	// Only the allowlisted fields are ever serialized — see contextResponse,
 	// which names the whole set and the reasons for the exclusions.
@@ -224,6 +284,7 @@ type Server struct {
 	// names because a struct cannot carry both.
 	issueReader       issueops.Reader
 	issueClaimer      issueops.Claimer
+	issueLifecycle    issueops.Lifecycle
 	settings          issueops.WorkspaceConfig
 	issueStats        issueops.StatsReporter
 	issueCycles       issueops.CycleDetector
@@ -235,7 +296,11 @@ type Server struct {
 	issueSweeper      issueops.Sweeper
 	issueDeleter      issueops.Deleter
 	issueBatchCreator issueops.BatchCreator
+	issueDependencies issueops.DependencyEditor
+	issueMetadataCAS  issueops.MetadataCAS
+	issueBatchApplier issueops.BatchApplier
 	workspaceMemories memoryops.Memories
+	eventsJournal     storage.EventsJournalCursor
 
 	listener net.Listener
 	http     *http.Server
@@ -243,13 +308,30 @@ type Server struct {
 	// sem bounds handlers that touch the database. Buffered channel rather
 	// than sync.Semaphore so the acquisition can select on a timer.
 	sem chan struct{}
-	// semTimeout, semWarn and writeStall default to the constants above. They
-	// are fields rather than constants at the point of use so the queueing and
-	// stalled-write behavior can be exercised in milliseconds instead of tens of
-	// seconds.
+	// semTimeout, semWarn, writeStall, watchPoll and watchBeat default to the
+	// constants above. They are fields rather than constants at the point of use
+	// so the queueing, stalled-write and streaming behavior can be exercised in
+	// milliseconds instead of tens of seconds.
 	semTimeout time.Duration
 	semWarn    time.Duration
 	writeStall time.Duration
+	watchPoll  time.Duration
+	watchBeat  time.Duration
+
+	// closing is closed when a graceful shutdown begins, and it is the ONLY
+	// notice a streaming handler gets: http.Server.Shutdown waits for active
+	// requests without canceling their contexts, so a stream that watched only
+	// for a client disconnect would hold every shutdown open for the whole drain
+	// timeout and then be killed anyway. Registered on the http.Server (which
+	// calls it exactly once) and guarded so a second call cannot close twice.
+	closing     chan struct{}
+	closingOnce sync.Once
+
+	// watchStreams is the live count of open events:watch streams and
+	// maxWatchStreams mirrors the constant, so a test can saturate the cap
+	// without opening sixty-four of them.
+	watchStreams    atomic.Int64
+	maxWatchStreams int
 
 	log     *log.Logger
 	stdout  io.Writer
@@ -334,6 +416,7 @@ func Listen(cfg Config) (*Server, error) {
 		provider:          cfg.Provider,
 		issueReader:       cfg.Reader,
 		issueClaimer:      cfg.Claimer,
+		issueLifecycle:    cfg.Lifecycle,
 		settings:          cfg.Settings,
 		issueStats:        cfg.Stats,
 		issueCycles:       cfg.CycleDetector,
@@ -345,11 +428,18 @@ func Listen(cfg Config) (*Server, error) {
 		issueSweeper:      cfg.Sweeper,
 		issueDeleter:      cfg.Deleter,
 		issueBatchCreator: cfg.BatchCreator,
+		issueDependencies: cfg.DependencyEditor,
+		issueMetadataCAS:  cfg.MetadataCAS,
+		issueBatchApplier: cfg.BatchApplier,
 		workspaceMemories: cfg.Memories,
+		eventsJournal:     cfg.EventsJournal,
 
 		sem:        make(chan struct{}, maxInflight),
 		semTimeout: semAcquireTimeout,
 		semWarn:    saturationWarn,
+
+		closing:         make(chan struct{}),
+		maxWatchStreams: maxWatchStreams,
 
 		log:      log.New(cfg.Stderr, "bd serve: ", log.LstdFlags|log.LUTC),
 		stdout:   cfg.Stdout,
@@ -374,6 +464,11 @@ func Listen(cfg Config) (*Server, error) {
 		ErrorLog:          log.New(cfg.Stderr, "bd serve: http: ", log.LstdFlags|log.LUTC),
 		ConnState:         s.connState,
 	}
+	// Tell the streams to wind up as soon as a drain starts. Without it a
+	// graceful shutdown waits out the whole drain timeout on any open stream and
+	// then reports itself forced, which is the one shutdown signal an operator
+	// is meant to be able to trust.
+	s.http.RegisterOnShutdown(s.closeStreams)
 
 	// Bound what a burst of requests can open on the database. The knob is
 	// optional on the interface, so say so out loud when a provider does not
@@ -434,13 +529,19 @@ func Listen(cfg Config) (*Server, error) {
 // A role is compared against nil as an INTERFACE, which is what the caller
 // actually sets; a typed nil stored in one of these fields is a value as far as
 // this check is concerned.
+//
+// It carries only the roles every deployment must have. EventsJournal is
+// deliberately NOT here: it is required only when the workspace's journal is
+// enabled, and folding a conditional field into a set whose whole value is
+// "all or nothing" would turn an honest condition into a special case inside
+// three functions. It is checked once, on its own, below.
 func sourceRoles(cfg Config) []any {
-	return []any{cfg.Reader, cfg.Claimer, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.Memories}
+	return []any{cfg.Reader, cfg.Claimer, cfg.Lifecycle, cfg.Settings, cfg.Stats, cfg.CycleDetector, cfg.EdgeReader, cfg.BlockingAnnotator, cfg.TreeWalker, cfg.ReadyCounter, cfg.Querier, cfg.Sweeper, cfg.Deleter, cfg.BatchCreator, cfg.DependencyEditor, cfg.BatchApplier, cfg.Memories, cfg.MetadataCAS}
 }
 
 // roleSourceNames spells sourceRoles for the refusal message, in the same
 // order, so a caller reading the error learns the whole set it must pass.
-const roleSourceNames = "Reader, Claimer, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator and Memories"
+const roleSourceNames = "Reader, Claimer, Lifecycle, Settings, Stats, CycleDetector, EdgeReader, BlockingAnnotator, TreeWalker, ReadyCounter, Querier, Sweeper, Deleter, BatchCreator, DependencyEditor, BatchApplier, Memories and MetadataCAS"
 
 func anyRoleSet(cfg Config) bool {
 	return slices.ContainsFunc(sourceRoles(cfg), func(r any) bool { return r != nil })
@@ -456,14 +557,30 @@ func anyRoleFiresHooks(cfg Config) bool {
 
 func checkDatabaseSource(cfg Config) error {
 	switch {
-	case cfg.Provider != nil && anyRoleSet(cfg):
+	case cfg.Provider != nil && (anyRoleSet(cfg) || cfg.EventsJournal != nil):
 		return errors.New("httpapi: both a unit-of-work provider and issue roles were set; pass exactly one database source")
 	case cfg.Provider == nil && !everyRoleSet(cfg):
 		return errors.New("httpapi: no database source: set Provider, or " + roleSourceNames + " together")
+	// The conditional role, checked where every other configuration mistake is.
+	// A workspace that HAS a journal and a server that cannot read it is the
+	// one combination that would bind, answer every other route, and fail this
+	// one — with a nil dereference, which is the shape checkDatabaseSource
+	// exists to prevent. A workspace with the journal off needs no reader and
+	// this says nothing about it.
+	case cfg.Provider == nil && cfg.EventsJournalEnabled && cfg.EventsJournal == nil:
+		return errors.New("httpapi: this workspace's events journal is enabled but no EventsJournal reader was configured; " +
+			"take one off the store (storage.EventsJournalCursor), or serve a workspace with the journal off")
 	case anyRoleFiresHooks(cfg):
 		return errors.New("httpapi: a configured role fires this workspace's hooks; " +
 			"this server does not run hooks, so take the roles from the store beneath the hook decorator " +
 			"((*storage.HookFiringStore).Unwrap)")
+	case uow.ProviderFiresHooks(cfg.Provider):
+		// The same refusal for the other database source. A provider's roles
+		// carry whatever the provider carries, so a hook-firing one would run a
+		// user's subprocess per served mutation just as a hook-firing role does.
+		return errors.New("httpapi: the configured provider fires this workspace's hooks; " +
+			"this server does not run hooks, so pass the provider beneath the hook layer " +
+			"(uow.UnwrapProvider)")
 	}
 	return nil
 }
@@ -616,6 +733,25 @@ func (s *Server) claimer(r *http.Request) (issueops.Claimer, error) {
 	return checkedClaimer{inner: cl}, nil
 }
 
+// lifecycle returns the guarded issue-mutation surface for one request.
+//
+// Built the same two ways as claimer above and for the same reasons: the
+// configured role on the roles source, and on the provider source one built per
+// request so its units of work are timed into THIS request's log line, held by
+// INTERFACE so uow.IssueLifecycleSource is load-bearing rather than decorative
+// — and, from either source, wrapped in checkedLifecycle.
+func (s *Server) lifecycle(r *http.Request) (issueops.Lifecycle, error) {
+	if s.provider == nil {
+		return checkedLifecycle{inner: s.issueLifecycle}, nil
+	}
+	var src uow.IssueLifecycleSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	lc, err := src.IssueLifecycle()
+	if err != nil {
+		return nil, err
+	}
+	return checkedLifecycle{inner: lc}, nil
+}
+
 // workspaceConfig returns the guarded workspace-settings surface for one
 // request.
 //
@@ -755,6 +891,60 @@ func (s *Server) batchCreator(r *http.Request) (issueops.BatchCreator, error) {
 	return checkedBatchCreator{inner: creator}, nil
 }
 
+// dependencyEditor returns the guarded dependency-graph write surface for one
+// request, on the same terms as every role above and held by INTERFACE so
+// uow.DependencyEditorSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED, like the sweeper and the deleter: both of this role's
+// results are VALUES, so no handler dereferences a pointer it returned.
+//
+// The role this returns owns every refusal the graph can raise — the cycle
+// gate, the hierarchy rule, the type conflict and the endpoint existence checks
+// — which is why the Config field it comes from is required rather than
+// optional.
+func (s *Server) dependencyEditor(r *http.Request) (issueops.DependencyEditor, error) {
+	if s.provider == nil {
+		return s.issueDependencies, nil
+	}
+	var src uow.DependencyEditorSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.DependencyEditor()
+}
+
+// metadataCAS returns the conditional metadata write for one request, on the
+// same terms as every role above and held by INTERFACE so
+// uow.MetadataCASSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED: the role's result is a VALUE whose only pointer member
+// is an optional raw value the handler passes through without dereferencing.
+func (s *Server) metadataCAS(r *http.Request) (issueops.MetadataCAS, error) {
+	if s.provider == nil {
+		return s.issueMetadataCAS, nil
+	}
+	var src uow.MetadataCASSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.MetadataCAS()
+}
+
+// batchApplier returns the ordered-plan write surface for one request, on the
+// same terms as every role above and held by INTERFACE so
+// uow.BatchApplierSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED, like the dependency editor: ApplyBatchResult is a
+// VALUE, and the one pointer its items carry — the post-item issue snapshot —
+// never reaches the wire, so no handler dereferences anything this role
+// returned.
+//
+// The role owns every refusal this operation can raise: the ref graph, the
+// as-modified preconditions, the close policy, the assignee fence and the end
+// gate. That is why the Config field it comes from is required rather than
+// optional.
+func (s *Server) batchApplier(r *http.Request) (issueops.BatchApplier, error) {
+	if s.provider == nil {
+		return s.issueBatchApplier, nil
+	}
+	var src uow.BatchApplierSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.BatchApplier()
+}
+
 // memories returns the persistent-memory surface for one request, on the same
 // terms as every role above and held by INTERFACE so uow.MemoriesSource is
 // load-bearing rather than decorative.
@@ -768,6 +958,34 @@ func (s *Server) memories(r *http.Request) (memoryops.Memories, error) {
 	}
 	var src uow.MemoriesSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
 	return src.Memories()
+}
+
+// eventsJournalCursor returns the journal read surface for one request, on the
+// same terms as every role above and held by INTERFACE so
+// uow.EventsJournalCursorSource is load-bearing rather than decorative.
+//
+// It goes out UNWRAPPED: a page is a value carrying a slice, so there is
+// nothing for a checked wrapper to make safe — the querier's argument.
+//
+// The narrow type is the point of this accessor rather than an accident of it.
+// The provider can also hand out uw.EventsJournalUseCase(), which PRUNES; going
+// through a source that only publishes storage.EventsJournalCursor is what
+// keeps the read-only promise a fact about what the handler is holding.
+func (s *Server) eventsJournalCursor(r *http.Request) (storage.EventsJournalCursor, error) {
+	if s.provider == nil {
+		if s.eventsJournal == nil {
+			// Unreachable through the handler, which refuses a disabled
+			// workspace before asking for a reader, and Listen refuses an
+			// enabled one with no reader. Said out loud rather than returned as
+			// a nil interface for the reason WithUOW says its own: a 500 naming
+			// the condition beats a panic on a live server if either of those
+			// two gates is ever moved.
+			return nil, errors.New("httpapi: this server has no events-journal reader; it was configured for a workspace with the journal off")
+		}
+		return s.eventsJournal, nil
+	}
+	var src uow.EventsJournalCursorSource = timedProvider{inner: s.provider, rec: requestInfo(r.Context())}
+	return src.EventsJournalCursor()
 }
 
 // WithUOW runs fn inside one unit of work and guarantees the rollback.
@@ -864,8 +1082,24 @@ func orDefault(v, fallback time.Duration) time.Duration {
 // middleware in front of both.
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
+	// Rows carrying a customMethod SHARE a pattern, so they get one
+	// registration between them and a dispatcher in front. Collected in table
+	// order, which is the order customMethodTarget tries the suffixes in.
+	shared := map[string][]route{}
+	var sharedOrder []string
 	for _, rt := range routeTable {
-		mux.Handle(rt.method+" "+rt.pattern, s.route(rt))
+		if rt.customMethod == "" {
+			mux.Handle(rt.method+" "+rt.pattern, s.route(rt))
+			continue
+		}
+		key := rt.method + " " + rt.pattern
+		if _, seen := shared[key]; !seen {
+			sharedOrder = append(sharedOrder, key)
+		}
+		shared[key] = append(shared[key], rt)
+	}
+	for _, key := range sharedOrder {
+		mux.Handle(key, s.dispatchCustomMethod(shared[key]))
 	}
 
 	// Not an operation and deliberately not in the route table: it exists so
@@ -1046,6 +1280,36 @@ func (s *Server) checkHost(next http.Handler) http.Handler {
 	})
 }
 
+// dispatchCustomMethod is the one registration the single-resource custom
+// methods share. It splits the trailing `:verb` off the matched segment, hands
+// the request to the row that claims it, and leaves the id where that row's
+// handler reads it.
+//
+// The split happens BEFORE s.route, which is what makes an unrouted suffix cost
+// nothing: it takes no database slot and books no operation on the request
+// line, exactly as the catch-all's 404 does. Answering it from inside a row's
+// handler — where the claim answered it while it was the only POST here — would
+// attribute every probe of this prefix to whichever operation happened to be
+// first in the table.
+func (s *Server) dispatchCustomMethod(rows []route) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rt, id, res := customMethodTarget(rows, r.PathValue(customMethodPathValue))
+		if res != nil {
+			s.fail(w, r, *res)
+			return
+		}
+		r.SetPathValue(customMethodIDValue, id)
+		s.route(rt).ServeHTTP(w, r)
+	})
+}
+
+// closeStreams signals every streaming handler that this server is shutting
+// down. Idempotent: http.Server calls its registered hooks once per Shutdown,
+// and a second Shutdown must not panic on an already-closed channel.
+func (s *Server) closeStreams() {
+	s.closingOnce.Do(func() { close(s.closing) })
+}
+
 // route wraps one operation with the limits that apply to it: the per-request
 // deadline, and — unless the operation is exempt — a database slot.
 func (s *Server) route(rt route) http.Handler {
@@ -1053,12 +1317,19 @@ func (s *Server) route(rt route) http.Handler {
 		rec := requestInfo(r.Context())
 		rec.op = rt.op
 
-		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
-		defer cancel()
-		r = r.WithContext(ctx)
+		// A STREAMING OPERATION GETS NO DEADLINE. For every other row this is
+		// the backstop that stops a request from holding resources forever; on a
+		// held-open response it would do nothing but sever the stream at sixty
+		// seconds. What replaces it is per-read: streamEvents holds no slot
+		// between passes and bounds each read on its own.
+		if !rt.streaming {
+			ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
 
 		if !rt.bypassSemaphore {
-			release, err := s.acquire(ctx, rec)
+			release, err := s.acquire(r.Context(), rec)
 			if err != nil {
 				s.failErr(w, r, err)
 				return

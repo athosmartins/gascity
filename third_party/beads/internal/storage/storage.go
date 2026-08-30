@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/steveyegge/beads/internal/types"
@@ -44,7 +45,12 @@ type CloseOpenChildrenError = issueops.CloseOpenChildrenError
 // ErrNotOwner is returned when an actor tries to unclaim an issue that is claimed
 // by a different actor. Releasing another actor's claim requires the force
 // escape hatch (bd unclaim --force), reserved for admin/reaper use.
-var ErrNotOwner = errors.New("issue claimed by a different actor")
+//
+// It is an ALIAS of issueops.ErrNotOwner, which now declares it: a refusal the
+// public Releaser role raises has to be classifiable by a caller that cannot
+// import this package. The identity is preserved, so every errors.Is site in
+// the tree keeps matching the same value.
+var ErrNotOwner = issueops.ErrNotOwner
 
 // ErrCommitIndeterminate marks a write error whose durable outcome may be
 // unknown. Such errors must not be replayed because the write may already have
@@ -67,7 +73,7 @@ var ErrCommitIndeterminate = errors.New("write commit result indeterminate")
 // before wrapping it in an issueops.ClaimConflictError. That type's Error() is
 // a PASSTHROUGH, so the fragments must be in the wrapped error; a caller
 // reading the type's FIELDS needs none of this. These stay for the parser, and
-// TestClaimConflictFormatRoundTrip (internal/storage/dolt) plus the
+// the conformance suite's RunClaimRefusalMessagesCarryTheirFragments plus the
 // root-package ParseClaimConflict tests are the tripwires that producer and
 // consumer still agree character for character.
 //
@@ -240,6 +246,14 @@ type Storage interface {
 	// walk has a depth, a cycle policy and a node shape of its own. Reads fire
 	// no hooks, as for IssueReader.
 	TreeWalker() (issueops.TreeWalker, error)
+	// GraphCounter returns the guarded edge-count surface for this store: how
+	// many dependency edges each of several anchors has, in one named
+	// direction, spanning both dependency planes. Its own role rather than a
+	// third Counter method (that one's predicate is a filter over the issues
+	// table and says nothing about an edge) and rather than a counted
+	// EdgeReader (that one answers with the stored ROWS, outbound only). Reads
+	// fire no hooks, as for IssueReader.
+	GraphCounter() (issueops.GraphCounter, error)
 	// ReadyCounter returns the guarded ready-count surface for this store: the
 	// size of the ready set, which is the number `bd ready`'s pagination
 	// publishes and which no other role answers. Counter's predicate is a
@@ -293,6 +307,39 @@ type Storage interface {
 	//
 	// Reads fire no hooks, as for IssueReader.
 	InitVerifier() (issueops.InitVerifier, error)
+	// MetadataCAS returns the conditional single-key metadata write for this
+	// store: set metadata[key] only if it currently holds the value the caller
+	// expected. It is its own role rather than another Lifecycle guard because
+	// Lifecycle's ExpectedVersion/Assignee/Status gate an ordinary edit on the
+	// row's LIFECYCLE, and coordination state that is not a claim lives on keys
+	// the caller invented, which no lifecycle guard can name.
+	//
+	// It is a WRITE role and its hook decorator WRAPS: a swap that lands is an
+	// update to an issue, which is a hook the vocabulary publishes. See
+	// hook_metadata_cas.go.
+	MetadataCAS() (issueops.MetadataCAS, error)
+	// BatchApplier returns the guarded apply-many surface for this store:
+	// a HETEROGENEOUS list of creates, updates, closes and edges applied in
+	// declaration order as one durable act. It is its own role rather than a
+	// fifth batch verb because its unit is a PLAN — create these, wire them,
+	// close the step that spawned them — and each of BatchCreator, BatchCloser
+	// and DependencyEditor is one verb repeated, so composing two of them means
+	// two transactions with a window in between.
+	//
+	// It is a WRITE role and its hook decorator WRAPS: every landed item is an
+	// event the hook vocabulary publishes. See hook_batch_applier.go.
+	BatchApplier() (issueops.BatchApplier, error)
+	// Releaser returns the claim-release surface for this store: give up the
+	// claim on one issue, optionally only while a named holder still has it.
+	// It is its own role beside IssueClaimer rather than a method on it,
+	// because a caller entitled to release its own work is often not entitled
+	// to take new work, and a surface carrying both hands it a capability it
+	// should not be able to reach.
+	//
+	// It is a WRITE role and its hook decorator WRAPS: a release changes
+	// assignee and status, which is on_update — the same event the journal
+	// already records for it. See hook_releaser.go.
+	Releaser() (issueops.Releaser, error)
 
 	// Issue CRUD
 	CreateIssue(ctx context.Context, issue *types.Issue, actor string) error
@@ -403,6 +450,13 @@ type Storage interface {
 	GetIssueCommentsPage(ctx context.Context, issueID string, after CommentPageCursor, limit int) ([]*types.Comment, error)
 	GetEvents(ctx context.Context, issueID string, limit int) ([]*types.Event, error)
 	GetAllEventsSince(ctx context.Context, since time.Time) ([]*types.Event, error)
+
+	// Provenance is an append-only event log binding issues to opaque external
+	// artifacts (git SHAs, PRs, work-ids). Record is idempotent on a
+	// deterministic id; there is deliberately no update or delete operation.
+	RecordProvenanceEvent(ctx context.Context, ev types.ProvenanceEvent) (id string, inserted bool, err error)
+	GetProvenanceEvents(ctx context.Context, issueID string, kindFilter string) ([]types.ProvenanceEvent, error)
+	GetProvenanceByRef(ctx context.Context, ref string) ([]types.ProvenanceEvent, error)
 
 	// Aggregate counts — cheaper than materializing rows when only cardinality is needed.
 	// Filter.Limit and Filter.Offset are ignored by CountIssues; all others apply.
@@ -687,6 +741,134 @@ type BlockedRecomputer interface {
 // GetCurrentCommit when the store does not implement it.
 type StateHasher interface {
 	GetStateHash(ctx context.Context) (string, error)
+}
+
+// EventsJournalRow is one raw bd_events_journal row surfaced to the
+// `bd events` CLI. IssueJSON is empty when the op is a delete (no surviving
+// row); DepJSON is empty for non-dependency ops; CommentJSON is empty for
+// non-comment ops. TS is the insert-time timestamp (stamped inside the
+// committing transaction) normalized to a string.
+type EventsJournalRow struct {
+	Seq         int64
+	TS          string
+	Op          string
+	IssueID     string
+	IssueJSON   string
+	DepJSON     string
+	CommentJSON string
+}
+
+// EventsJournalTruncatedCode is the stable machine-readable code a consumer
+// matches on when its checkpoint has fallen below the retained journal window.
+const EventsJournalTruncatedCode = "events_journal_truncated"
+
+// EventsJournalTruncatedError reports that a sequential read cannot resume from
+// the caller's checkpoint because the rows it needs next were pruned.
+//
+// Without it, `WHERE seq > since` cannot distinguish "nothing new" from "your
+// prefix is gone": a consumer resuming past a prune would either see an empty
+// success and stall forever, or silently skip to the current floor and lose
+// every record in between. Both are silent data loss, so the read fails loudly
+// instead and hands back the window it can actually serve.
+//
+// Floor is the lowest seq still retained, or Head+1 when the journal holds no
+// rows at all. Head is the highest seq the counter has ever assigned; it never
+// decreases under a prune, so Floor > Head means "fully pruned, caught up to
+// Head". A consumer that receives this must decide explicitly — resume from
+// Floor-1 and accept the gap, or rebuild from scratch — and the engine does not
+// decide for it.
+type EventsJournalTruncatedError struct {
+	// Since is the checkpoint the reported window begins after, which is the
+	// caller's own checkpoint in every case except one.
+	//
+	// When the rows the read can serve start above the caller's checkpoint —
+	// the ordinary "your prefix was pruned" case — Since IS that checkpoint and
+	// Floor is the first row still retained.
+	//
+	// When the prefix is intact but the retained window has an interior hole
+	// (a restored or hand-edited table; bd's own prune cannot produce one),
+	// Since is instead the last seq the engine could serve contiguously from
+	// the caller's checkpoint, and Floor is where the next intact island
+	// starts. A batch with BOTH shapes reports the prefix one; the interior
+	// hole is reported on the next read, once the caller has resumed past the
+	// first. Every gap is surfaced, one resume at a time.
+	//
+	// Since therefore never reports a value BELOW what the caller presented, so
+	// echoing it back can never make a consumer re-read records it already has.
+	Since int64
+	// Floor is the lowest retained seq (Head+1 when nothing is retained).
+	Floor int64
+	// Head is the highest seq ever assigned.
+	Head int64
+}
+
+func (e *EventsJournalTruncatedError) Error() string {
+	return fmt.Sprintf(
+		"events journal truncated: checkpoint %d is below the retained window [%d..%d]; records %d..%d were pruned",
+		e.Since, e.Floor, e.Head, e.Since+1, e.Floor-1)
+}
+
+// EventsJournalPage is one journal read that also reports how far behind the
+// caller is: the rows it asked for, and the head of the journal's history at
+// the moment they were read.
+//
+// The two travel together because they are only meaningful together. Rows alone
+// cannot answer "poll again now, or wait?" — a full page might be the end of
+// the journal or the first thousand of a hundred thousand — and a head read
+// separately could be taken from a different instant and land BELOW the last
+// row served, which a consumer reads as "past the end" and stalls on.
+//
+// Head is the highest seq the counter has ever assigned. It never decreases
+// under a prune (see EventsJournalTruncatedError), so it is the journal's
+// history rather than its contents: a fully pruned journal reports its rows
+// gone and its head unchanged.
+type EventsJournalPage struct {
+	Rows []EventsJournalRow
+	Head int64
+}
+
+// EventsJournalCursor is the READ-ONLY half of the journal seam, for a consumer
+// that pages through the journal with a checkpoint.
+//
+// It is separate from EventsJournalAccessor rather than a method on it because
+// of who holds it. Retention is an operator decision made by the workspace
+// (`bd events prune` and the automatic bounding); a surface that only PUBLISHES
+// the journal — bd serve's GET /v0/beads/events — must not be handed a delete.
+// Narrowing the interface is what makes "this surface cannot prune" a fact
+// about the type rather than a promise about the handler.
+type EventsJournalCursor interface {
+	// ReadEventsJournalPage returns rows with seq greater than since, ordered
+	// by seq ascending and capped by limit (0 = no cap), together with the
+	// journal head read in the same transaction. It returns
+	// *EventsJournalTruncatedError on the same terms ReadEventsJournal does.
+	ReadEventsJournalPage(ctx context.Context, since int64, limit int) (EventsJournalPage, error)
+}
+
+// EventsJournalAccessor reads and prunes the durable events journal
+// (bd_events_journal) through the store's own transaction machinery. Unlike
+// RawDBAccessor — which only the server-mode store provides — this works on the
+// embedded store too, which owns its connections and exposes no stable *sql.DB.
+// Callers that need the journal should type-assert to this interface; a caller
+// that only reads should ask for EventsJournalCursor instead.
+type EventsJournalAccessor interface {
+	// ReadEventsJournal returns rows with seq greater than since, ordered by
+	// seq ascending, optionally capped by limit (0 = no cap). It returns
+	// *EventsJournalTruncatedError when since sits below the retained window.
+	ReadEventsJournal(ctx context.Context, since int64, limit int) ([]EventsJournalRow, error)
+	// PruneEventsJournal deletes rows with seq below before, honoring the
+	// retain-days / retain-rows floors (0 = floor disabled), and returns the
+	// number of rows deleted.
+	PruneEventsJournal(ctx context.Context, before int64, retainDays, retainRows int) (int64, error)
+}
+
+// EventsJournalConfigurer controls durable events journal activation on ONE
+// storage instance. Implementations must never use process-global state: a
+// process can hold several stores at once (multiple projects, a test binary's
+// parallel fixtures), and opening one with the journal enabled must not turn it
+// on for any other. Callers type-assert; a store that does not implement it
+// simply cannot journal.
+type EventsJournalConfigurer interface {
+	SetEventsJournalEnabled(enabled bool)
 }
 
 // LifecycleManager provides lifecycle inspection beyond Close().

@@ -10,11 +10,13 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/eventsjournal"
 	"github.com/steveyegge/beads/internal/httpapi"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/backends"
 	"github.com/steveyegge/beads/internal/storage/contextinfo"
 	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/issueops"
 	"github.com/steveyegge/beads/memoryops"
 )
@@ -171,15 +173,18 @@ func runServe() error {
 		// runs after this function returns, which is after the server has
 		// fully drained, so no request can reach a closed store. runServe must
 		// not close it.
-		roles, err := serveIssueRoles(store)
+		journalEnabled := eventsjournal.EnabledFor(info.BeadsDir)
+		roles, err := serveIssueRoles(store, journalEnabled)
 		if err != nil {
 			return HandleError("bd serve: %v", err)
 		}
+		defer startServeEventsJournalMaintenance(info.BeadsDir, store)()
 		return serveListen(httpapi.Config{
 			Addr:              serveAddr,
 			AllowNonLoopback:  serveAllowNonLoopback,
 			Reader:            roles.reader,
 			Claimer:           roles.claimer,
+			Lifecycle:         roles.lifecycle,
 			Settings:          roles.settings,
 			Stats:             roles.stats,
 			CycleDetector:     roles.cycles,
@@ -191,14 +196,33 @@ func runServe() error {
 			Sweeper:           roles.sweeper,
 			Deleter:           roles.deleter,
 			BatchCreator:      roles.batchCreator,
+			DependencyEditor:  roles.dependencyEditor,
+			MetadataCAS:       roles.metadataCAS,
+			BatchApplier:      roles.batchApplier,
 			Memories:          roles.memories,
-			Workspace:         info,
-			SchemaVersion:     JSONSchemaVersion,
-			Mode:              serveResolvedMode(info, db),
+			// Nil when this backend has no journal seam and the workspace never
+			// asked for one; Listen requires it exactly when the flag below is
+			// set, and serveIssueRoles has already refused the enabled case.
+			EventsJournal: roles.eventsJournal,
+			// GET /v0/beads/events refuses outright on a workspace that records
+			// nothing, because a disabled journal and an empty one are one
+			// answer at the data level. Resolved ONCE above, so the role
+			// extraction, this flag and the maintenance ticker cannot disagree
+			// about whether this workspace journals.
+			EventsJournalEnabled: journalEnabled,
+			Workspace:            info,
+			SchemaVersion:        JSONSchemaVersion,
+			Mode:                 serveResolvedMode(info, db),
 		})
 	}
 
-	provider := uowProvider
+	// Serve from the provider BENEATH the hook layer. `bd serve` documents that
+	// it runs no hooks — a user-controlled subprocess per mutation is an
+	// unbounded latency multiplier and an orphaned child at shutdown — while
+	// proxied mode wires a notifying provider so the CLI's own writes keep
+	// firing them. This is the unit-of-work twin of the
+	// (*storage.HookFiringStore).Unwrap the store-shaped source takes.
+	provider := uow.UnwrapProvider(uowProvider)
 	if provider == nil {
 		// Server, external-server and shared-server workspaces: PersistentPreRunE
 		// builds a DoltStore for those and no unit-of-work provider, so serve
@@ -239,14 +263,56 @@ func runServe() error {
 		provider = p
 	}
 
+	defer startServeEventsJournalMaintenance(info.BeadsDir, provider)()
+
 	return serveListen(httpapi.Config{
 		Addr:             serveAddr,
 		AllowNonLoopback: serveAllowNonLoopback,
 		Provider:         provider,
-		Workspace:        info,
-		SchemaVersion:    JSONSchemaVersion,
-		Mode:             serveResolvedMode(info, db),
+		// No EventsJournal field on this arm: the provider carries the journal
+		// read as one of its own capability accessors, exactly as it carries
+		// every other role Listen would otherwise need spelled out. Activation
+		// is still the workspace's answer and still has to be handed in — the
+		// provider knows how to READ the journal, not whether this workspace has
+		// one.
+		EventsJournalEnabled: eventsjournal.EnabledFor(info.BeadsDir),
+		Workspace:            info,
+		SchemaVersion:        JSONSchemaVersion,
+		Mode:                 serveResolvedMode(info, db),
 	})
+}
+
+// startServeEventsJournalMaintenance runs events-journal retention for the life
+// of the server and returns the function that stops it.
+//
+// A server is not a command, so it is excluded from the per-command maintenance
+// net (runsPostCommandMaintenance) — including the writer-pays auto-prune
+// trigger that fires after a CLI mutation. Without this, the one topology that
+// journals fastest, because it is the one accepting concurrent HTTP mutations
+// for hours, would be the one that never prunes. A ticker is the honest shape
+// for a process with no command boundary: it polls, and the same persisted
+// watermark every CLI process reads decides whether a pass is actually due, so
+// a server and the CLIs beside it share one schedule rather than three.
+//
+// The stop is deferred by the caller so it runs after the server has drained:
+// maintenance and requests overlap freely (both are ordinary transactions), but
+// nothing should still be deleting when the provider closes underneath it.
+func startServeEventsJournalMaintenance(beadsDir string, source any) func() {
+	if !eventsjournal.EnabledFor(beadsDir) || !eventsjournal.AutoPruneEnabledFor(beadsDir) {
+		return func() {}
+	}
+	// The plumbing this server answers FROM, not whatever the root pre-run left
+	// in a global: on the server-mode arm serve builds its own provider, and
+	// maintaining a journal through a different handle than the one writing it
+	// is how a topology ends up pruning the wrong database.
+	runner := eventsJournalMaintenanceRunnerFor(source)
+	if runner == nil {
+		return func() {}
+	}
+	return eventsjournal.StartAutoPruneTicker(rootCtx, runner,
+		eventsjournal.DefaultAutoPruneTickInterval,
+		eventsJournalAutoPruneOptions(),
+		reportEventsJournalAutoPrune)
 }
 
 // serveListen binds and runs. It is where the two database sources converge:
@@ -414,7 +480,7 @@ func errServeEmbedded() error {
 // It returns the WHOLE set httpapi.Config requires; Listen refuses a partial
 // set (see checkDatabaseSource), so a role missing here is a startup failure
 // rather than a nil dereference on the first request that reaches it.
-func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
+func serveIssueRoles(src storage.DoltStorage, journalEnabled bool) (serveRoles, error) {
 	var roles serveRoles
 	if src == nil {
 		// A set of nil roles would reach Listen as "no database source" —
@@ -434,6 +500,7 @@ func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
 	for _, b := range []binding{
 		{"issue reader", func() (err error) { roles.reader, err = src.IssueReader(); return }},
 		{"issue claimer", func() (err error) { roles.claimer, err = src.IssueClaimer(); return }},
+		{"issue lifecycle", func() (err error) { roles.lifecycle, err = src.IssueLifecycle(); return }},
 		{"workspace config", func() (err error) { roles.settings, err = src.WorkspaceConfig(); return }},
 		{"stats reporter", func() (err error) { roles.stats, err = src.StatsReporter(); return }},
 		{"cycle detector", func() (err error) { roles.cycles, err = src.CycleDetector(); return }},
@@ -445,7 +512,34 @@ func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
 		{"sweeper", func() (err error) { roles.sweeper, err = src.Sweeper(); return }},
 		{"deleter", func() (err error) { roles.deleter, err = src.Deleter(); return }},
 		{"batch creator", func() (err error) { roles.batchCreator, err = src.BatchCreator(); return }},
+		{"dependency editor", func() (err error) { roles.dependencyEditor, err = src.DependencyEditor(); return }},
+		{"metadata cas", func() (err error) { roles.metadataCAS, err = src.MetadataCAS(); return }},
+		{"batch applier", func() (err error) { roles.batchApplier, err = src.BatchApplier(); return }},
 		{"memories", func() (err error) { roles.memories, err = src.Memories(); return }},
+		{"events journal", func() error {
+			// storage.UnwrapStore rather than the ONE peel above, and that is not
+			// an exception to this function's rule — it is the rule applied to a
+			// capability that no decorator publishes. The hook and telemetry
+			// layers wrap ROLES; neither implements the journal seam, so the
+			// assertion has to reach the concrete store or it finds nothing at
+			// all. Nothing is skipped by going the whole way: there is no
+			// journal decorator to peel past.
+			cursor, ok := storage.UnwrapStore(src).(storage.EventsJournalCursor)
+			if ok {
+				roles.eventsJournal = cursor
+				return nil
+			}
+			// A backend that cannot read the journal is an ordinary backend
+			// while the workspace records nothing — the journal is off by
+			// default, and eventsjournal.Apply takes exactly this deal when it
+			// binds activation at open time. Only an ENABLED workspace has
+			// asked for something this backend cannot do, and the message is
+			// the one `bd events` prints for the same condition.
+			if journalEnabled {
+				return fmt.Errorf("storage backend does not support the events journal")
+			}
+			return nil
+		}},
 	} {
 		if err := b.get(); err != nil {
 			return serveRoles{}, fmt.Errorf("%s: %w", b.name, err)
@@ -461,6 +555,7 @@ func serveIssueRoles(src storage.DoltStorage) (serveRoles, error) {
 type serveRoles struct {
 	reader       issueops.Reader
 	claimer      issueops.Claimer
+	lifecycle    issueops.Lifecycle
 	settings     issueops.WorkspaceConfig
 	stats        issueops.StatsReporter
 	cycles       issueops.CycleDetector
@@ -472,10 +567,36 @@ type serveRoles struct {
 	sweeper      issueops.Sweeper
 	deleter      issueops.Deleter
 	batchCreator issueops.BatchCreator
+	// dependencyEditor is the second role here whose accessor recurses through
+	// the hook decorator, so taking it off the peeled store is not optional:
+	// HookFiringStore.DependencyEditor fires the workspace's update hook per
+	// edited source issue, and this server documents that hooks do not fire.
+	dependencyEditor issueops.DependencyEditor
+	// metadataCAS is the conditional single-key metadata write. Its accessor
+	// recurses through the hook decorator, so the ONE peel above is what keeps
+	// this server from running the workspace's on_update script per swap.
+	metadataCAS issueops.MetadataCAS
+	// batchApplier is the role that makes the ONE peel above matter most, and
+	// the arithmetic is what makes it worth its own sentence. Its hook wrapper
+	// fires FOUR vocabularies from one call — on_create for every created item,
+	// on_update for every changed update AND once per distinct edge source, and
+	// the close hooks for every close that landed — so one hundred-item plan
+	// served from an unpeeled applier is up to a hundred of the workspace's own
+	// subprocesses spawned inside a single HTTP request, holding a write
+	// transaction open while they run. Every other role here costs at most one
+	// per mutation.
+	batchApplier issueops.BatchApplier
 	// memories is the one role here that is not an issueops role: the memory
 	// plane is user data riding in the config table under its own merge class,
 	// so it has its own leaf package.
 	memories memoryops.Memories
+	// eventsJournal is the only role here that comes from a TYPE ASSERTION
+	// rather than an accessor, because the journal is not part of DoltStorage's
+	// published surface: it is engine state on a dolt_ignored table that the two
+	// concrete stores implement and a backend may not. Missing it is a startup
+	// error rather than a route that 500s, which is the same deal every other
+	// role here takes.
+	eventsJournal storage.EventsJournalCursor
 }
 
 // serveResolvedMode labels the topology for the startup log line. Cosmetic —

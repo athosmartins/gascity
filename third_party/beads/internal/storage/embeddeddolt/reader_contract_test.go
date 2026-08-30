@@ -33,20 +33,26 @@ func TestEmbeddedReaderReadyLimitBoundary(t *testing.T) {
 	conformance.RunReaderReadyLimitBoundary(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
-func TestEmbeddedReaderOffsetIsHonoredOrRefused(t *testing.T) {
+func TestEmbeddedReaderOffsetSkipsTheRowsBeforeThePage(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	ctx := t.Context()
-	conformance.RunReaderOffsetIsHonoredOrRefused(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+	conformance.RunReaderOffsetSkipsTheRowsBeforeThePage(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
 // SkipCounts matters most HERE. The aggregate it drops is the reverse-blocker
 // join, whose COALESCE key the pure-Go analyzer cannot auto-index — so this is
 // the engine where the knob is worth having, and the one where an
 // implementation that quietly ignored it would be least visible.
-func TestEmbeddedReaderListMaxRowsIsHonoredOrRefused(t *testing.T) {
+func TestEmbeddedReaderListMaxRowsIsHonored(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	ctx := t.Context()
-	conformance.RunReaderListMaxRowsIsHonoredOrRefused(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+	conformance.RunReaderListMaxRowsIsHonored(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListMaxRowsBoundaryIsLimitPlusOffset(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListMaxRowsBoundaryIsLimitPlusOffset(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
 func TestEmbeddedReaderListSkipCountsDropsTheCardinalitiesAndNothingElse(t *testing.T) {
@@ -155,6 +161,72 @@ func TestEmbeddedReaderDoesNotMutateTheCallerRequest(t *testing.T) {
 	skipUnlessEmbeddedDolt(t)
 	ctx := t.Context()
 	conformance.RunReaderDoesNotMutateTheCallerRequest(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+// One body, the other engine. The counts mega-query's reverse-blocker join is
+// the one the pure-Go planner cannot index, which is why the by-ids page-down
+// path these cases drive exists at all — so an engine-level disagreement about
+// it shows here rather than at the server-backed wiring.
+func TestEmbeddedReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyPageIsThePrefixOfTheUnboundedAnswerCountsIncluded(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyEphemeralPageKeepsBothPlanesCountsAtItsBoundary(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyPageWiderThanTheHydrationBatchIsStillThatPrefix(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListCountsAreBlocksOnlyWhereGetCountsEveryEdge(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderReadyParentScopesToItsTransitiveDescendants(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderReadyParentScopesToItsTransitiveDescendants(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+// The id prefix is a LIKE against a binary-collated column on this engine, so
+// the cased-sibling half of the case has its most plausible failure mode here.
+func TestEmbeddedReaderListParentReachesEveryDescendantAndOnlyItsOwn(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListParentReachesEveryDescendantAndOnlyItsOwn(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListKeysetWalkOverAnOversizedGroupLosesNothingAndRepeatsNothing(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListKeysetPositionNarrowsWithoutReplacingTheOtherPredicates(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListIncludeEphemeralMergesThePlanesIntoOneOrder(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListIncludeEphemeralMergesThePlanesIntoOneOrder(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
+}
+
+func TestEmbeddedReaderListWispTypeNarrowsTheAdmittedPlaneRatherThanAdmittingIt(t *testing.T) {
+	skipUnlessEmbeddedDolt(t)
+	ctx := t.Context()
+	conformance.RunReaderListWispTypeNarrowsTheAdmittedPlaneRatherThanAdmittingIt(t, ctx, newEmbeddedReaderFixture(t, "rdr"))
 }
 
 // newEmbeddedReaderFixture composes the shared role kit with the reader

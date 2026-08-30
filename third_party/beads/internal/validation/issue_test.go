@@ -144,6 +144,71 @@ func TestNotPinned(t *testing.T) {
 	}
 }
 
+func TestCanonicalActor(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty stays empty", in: "", want: ""},
+		{name: "no separators is unchanged", in: "alice", want: "alice"},
+		{name: "dot separator canonicalizes", in: "gastown.mayor", want: "gastown_mayor"},
+		{name: "double-underscore separator canonicalizes to the same form", in: "gastown__mayor", want: "gastown_mayor"},
+		{name: "hyphen separator canonicalizes to the same form", in: "gastown-mayor", want: "gastown_mayor"},
+		{name: "single underscore is already canonical", in: "gastown_mayor", want: "gastown_mayor"},
+		{name: "mixed separators each collapse to one canonical separator", in: "gastown.dog-3", want: "gastown_dog_3"},
+		{name: "leading separator is preserved as a separator, not dropped", in: ".mayor", want: "_mayor"},
+		{name: "trailing separator is preserved as a separator, not dropped", in: "mayor.", want: "mayor_"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CanonicalActor(tt.in); got != tt.want {
+				t.Errorf("CanonicalActor(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestActorMatches(t *testing.T) {
+	tests := []struct {
+		name     string
+		assignee string
+		actor    string
+		want     bool
+	}{
+		{name: "byte-identical matches", assignee: "alice", actor: "alice", want: true},
+		{name: "different spellings of the same identity match (ga-wzl83)", assignee: "gastown.mayor", actor: "gastown__mayor", want: true},
+		{name: "genuinely different identities do not match", assignee: "gastown.mayor", actor: "gastown.dog-3", want: false},
+		{name: "both empty match", assignee: "", actor: "", want: true},
+		{name: "empty assignee never matches a non-empty actor", assignee: "", actor: "mayor", want: false},
+		// wa-msxg5: an agent's bare name and that agent's own session-qualified
+		// actor string are the same identity at two granularities.
+		{name: "session suffix of the assignee matches (wa-msxg5)", assignee: "batista-wa", actor: "batista-wa-awisplqy3swl", want: true},
+		{name: "session suffix match is symmetric in argument order (wa-msxg5)", assignee: "batista-wa-awisplqy3swl", actor: "batista-wa", want: true},
+		{name: "session suffix composes with delimiter canonicalization (wa-msxg5)", assignee: "gastown.mayor", actor: "gastown_mayor__somesession", want: true},
+		{name: "exact repro from the bug report matches (wa-msxg5)", assignee: "peter-wa", actor: "peter-wa-gack5xf", want: true},
+		// Regression guards — the whole point of the fix is to stop matching
+		// on a bare shared prefix, only on a real canonical-separator boundary.
+		{name: "a different agent's session does not match (wa-msxg5 regression guard)", assignee: "batista-wa", actor: "thies-wa-gapfne3", want: false},
+		{name: "a name that only looks like a prefix does not match (wa-msxg5 collision guard)", assignee: "X", actor: "X2-something", want: false},
+		{name: "empty assignee never matches a session-suffixed actor either (wa-msxg5)", assignee: "", actor: "-session", want: false},
+		// Documented scope limit (see canonicalSessionSuffix): this is a
+		// structural check, not a registry lookup, so any well-formed suffix
+		// passes — bd has no way to confirm the suffix names a session it has
+		// actually seen.
+		{name: "any well-formed suffix matches — no session registry to verify against (wa-msxg5, documented scope limit)", assignee: "batista-wa", actor: "batista-wa-anything-at-all", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ActorMatches(tt.assignee, tt.actor); got != tt.want {
+				t.Errorf("ActorMatches(%q, %q) = %v, want %v", tt.assignee, tt.actor, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestAssigneeMatches(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -190,6 +255,41 @@ func TestAssigneeMatches(t *testing.T) {
 			name:        "empty actor with assigned bead fails",
 			issue:       &types.Issue{ID: "bd-test", Assignee: "bob"},
 			actor:       "",
+			wantErr:     true,
+			wantErrFrag: "assignee is",
+		},
+		// ga-wzl83: the assignee is stored under one layer's spelling of an
+		// identity ("gastown.mayor") while actor resolution can hand back a
+		// DIFFERENT layer's spelling of the SAME identity — a session name
+		// sanitizes the dot to "__" because a dot is unsafe there. The owner
+		// closing its own bead must not need --force just because two layers
+		// spelled its name differently.
+		{
+			name:    "same identity under session-name spelling passes (ga-wzl83)",
+			issue:   &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
+			actor:   "gastown__mayor",
+			wantErr: false,
+		},
+		{
+			name:    "same identity under hyphen spelling passes",
+			issue:   &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
+			actor:   "gastown-mayor",
+			wantErr: false,
+		},
+		{
+			name:    "same identity under single-underscore spelling passes",
+			issue:   &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
+			actor:   "gastown_mayor",
+			wantErr: false,
+		},
+		// The control that keeps the guard from becoming a no-op: a genuinely
+		// DIFFERENT agent must still be refused, even though its own name also
+		// contains separator characters that canonicalize.
+		{
+			name:        "genuinely different identity stays rejected despite shared separators",
+			issue:       &types.Issue{ID: "bd-test", Assignee: "gastown.mayor"},
+			actor:       "gastown.dog-3",
+			force:       false,
 			wantErr:     true,
 			wantErrFrag: "assignee is",
 		},
@@ -299,6 +399,31 @@ func TestAssigneeNotStolen(t *testing.T) {
 			actor:       "alice",
 			newAssignee: "alice",
 			pools:       nil,
+			wantErr:     true,
+		},
+		// ga-wzl83: same class as AssigneeMatches — actor and newAssignee are
+		// compared against the stored assignee under CanonicalActor, so a
+		// different layer's spelling of the current holder's own identity is
+		// not mistaken for a stranger.
+		{
+			name:        "actor editing its own claim passes under a different spelling",
+			issue:       inProgress("gastown.mayor"),
+			actor:       "gastown__mayor",
+			newAssignee: "bob",
+			wantErr:     false,
+		},
+		{
+			name:        "idempotent re-assert under a different spelling of the current holder passes",
+			issue:       inProgress("gastown.mayor"),
+			actor:       "alice",
+			newAssignee: "gastown__mayor",
+			wantErr:     false,
+		},
+		{
+			name:        "different identity with shared separators still refused",
+			issue:       inProgress("gastown.mayor"),
+			actor:       "gastown.dog-3",
+			newAssignee: "gastown.dog-3",
 			wantErr:     true,
 		},
 	}

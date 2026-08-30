@@ -3,6 +3,8 @@ package issueops
 import (
 	"errors"
 	"fmt"
+
+	"github.com/steveyegge/beads/beadserrors"
 )
 
 // ErrAlreadyClaimed is returned when attempting to claim an issue that is already
@@ -41,43 +43,57 @@ func (e *ClaimConflictError) Error() string { return e.Err.Error() }
 // Unwrap makes ClaimConflictError match the refusal it carries.
 func (e *ClaimConflictError) Unwrap() error { return e.Err }
 
-// ErrUnsupported reports something the caller asked for that this backend
-// cannot serve — a capability accessor it does not implement, or a request
-// field it will not honor. It is a TYPE rather than a sentinel because the
-// two facts a caller needs are which operation refused and which backend
-// refused it, and neither survives a formatted string.
+// ErrUnsupported reports a capability this backend does not serve. It is an
+// alias of beadserrors.ErrUnsupported — the same type, so one errors.As arm
+// matches it under either name — and it is re-exported here because a caller
+// holding an issueops role should not have to discover a second package to
+// classify the refusal.
 //
-// A backend returns it instead of quietly doing something narrower. The case
-// that made that rule explicit is Reader's Offset: the store-backed body
-// rendered LIMIT without OFFSET, so a caller that paged with it received the
-// first page over and over with no error to notice.
-//
-// It lives here so a caller holding only a role interface can classify the
-// refusal with errors.As without importing internal/storage.
-type ErrUnsupported struct {
-	Op      string // method name, e.g. "AddLabel" or "Transaction.CreateIssues"
-	Backend string // e.g. "dolt-server"
-}
+// It is declared there rather than here because the capability shell is not an
+// issue concept: a memory role can go unimplemented by a backend exactly as a
+// Reader can.
+type ErrUnsupported = beadserrors.ErrUnsupported
 
-func (e *ErrUnsupported) Error() string {
-	return fmt.Sprintf("operation %q not supported by the %s backend", e.Op, e.Backend)
-}
-
-// ErrAssigneeMismatch is returned by UnclaimIssueIfAssignee when the issue's
-// current assignee does not match the expected assignee (including when the
-// issue is no longer assigned at all). The caller's view of the claim was
-// stale; the issue is left untouched.
+// ErrAssigneeMismatch is returned by a conditional release or update whose
+// ExpectedAssignee does not match the issue's current assignee (including when
+// the issue is no longer assigned at all). The caller's view of the claim was
+// stale; the issue is left untouched. See Releaser.Release and
+// UpdateRequest.ExpectedAssignee.
 var ErrAssigneeMismatch = errors.New("assignee mismatch")
 
-// ErrNotFound is returned when a requested entity does not exist in the database.
-var ErrNotFound = errors.New("not found")
+// ErrNotOwner is returned when an actor tries to release a claim that a
+// different actor holds. Releasing another actor's claim requires the force
+// escape hatch (ReleaseRequest.Force, `bd unclaim --force`), reserved for
+// abandoned claims — or ReleaseRequest.ExpectedAssignee, which authorizes the
+// same thing by naming the holder instead of ignoring it.
+//
+// It is DECLARED here and re-exported by internal/storage rather than the other
+// way round, which is the direction the memoryops slice settled: a Go alias
+// preserves identity in both directions, so every existing storage.ErrNotOwner
+// reference keeps matching this identical value, and a caller holding only the
+// public role can now classify the refusal without importing an internal
+// package it cannot reach. It is the ownership half of the same vocabulary
+// ErrAssigneeMismatch above belongs to, which is why it is here rather than
+// beside Releaser: both refusals answer "whose claim is this".
+var ErrNotOwner = errors.New("issue claimed by a different actor")
 
-// ErrValidation classifies deterministic request-validation failures.
-var ErrValidation = errors.New("validation failed")
-
-// ErrNotInitialized is returned when the database has not been initialized
-// (e.g., issue_prefix config is missing).
-var ErrNotInitialized = errors.New("database not initialized")
+// The namespace-neutral part of this vocabulary is declared by beadserrors and
+// re-exported here. These are ALIASES, so they are the same values: every
+// existing issueops.ErrX reference and every errors.Is site keeps matching the
+// identical error, and a leaf that never imports issueops still matches it too.
+//
+// They live down there because none of them names an issue: a request can be
+// invalid, a row can be missing and a database can be uninitialized on any
+// plane. The refusals BELOW that name issue concepts stay here.
+var (
+	// ErrNotFound is returned when a requested entity does not exist in the database.
+	ErrNotFound = beadserrors.ErrNotFound
+	// ErrValidation classifies deterministic request-validation failures.
+	ErrValidation = beadserrors.ErrValidation
+	// ErrNotInitialized is returned when the database has not been initialized
+	// (e.g., issue_prefix config is missing).
+	ErrNotInitialized = beadserrors.ErrNotInitialized
+)
 
 // ErrPrefixMismatch is returned when an issue ID does not match the configured prefix.
 var ErrPrefixMismatch = errors.New("prefix mismatch")
@@ -191,6 +207,51 @@ func (e *DependencyTypeConflictError) Error() string {
 	return fmt.Sprintf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
 		e.IssueID, e.DependsOnID, e.ExistingType, e.RequestedType)
 }
+
+// ErrDependencySourceNotFound is returned when an edge's SOURCE names no row
+// this database holds. An edge follows its source, so there is no plane for it
+// to land in and no event stream to record it on.
+var ErrDependencySourceNotFound = errors.New("dependency source not found")
+
+// ErrDependencyTargetNotFound is returned when an edge's TARGET names no row
+// this database holds AND is one whose absence this database can SEE: an id in
+// its own namespace, carrying no "external:" marker. An "external:" reference
+// and an id belonging to another repository are accepted as external targets,
+// so neither raises this.
+//
+// It is a separate sentinel from the source's because the two are separate
+// answers. A ghost source is always a bad id; a target is only refused when
+// this database is the one that would have held it, which is a narrower claim
+// and the one a caller has to reason about before retrying.
+var ErrDependencyTargetNotFound = errors.New("dependency target not found")
+
+// DependencyEndpointNotFoundError reports which endpoint of a refused edge was
+// absent, read inside the transaction that refused it. It wraps the refusal
+// rather than replacing it, so the sentinel still matches, the message stays
+// what it was, and a caller classifies the refusal from typed fields instead of
+// parsing prose — the ClaimConflictError arrangement, applied to the graph.
+//
+// It carries the whole edge rather than only the missing id because the request
+// is all-or-nothing: the refusal is the REQUEST's, so a caller reporting which
+// of its own edges was rejected has to find it by both endpoints.
+type DependencyEndpointNotFoundError struct {
+	// IssueID and DependsOnID name the refused edge.
+	IssueID     string
+	DependsOnID string
+	// MissingID is the endpoint that named no row: IssueID for a ghost source,
+	// DependsOnID for a missing target.
+	MissingID string
+	// Err is the wrapped refusal. It matches ErrDependencySourceNotFound or
+	// ErrDependencyTargetNotFound.
+	Err error
+}
+
+func (e *DependencyEndpointNotFoundError) Error() string {
+	return fmt.Sprintf("issue %s not found", e.MissingID)
+}
+
+// Unwrap makes DependencyEndpointNotFoundError match the refusal it carries.
+func (e *DependencyEndpointNotFoundError) Unwrap() error { return e.Err }
 
 // DependencyHierarchyConflictError is returned when a blocking dependency
 // would gate an issue on one of its own ancestors or descendants. Either shape

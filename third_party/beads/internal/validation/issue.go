@@ -3,6 +3,7 @@ package validation
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -70,14 +71,124 @@ func NotPinned(force bool) IssueValidator {
 	}
 }
 
+// CanonicalActor normalizes an identity string so two spellings of the same
+// Gas Town identity compare equal. The same identity arrives at bd in more
+// than one spelling depending on which layer produced the string it was
+// handed: a dotted alias like "gastown.mayor" gets its dot replaced wherever
+// a dot is unsafe for that context — "__" in a session name, "_" in a Dolt
+// table/database name, "-" elsewhere — and bd only ever sees the resulting
+// string, never the substitution itself (ga-wzl83). None of ".", "_", "-"
+// carries meaning in an identity string: each is always a positional
+// separator between a rig and a role/agent name, never part of either name.
+// Collapsing any run of them to one canonical separator lets two spellings
+// of the same identity compare equal without weakening comparisons between
+// genuinely different identities, whose non-separator characters still
+// differ (e.g. "gastown.mayor" vs "gastown.dog-3" stay distinct).
+//
+// Empty stays empty: an actual absence of an actor must never canonicalize
+// to the same value as a non-empty one, or AssigneeMatches would start
+// accepting an empty actor against an assigned issue.
+func CanonicalActor(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inSeparator := false
+	for _, r := range s {
+		switch r {
+		case '.', '_', '-':
+			if !inSeparator {
+				b.WriteByte('_')
+				inSeparator = true
+			}
+		default:
+			b.WriteRune(r)
+			inSeparator = false
+		}
+	}
+	return b.String()
+}
+
+// canonicalSessionSuffix reports whether long is a session incarnation of
+// short: long, once canonicalized, consists of short's canonical form
+// followed by the canonical separator and (optionally) more. Gas Town
+// assigns an issue to an agent's bare name ("batista-wa") but performs the
+// write under that agent's per-session actor string
+// ("batista-wa-awisplqy3swl") — the session is an incarnation of the agent,
+// not a different identity (wa-msxg5), but no amount of delimiter-folding
+// alone (CanonicalActor) makes a shorter assignee string equal a longer,
+// session-qualified actor string naming the same agent. Both arguments must
+// already be canonicalized; short == "" always returns false, or an
+// unassigned issue (CanonicalActor("") == "") would match every actor whose
+// canonical form happens to start with a separator.
+//
+// SCOPE LIMIT, read before extending this: this is a structural check, not
+// an identity check. It cannot confirm the suffix names a session bd has
+// actually seen — bd has no session registry, only the two strings a caller
+// hands it (confirmed by reading every ActorMatches/actorMatches call site
+// in internal/storage: assignee and actor arrive as bare strings, nothing
+// more). The fix originally proposed for wa-msxg5 was to resolve actor to
+// its owning agent via a registry (the same agent_name -> template
+// relationship `gc session list` exposes) and compare agent-to-agent,
+// specifically to close the hole this scope limit leaves open: a genuinely
+// distinct agent whose own name happens to be "<other-agent>-<word>" (e.g. a
+// future "batista-wa-backup") would have ITS sessions match against
+// "batista-wa" too, incorrectly. That registry lookup is not reachable from
+// here — it lives in Gas Town's gc/gascity layer, a dependency this package
+// cannot take without inverting bd's layering (and bd is used outside Gas
+// Town, where no such registry would exist at all).
+//
+// Accepted as the pragmatic fix instead because: (a) it strictly narrows the
+// originally-proposed bare-prefix design, which matched on any shared
+// prefix — this requires an exact canonical-separator boundary, so
+// "batista-wa2" no longer matches "batista-wa"; (b) no agent name in the
+// current Gas Town roster is a separator-extension of another agent's name
+// (verified 2026-08-23, at the time this landed); (c) the bug this fixes
+// (P1, reproduced independently by three agents, blocks every agent from
+// closing its own beads without --force) is real and active today, while
+// the collision this leaves open is hypothetical and, per (b), not
+// currently live. Whoever names a new Gas Town agent should avoid
+// "<existing-agent>-<word>" shapes; whoever later plumbs session-registry
+// data down to bd should replace this with the registry check rather than
+// extend it further.
+func canonicalSessionSuffix(short, long string) bool {
+	if short == "" {
+		return false
+	}
+	return strings.HasPrefix(long, short+"_")
+}
+
+// ActorMatches reports whether actor has the same authority as assignee:
+// they're byte-identical, they canonicalize to the same identity (see
+// CanonicalActor), or one canonicalizes to a session incarnation of the
+// other (see canonicalSessionSuffix, wa-msxg5) — an agent's bare name and
+// that agent's own session-qualified actor string are the same identity at
+// two granularities, and either may legitimately appear in either argument
+// position (some callers compare two assignee-shaped values against each
+// other, not just assignee-then-actor, so the session-suffix check runs
+// both directions). The byte-identical check is not redundant — it avoids
+// paying canonicalization on the overwhelmingly common exact-match path
+// (ga-5ksp5 gate review, #5438: fixes a garbled doc comment, no behavior
+// change).
+func ActorMatches(assignee, actor string) bool {
+	if assignee == actor {
+		return true
+	}
+	ca, cb := CanonicalActor(assignee), CanonicalActor(actor)
+	return ca == cb || canonicalSessionSuffix(ca, cb) || canonicalSessionSuffix(cb, ca)
+}
+
 // AssigneeMatches validates that the actor has authority to close the issue.
 // Authority means the issue is unassigned or the actor matches the current
 // assignee. Returns an error on mismatch unless force is true.
 //
-// Authority is identity-by-string: actor is compared verbatim to assignee, so
-// two principals sharing one actor name both pass. bd has no identity layer,
-// so this matches the existing semantics of the actor field — the guard
-// removes silent cross-actor closes without adding new identity guarantees.
+// Authority is identity-by-string: actor is compared to assignee under
+// CanonicalActor, so two principals sharing one canonical actor name both
+// pass — including the same principal spelled two different ways by two
+// different layers of Gas Town (ga-wzl83). bd has no identity layer, so this
+// matches the existing semantics of the actor field — the guard removes
+// silent cross-actor closes without adding new identity guarantees.
 //
 // This guards against the silent-success bug where actor A closes a bead that
 // was concurrently re-claimed by actor B: storage accepts the close (id-only
@@ -88,7 +199,7 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
 		if issue == nil || force {
 			return nil
 		}
-		if issue.Assignee == "" || issue.Assignee == actor {
+		if issue.Assignee == "" || ActorMatches(issue.Assignee, actor) {
 			return nil
 		}
 		return fmt.Errorf("cannot close %s: assignee is %q, actor is %q; reclaim or use --force to override", id, issue.Assignee, actor)
@@ -101,10 +212,14 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
 // stripping a live claim is what bd unclaim refuses without --force).
 //
 // The refusal fires only when every clause holds; each one is load-bearing:
-//   - Assignee != ""          — unassigned issues are freely assignable.
-//   - Assignee != actor       — an actor editing its own claim is untouched.
-//   - Assignee != newAssignee — an idempotent re-assert of the current holder
-//     stays a success (retry/replay safety on the proxied path).
+//   - Assignee != ""                    — unassigned issues are freely
+//     assignable.
+//   - Assignee doesn't canonicalize to actor       — an actor editing its
+//     own claim is untouched, under any spelling of its own identity.
+//   - Assignee doesn't canonicalize to newAssignee — an idempotent re-assert
+//     of the current holder stays a success (retry/replay safety on the
+//     proxied path), even when the re-assert names the holder under a
+//     different spelling.
 //   - Status == in_progress   — reassigning an OPEN bead stays frictionless:
 //     dispatchers hand-dole open beads and pool-queue takes happen constantly,
 //     which is why this cannot reuse the unclaim/close ownership rule verbatim.
@@ -114,15 +229,18 @@ func AssigneeMatches(actor string, force bool) IssueValidator {
 //     bead. poolAliases is a thunk so call sites don't pay the config read on
 //     the overwhelmingly common non-conflicting paths.
 //
-// Like AssigneeMatches, authority is identity-by-string: bd has no identity
-// layer, so this removes silent cross-actor takeovers without adding new
-// identity guarantees.
+// Like AssigneeMatches, authority is identity-by-string — compared under
+// CanonicalActor rather than verbatim (ga-wzl83), so this removes silent
+// cross-actor takeovers without adding new identity guarantees, and without
+// falsely treating the current holder as a stranger when actor or
+// newAssignee names it under a different layer's spelling of the same
+// identity.
 func AssigneeNotStolen(actor, newAssignee string, poolAliases func() []string, force bool) IssueValidator {
 	return func(id string, issue *types.Issue) error {
 		if issue == nil || force {
 			return nil
 		}
-		if issue.Assignee == "" || issue.Assignee == actor || issue.Assignee == newAssignee {
+		if issue.Assignee == "" || ActorMatches(issue.Assignee, actor) || ActorMatches(issue.Assignee, newAssignee) {
 			return nil
 		}
 		if issue.Status != types.StatusInProgress {

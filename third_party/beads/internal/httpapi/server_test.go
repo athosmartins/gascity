@@ -204,7 +204,12 @@ func (l *lockedBuffer) String() string {
 	return l.b.String()
 }
 
-func newTestServer(t *testing.T, cfg Config) *testServer {
+// newTestServer binds and serves one server for a case. The optional tune
+// functions run between Listen and the first accepted connection, which is
+// where the millisecond-scale knobs (semTimeout, writeStall, the stream
+// cadences and the stream cap) belong: they are fields rather than Config
+// members precisely because they are not deployment configuration.
+func newTestServer(t *testing.T, cfg Config, tune ...func(*Server)) *testServer {
 	t.Helper()
 	stdout := &bytes.Buffer{}
 	stderr := &lockedBuffer{}
@@ -223,6 +228,9 @@ func newTestServer(t *testing.T, cfg Config) *testServer {
 	srv, err := Listen(cfg)
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
+	}
+	for _, apply := range tune {
+		apply(srv)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -586,10 +594,13 @@ func TestCapabilitiesAdvertiseEveryImplementedOperation(t *testing.T) {
 		got = append(got, c.(string))
 	}
 	want := []string{
-		"config.get", "config.list", "dependencies.blocking", "dependencies.cycles",
-		"dependencies.list", "dependencies.tree", "issues.batchCreate",
-		"issues.claim", "issues.delete", "issues.get", "issues.list",
-		"issues.query", "issues.sweep", "memories.forget", "memories.get",
+		"config.get", "config.list", "dependencies.add", "dependencies.blocking",
+		"dependencies.cycles", "dependencies.list", "dependencies.remove",
+		"dependencies.tree", "events.list", "events.watch", "issues.batchApply",
+		"issues.batchCreate", "issues.casMetadata",
+		"issues.claim", "issues.close", "issues.create", "issues.delete", "issues.get", "issues.list",
+		"issues.query", "issues.reopen", "issues.sweep", "issues.update",
+		"memories.forget", "memories.get",
 		"memories.list", "memories.remember", "ready.count", "ready.list",
 		"stats.get",
 	}

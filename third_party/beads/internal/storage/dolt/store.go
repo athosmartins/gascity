@@ -304,19 +304,23 @@ var _ storage.Flattener = (*DoltStore)(nil)
 var _ storage.Compactor = (*DoltStore)(nil)
 var _ storage.SchemaMigrator = (*DoltStore)(nil)
 var _ storage.ExternalRefHistoryQuerier = (*DoltStore)(nil)
+var _ storage.EventsJournalConfigurer = (*DoltStore)(nil)
 
 // DoltStore implements the Storage interface using Dolt
 type DoltStore struct {
-	db             *sql.DB
-	dbPath         string       // Path to Dolt data directory (server root, e.g. .beads/dolt/)
-	beadsDir       string       // Path to .beads directory (parent of dbPath)
-	database       string       // Database name (subdirectory under dbPath)
-	closed         atomic.Bool  // Tracks whether Close() has been called
-	connStr        string       // Connection string for reconnection
-	serverEndpoint string       // Exact endpoint bound to bootstrap reset authority
-	mu             sync.RWMutex // Protects concurrent access
-	readOnly       bool         // True if opened in read-only mode
-	credentialKey  []byte       // Random encryption key for federation credentials
+	db       *sql.DB
+	dbPath   string      // Path to Dolt data directory (server root, e.g. .beads/dolt/)
+	beadsDir string      // Path to .beads directory (parent of dbPath)
+	database string      // Database name (subdirectory under dbPath)
+	closed   atomic.Bool // Tracks whether Close() has been called
+	// eventsJournalEnabled activates the durable events journal for THIS store
+	// instance only (storage.EventsJournalConfigurer); never process-global.
+	eventsJournalEnabled atomic.Bool
+	connStr              string       // Connection string for reconnection
+	serverEndpoint       string       // Exact endpoint bound to bootstrap reset authority
+	mu                   sync.RWMutex // Protects concurrent access
+	readOnly             bool         // True if opened in read-only mode
+	credentialKey        []byte       // Random encryption key for federation credentials
 
 	// localActiveDatabaseDir is the exact active database directory when this
 	// store instance has authoritative local filesystem access. It is resolved
@@ -865,6 +869,7 @@ var doltMetrics struct {
 	poolWaitMs           metric.Float64Histogram
 	claimVerifyLost      metric.Int64Counter
 	claimVerifyRecovered metric.Int64Counter
+	ignoredTxFreshPool   metric.Int64Counter
 }
 
 func init() {
@@ -912,6 +917,10 @@ func init() {
 	doltMetrics.claimVerifyRecovered, _ = m.Int64Counter("bd.claim_verify_recovered_total",
 		metric.WithDescription("Indeterminate claim-family commits resolved by re-read (label: op, outcome=applied|replayed)"),
 		metric.WithUnit("{write}"),
+	)
+	doltMetrics.ignoredTxFreshPool, _ = m.Int64Counter("bd.db.ignored_tx_fresh_pool",
+		metric.WithDescription("ignored-tx transactions that fell back to a dedicated single-connection pool instead of borrowing from the main pool"),
+		metric.WithUnit("{tx}"),
 	)
 }
 
@@ -1143,6 +1152,8 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	if err != nil {
 		return fmt.Errorf("begin write tx: %w", err)
 	}
+	clearJournalScope := s.scopeEventsJournalTransaction(tx)
+	defer clearJournalScope()
 	if err := fn(tx); err != nil {
 		return errors.Join(err, tx.Rollback())
 	}
@@ -1150,6 +1161,15 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 		return wrapSQLCommitError("commit write tx", err)
 	}
 	return nil
+}
+
+// SetEventsJournalEnabled activates the journal for this store instance only.
+func (s *DoltStore) SetEventsJournalEnabled(enabled bool) {
+	s.eventsJournalEnabled.Store(enabled)
+}
+
+func (s *DoltStore) scopeEventsJournalTransaction(tx *sql.Tx) func() {
+	return issueops.ScopeEventsJournalTransaction(tx, s.eventsJournalEnabled.Load())
 }
 
 func (s *DoltStore) commitSQLTx(ctx context.Context, op string, tx *sql.Tx) error {
@@ -3122,6 +3142,22 @@ func (s *DoltStore) doltAddAndCommit(ctx context.Context, tables []string, commi
 					fmt.Errorf("dolt add %s after SQL mutation: %w: %w", table, err, ErrCommitIndeterminate))
 			}
 		}
+
+		// Skip the commit when nothing was actually staged (idempotent no-op
+		// write), so Dolt does not log a server-side "nothing to commit" warning
+		// on every reconcile-cadence call. The guard tests the STAGED set rather
+		// than the whole working set because this helper stages only a fixed
+		// table list — an unrelated dirty table must not trigger an empty '-m'
+		// commit. A guard-read failure is NOT a publication failure: nothing has
+		// been committed and nothing is indeterminate, so plain error return.
+		staged, err := issueops.HasStagedChanges(ctx, conn)
+		if err != nil {
+			return fmt.Errorf("check staged changes before commit: %w", err)
+		}
+		if !staged {
+			return nil
+		}
+
 		if err := schema.DrainCall(ctx, conn, "CALL DOLT_COMMIT('-m', ?, '--author', ?)",
 			commitMsg, s.commitAuthorString()); err != nil && !isDoltNothingToCommit(err) {
 			return s.recordDoltPublicationFailure(ctx,

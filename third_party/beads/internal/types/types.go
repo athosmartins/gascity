@@ -33,6 +33,11 @@ type Issue struct {
 	Status    Status    `json:"status,omitempty"`
 	Priority  int       `json:"priority"` // No omitempty: 0 is valid (P0/critical)
 	IssueType IssueType `json:"issue_type,omitempty"`
+	// IsBlocked is the persisted readiness projection. It is included in journal
+	// snapshots so graph deltas can be replayed without recomputing readiness.
+	// omitempty keeps it out of every other serialization (export JSONL, --json
+	// output): only journal snapshots, which set it explicitly, carry it.
+	IsBlocked bool `json:"is_blocked,omitempty"`
 
 	// ===== Assignment =====
 	Assignee         string `json:"assignee,omitempty"`
@@ -1264,6 +1269,32 @@ const (
 	WaitsForAnyChildren = "any-children" // Proceed when first child completes (future)
 )
 
+// IsSchedulingEdge reports whether a dependency type belongs to the static
+// COMBINED-CYCLE SET: blocks, conditional-blocks and parent-child. It is the
+// set every cycle probe and every whole-graph gate walks, and parent-child is
+// in it because a blocked parent propagates its blocked state to its children
+// in the ready-work computation — so a chain mixing blocks and parent-child
+// edges can form a livelock that leaves nothing ready.
+//
+// WAITS-FOR IS DELIBERATELY OUTSIDE IT. That edge also affects readiness, but
+// its gate clears on the spawner's CHILDREN rather than on the spawner, so a
+// waits-for edge cannot close a cycle the way a blocking one does.
+//
+// IT LIVES HERE, next to the Dep* constants themselves, because four packages
+// walk this set and no two of them can import each other: internal/storage/
+// issueops imports internal/storage/domain, so domain cannot import back, and
+// internal/storage/domain/db and internal/storage/uow are third and fourth. Each
+// had its own spelling of the same three types, so ADDING a fifth scheduling
+// type was four edits with nothing to catch a missed one. It is one edit now.
+func IsSchedulingEdge(t DependencyType) bool {
+	switch t {
+	case DepBlocks, DepConditionalBlocks, DepParentChild:
+		return true
+	default:
+		return false
+	}
+}
+
 // IsValidWaitsForGate reports whether gate names a known waits-for fanout gate.
 func IsValidWaitsForGate(gate string) bool {
 	return gate == WaitsForAllChildren || gate == WaitsForAnyChildren
@@ -1527,9 +1558,47 @@ const (
 	// EventLeaseReclaimed records that a stale lease was reverted to ready by
 	// bd reclaim (dead-worker recovery). old_value is the previous owner.
 	EventLeaseReclaimed EventType = "lease_reclaimed"
-	// EventDeleted records that a row was permanently removed (id + when
-	// survive in the events table even though the row itself does not).
-	EventDeleted EventType = "deleted"
+)
+
+// ProvenanceEvent is one entry in the append-only provenance log: a typed
+// binding from an issue to a structured external artifact (a git SHA, PR,
+// work-id, transcript, or branch).
+//
+// Unlike Event (a field-mutation audit record), a ProvenanceEvent records that
+// something happened in the world — a commit landed, a claim was made, work was
+// handed off — and ties it to an opaque external Ref. bd never interprets Actor
+// or Ref; only Kind and RefKind are structurally validated. This keeps the log
+// a primitive usable by any runtime without baking in orchestrator semantics.
+//
+// OccurredAt (event-time) is distinct from CreatedAt (ingest-time): a producer
+// may record a fact after it happened.
+type ProvenanceEvent struct {
+	ID         string     `json:"id"`
+	IssueID    string     `json:"issue_id"`
+	Kind       ProvKind   `json:"kind"`
+	Actor      *string    `json:"actor,omitempty"`
+	Ref        *string    `json:"ref,omitempty"`
+	RefKind    *string    `json:"ref_kind,omitempty"`
+	Payload    *string    `json:"payload,omitempty"`
+	Source     string     `json:"source"`
+	OccurredAt *time.Time `json:"occurred_at,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// ProvKind categorizes a provenance event.
+type ProvKind string
+
+// Provenance event kind constants. These are the only structurally-valid kinds;
+// the record path rejects anything outside this set.
+const (
+	ProvCut     ProvKind = "cut"
+	ProvClaim   ProvKind = "claim"
+	ProvSuspend ProvKind = "suspend"
+	ProvResume  ProvKind = "resume"
+	ProvHandoff ProvKind = "handoff"
+	ProvCommit  ProvKind = "commit"
+	ProvLand    ProvKind = "land"
+	ProvUsed    ProvKind = "used"
 )
 
 // BlockedIssue extends Issue with blocking information

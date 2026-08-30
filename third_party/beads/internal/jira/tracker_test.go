@@ -698,6 +698,10 @@ func (s *configStore) TreeWalker() (issueops.TreeWalker, error) {
 	return nil, &storage.ErrUnsupported{Op: "TreeWalker", Backend: "jira-config-stub"}
 }
 
+func (s *configStore) GraphCounter() (issueops.GraphCounter, error) {
+	return nil, &storage.ErrUnsupported{Op: "GraphCounter", Backend: "jira-config-stub"}
+}
+
 func (s *configStore) ReadyCounter() (issueops.ReadyCounter, error) {
 	return nil, &storage.ErrUnsupported{Op: "ReadyCounter", Backend: "jira-config-stub"}
 }
@@ -712,6 +716,18 @@ func (s *configStore) Deleter() (issueops.Deleter, error) {
 
 func (s *configStore) Sweeper() (issueops.Sweeper, error) {
 	return nil, &storage.ErrUnsupported{Op: "Sweeper", Backend: "jira-config-stub"}
+}
+
+func (s *configStore) MetadataCAS() (issueops.MetadataCAS, error) {
+	return nil, &storage.ErrUnsupported{Op: "MetadataCAS", Backend: "jira-config-stub"}
+}
+
+func (s *configStore) BatchApplier() (issueops.BatchApplier, error) {
+	return nil, &storage.ErrUnsupported{Op: "BatchApplier", Backend: "jira-config-stub"}
+}
+
+func (s *configStore) Releaser() (issueops.Releaser, error) {
+	return nil, &storage.ErrUnsupported{Op: "Releaser", Backend: "jira-config-stub"}
 }
 func (s *configStore) SetConfig(_ context.Context, _, _ string) error        { return nil }
 func (s *configStore) SetLocalMetadata(_ context.Context, _, _ string) error { return nil }
@@ -888,6 +904,16 @@ func (s *configStore) IterWisps(_ context.Context, _ types.WispFilter) (storage.
 }
 
 func (s *configStore) Close() error { return nil }
+
+func (s *configStore) RecordProvenanceEvent(_ context.Context, _ types.ProvenanceEvent) (string, bool, error) {
+	return "", false, nil
+}
+func (s *configStore) GetProvenanceEvents(_ context.Context, _, _ string) ([]types.ProvenanceEvent, error) {
+	return nil, nil
+}
+func (s *configStore) GetProvenanceByRef(_ context.Context, _ string) ([]types.ProvenanceEvent, error) {
+	return nil, nil
+}
 
 func TestFetchIssuesIncludesPullJQLInQuery(t *testing.T) {
 	var capturedJQL string

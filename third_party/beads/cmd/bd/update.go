@@ -108,6 +108,13 @@ pointless).`,
 			}
 		}()
 
+		// Refuse a mis-typed flag value that cobra parsed as a positional issue
+		// id, before any write path (direct or proxied) can apply a partial
+		// update. See bd-5247.
+		if err := errStrayFlagValuePositional(args); err != nil {
+			return HandleErrorRespectJSON("%s", err)
+		}
+
 		if usesProxiedServer() {
 			return runUpdateProxiedServer(cmd, rootCtx, args)
 		}
@@ -297,7 +304,7 @@ pointless).`,
 				inPast := t.Before(time.Now())
 				if inPast && !jsonOutput {
 					fmt.Fprintf(os.Stderr, "%s Defer date %q is in the past. Issue will appear in bd ready immediately.\n",
-						ui.RenderWarn("!"), t.Format("2006-01-02 15:04"))
+						ui.RenderWarn("!"), t.Local().Format("2006-01-02 15:04"))
 					fmt.Fprintf(os.Stderr, "  Did you mean a future date? Use --defer=+1h or --defer=tomorrow\n")
 				}
 				updates["defer_until"] = t
@@ -827,6 +834,21 @@ type updateIDFailure struct {
 	GuardMismatch bool   `json:"guard_mismatch,omitempty"`
 }
 
+// errStrayFlagValuePositional refuses, before any write, a positional argument
+// that contains '='. --set-metadata takes ONE key=value per flag, so
+// `--set-metadata a=1 b=2` silently turns `b=2` into a positional issue id;
+// no issue id contains '=', so such a positional is unambiguously a mis-typed
+// flag value. Rejecting it up front prevents a partial write that would apply
+// only the pairs that happened to bind to a flag (bd-5247).
+func errStrayFlagValuePositional(args []string) error {
+	for _, arg := range args {
+		if strings.Contains(arg, "=") {
+			return fmt.Errorf("positional argument %q contains '=', which no issue id does — this is a mis-typed flag value; repeat the flag per pair, e.g. --set-metadata a=1 --set-metadata b=2", arg)
+		}
+	}
+	return nil
+}
+
 // reportUpdateFailures emits a per-ID failure report on stderr and returns a
 // nonzero exit error — ExitGuardMismatch when every failure is a
 // --if-assignee/--if-status guard refusal, 1 otherwise. In --json mode the
@@ -985,7 +1007,7 @@ func init() {
 	//   --defer=+1h         Hidden from bd ready for 1 hour
 	//   --defer=""          Clear defer (show in bd ready immediately)
 	updateCmd.Flags().String("due", "", "Due date/time (empty to clear). Formats: +6h, +1d, +2w, tomorrow, next monday, 2025-01-15")
-	updateCmd.Flags().String("defer", "", "Defer until date (empty to clear). Issue hidden from bd ready until then")
+	updateCmd.Flags().String("defer", "", "Defer until date (empty to clear). Issue hidden from bd ready until then, then auto-wakes to open")
 	// Gate fields (bd-z6kw)
 	updateCmd.Flags().String("await-id", "", "Set gate await_id (e.g., GitHub run ID for gh:run gates)")
 	// Ephemeral/persistent flags

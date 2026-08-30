@@ -91,6 +91,66 @@ func (c checkedBatchCreator) CreateBatch(ctx context.Context, req issueops.Creat
 	return result, nil
 }
 
+// checkedLifecycle is the lifecycle role every mutation handler is handed.
+//
+// All four methods are why it exists: every handler over this role writes
+// *result.Issue, which is checkedClaimer's hazard exactly.
+type checkedLifecycle struct{ inner issueops.Lifecycle }
+
+// Create refuses a result that reports success without the row the response
+// body is built from, for Close's reason.
+//
+// It USED to pass through, because no handler on this surface reached it. The
+// single create publishes one, and handleCreateIssue writes *result.Issue
+// straight onto the wire, so the same nil-with-nil-error a provider-supplied
+// role can return is a panic on a live server without this.
+func (c checkedLifecycle) Create(ctx context.Context, req issueops.CreateRequest) (issueops.CreateResult, error) {
+	result, err := c.inner.Create(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.CreateResult{}, fmt.Errorf("create: the lifecycle reported success without an issue")
+	}
+	return result, err
+}
+
+// Update refuses a result that reports success without the row the response
+// body is built from, for Close's reason.
+func (c checkedLifecycle) Update(ctx context.Context, req issueops.UpdateRequest) (issueops.UpdateResult, error) {
+	result, err := c.inner.Update(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.UpdateResult{}, fmt.Errorf("update %q: the lifecycle reported success without an issue", req.IssueID)
+	}
+	return result, err
+}
+
+// Close refuses a result that reports success without the row the response body
+// is built from.
+//
+// There is no wire code for it and there must not be one: `already_closed` says
+// the issue was closed earlier and the response still carries the row, and a
+// 404 would tell a client the issue does not exist when nothing here knows
+// that. It is a broken implementation, so it is the generic 500 — with the
+// fault in the log as an error and a request_error line beside it, which is
+// what the panic it replaces did not produce.
+func (c checkedLifecycle) Close(ctx context.Context, req issueops.CloseRequest) (issueops.CloseResult, error) {
+	result, err := c.inner.Close(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.CloseResult{}, fmt.Errorf("close %q: the lifecycle reported success without an issue", req.IssueID)
+	}
+	return result, err
+}
+
+// Reopen refuses a result that reports success without the row the response
+// body is built from, for Close's reason: handleReopen dereferences it, and a
+// broken implementation should be the generic 500 with the fault in the log
+// rather than a panic on a live server.
+func (c checkedLifecycle) Reopen(ctx context.Context, req issueops.ReopenRequest) (issueops.ReopenResult, error) {
+	result, err := c.inner.Reopen(ctx, req)
+	if err == nil && result.Issue == nil {
+		return issueops.ReopenResult{}, fmt.Errorf("reopen %q: the lifecycle reported success without an issue", req.IssueID)
+	}
+	return result, err
+}
+
 // checkedClaimer is the claimer the claim handler is handed.
 type checkedClaimer struct{ inner issueops.Claimer }
 
