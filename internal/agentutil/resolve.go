@@ -248,7 +248,7 @@ func AgentReachesWorkflowStore(storeRef string, agentCfg *config.Agent, cityPath
 	if AgentIsCrossStoreEligible(agentCfg) {
 		return true
 	}
-	agentRig := workdirutil.ConfiguredRigName(cityPath, *agentCfg, cfg.Rigs)
+	agentRig := workdirutil.RoutingRigName(cityPath, *agentCfg, cfg.Rigs)
 	if agentRig == "" {
 		return strings.HasPrefix(storeRef, "city:")
 	}
@@ -270,7 +270,7 @@ func AgentReachableStoreLabel(agentCfg *config.Agent, cityPath, cityName string,
 	if cfg == nil || agentCfg == nil {
 		return ""
 	}
-	agentRig := workdirutil.ConfiguredRigName(cityPath, *agentCfg, cfg.Rigs)
+	agentRig := workdirutil.RoutingRigName(cityPath, *agentCfg, cfg.Rigs)
 	if agentRig == "" {
 		cn := strings.TrimSpace(cityName)
 		if cn == "" {

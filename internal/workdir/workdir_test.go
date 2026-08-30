@@ -235,7 +235,7 @@ func TestConfiguredRigNameMatchesSymlinkAliasPath(t *testing.T) {
 	}
 }
 
-func TestConfiguredRigNameFallsBackToWorkDirWhenDirLess(t *testing.T) {
+func TestRoutingRigNameFallsBackToWorkDirWhenDirLess(t *testing.T) {
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(cityPath, "whatsapp_automation")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
@@ -246,23 +246,23 @@ func TestConfiguredRigNameFallsBackToWorkDirWhenDirLess(t *testing.T) {
 	// only field carrying a real filesystem location, and it commonly
 	// points at a subdirectory of the rig (crew/worker), not the rig root
 	// itself.
-	got := ConfiguredRigName(cityPath, config.Agent{
+	got := RoutingRigName(cityPath, config.Agent{
 		Name:    "wa-worker",
 		WorkDir: filepath.Join(rigPath, "crew", "worker"),
 	}, []config.Rig{{Name: "whatsapp_automation", Path: rigPath}})
 	if got != "whatsapp_automation" {
-		t.Fatalf("ConfiguredRigName() = %q, want %q", got, "whatsapp_automation")
+		t.Fatalf("RoutingRigName() = %q, want %q", got, "whatsapp_automation")
 	}
 }
 
-func TestConfiguredRigNameWorkDirFallbackPicksMostSpecificRig(t *testing.T) {
+func TestRoutingRigNameWorkDirFallbackPicksMostSpecificRig(t *testing.T) {
 	cityPath := t.TempDir()
 	outerPath := filepath.Join(cityPath, "outer")
 	innerPath := filepath.Join(outerPath, "inner")
 	if err := os.MkdirAll(innerPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	got := ConfiguredRigName(cityPath, config.Agent{
+	got := RoutingRigName(cityPath, config.Agent{
 		Name:    "worker",
 		WorkDir: filepath.Join(innerPath, "crew", "worker"),
 	}, []config.Rig{
@@ -270,7 +270,7 @@ func TestConfiguredRigNameWorkDirFallbackPicksMostSpecificRig(t *testing.T) {
 		{Name: "inner", Path: innerPath},
 	})
 	if got != "inner" {
-		t.Fatalf("ConfiguredRigName() = %q, want %q (most specific containing rig)", got, "inner")
+		t.Fatalf("RoutingRigName() = %q, want %q (most specific containing rig)", got, "inner")
 	}
 }
 
@@ -278,6 +278,33 @@ func TestConfiguredRigNameDirLessNoWorkDirStillEmpty(t *testing.T) {
 	got := ConfiguredRigName(t.TempDir(), config.Agent{Name: "city-scoped"}, []config.Rig{{Name: "demo", Path: "/anywhere"}})
 	if got != "" {
 		t.Fatalf("ConfiguredRigName() = %q, want empty for an agent with neither Dir nor WorkDir", got)
+	}
+}
+
+// TestConfiguredRigNameDirLessAgentWithRigWorkDirStaysCityScoped pins the
+// contract every crew and pool-template agent in this city relies on: no dir
+// => city-scoped, EVEN IF work_dir lives inside a rig. Incident 2026-08-29
+// (ga-f7k65a): a work_dir fallback added to ConfiguredRigName flipped every
+// dir-less rig crew/pool to rig-scoped at a binary swap — session beads got
+// template "whatsapp_automation/wa-worker" while the configured agent stayed
+// "wa-worker", so every pending create expired unmatched (ghost slots all
+// night) and oracle-wa lost its identity match and looped create/drain 88x.
+// The fallback belongs to RoutingRigName (sling route guard only). This test
+// fails if anyone moves it back.
+func TestConfiguredRigNameDirLessAgentWithRigWorkDirStaysCityScoped(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "whatsapp_automation")
+	if err := os.MkdirAll(filepath.Join(rigPath, "crew", "worker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agent := config.Agent{Name: "wa-worker", WorkDir: filepath.Join(rigPath, "crew", "worker")}
+	rigs := []config.Rig{{Name: "whatsapp_automation", Path: rigPath}}
+	if got := ConfiguredRigName(cityPath, agent, rigs); got != "" {
+		t.Fatalf("ConfiguredRigName() = %q, want empty: a dir-less agent is city-scoped even with a rig work_dir (see incident note)", got)
+	}
+	// ...while the routing view of the same agent still sees the rig.
+	if got := RoutingRigName(cityPath, agent, rigs); got != "whatsapp_automation" {
+		t.Fatalf("RoutingRigName() = %q, want %q", got, "whatsapp_automation")
 	}
 }
 

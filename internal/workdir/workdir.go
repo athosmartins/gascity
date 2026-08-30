@@ -43,6 +43,50 @@ func ResolveDirPath(cityPath, dir string) string {
 }
 
 // ConfiguredRigName returns the rig associated with an agent, preferring the
+// legacy dir-as-rig convention and falling back to path matching of Dir.
+//
+// CONTRACT (restored 2026-08-29, incident ga-f7k65a): an agent with NO dir is
+// city-scoped, full stop — even when its work_dir lives inside a rig. Every
+// crew and pool-template agent in this city is shaped exactly like that
+// (agents/<name>/agent.toml with work_dir=<rig>/crew/<x> and no dir=), and the
+// wa-worker/ps-worker design (8877e387c) depends on it: dir= is deliberately
+// absent so `gc session new wa-worker` resolves the agent at city level and
+// the Pilot's explicit rig-native spawn is what starts workers, not the
+// supervisor's scale_check. ga-f7k65a added a work_dir fallback HERE to fix a
+// false refusal in the sling cross-store route guard — a real bug — but this
+// function is shared by the supervisor's desired-state, template resolution
+// and session identity paths, so the fallback flipped every dir-less rig
+// crew/pool to rig-scoped at the 15:30 swap: session beads were created with
+// template "whatsapp_automation/wa-worker" while the configured agent stayed
+// "wa-worker", pending creates never matched a template and expired (every
+// ghost slot that night), and oracle-wa lost its identity match and looped
+// create/drain 88x. The fallback now lives in RoutingRigName, used only by the
+// route guard that needed it. Do not re-add work_dir matching here.
+func ConfiguredRigName(cityPath string, a config.Agent, rigs []config.Rig) string {
+	if a.Dir == "" {
+		return ""
+	}
+	for _, rig := range rigs {
+		if a.Dir == rig.Name {
+			return rig.Name
+		}
+	}
+	abs := ResolveDirPath(cityPath, a.Dir)
+	for _, rig := range rigs {
+		if samePath(abs, rig.Path) {
+			return rig.Name
+		}
+	}
+	return ""
+}
+
+// RoutingRigName is ConfiguredRigName plus a work_dir fallback for dir-less
+// agents. It exists for ONE consumer: the sling cross-store route guard
+// (agentutil.AgentReachesWorkflowStore / AgentReachableStoreLabel), which
+// must classify a dir-less rig crew/pool by where its bd context actually
+// reads (ga-f7k65a). It is deliberately NOT used by the supervisor or by
+// session identity — see ConfiguredRigName for the incident that split them.
+//
 // legacy dir-as-rig convention and falling back to path matching. Dir-less
 // agents (Dir == "" — pool-template agents defined via agents/<name>/agent.toml,
 // e.g. wa-worker, ps-worker, commonly have no dir field at all) fall back to
@@ -52,7 +96,7 @@ func ResolveDirPath(cityPath, dir string) string {
 // one to every caller keyed off ConfiguredRigName (e.g. the cross-store route
 // guard in internal/sling), which misclassifies it as reaching only the city
 // store and refuses legitimate rig-scoped routes.
-func ConfiguredRigName(cityPath string, a config.Agent, rigs []config.Rig) string {
+func RoutingRigName(cityPath string, a config.Agent, rigs []config.Rig) string {
 	if a.Dir != "" {
 		for _, rig := range rigs {
 			if a.Dir == rig.Name {
