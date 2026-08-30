@@ -131,3 +131,79 @@ func TestArchiveOverlapsFilter(t *testing.T) {
 		})
 	}
 }
+
+// TestArchiveOverlapsFilterSkipsArchivesOlderThanSince is a regression test
+// for ga-64nv6: `gc events --since=<window>` hangs ~30s and times out
+// ("context deadline exceeded") because archiveOverlapsFilter only consults
+// AfterSeq, never Since — even though archiveInfo.Timestamp already carries
+// the rotation instant parsed from the filename. A Since-bound query (the
+// only lower bound the CLI/API can send; there is no after_seq param)
+// therefore gunzips and JSON-parses every retained archive before it can
+// even reach the live file, regardless of how narrow the requested window
+// is.
+//
+// The archive filename records only info.Timestamp, the rotation instant
+// TRUNCATED to whole seconds — the true rotation instant T can land
+// anywhere in [info.Timestamp, info.Timestamp+1s). Every event in the
+// archive was appended before T, so event.Time <= T, which only gives
+// event.Time < info.Timestamp+1s. A Since strictly inside that truncation
+// second must therefore still be read; only a Since at or beyond
+// info.Timestamp+1s can be safely skipped.
+func TestArchiveOverlapsFilterSkipsArchivesOlderThanSince(t *testing.T) {
+	// Rotated 2026-05-07; a caller queries with ?since=5m.
+	info := archiveInfo{
+		Basename:  "events.jsonl.archive-20260507T000000Z-seq-100-200.gz",
+		Timestamp: time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC),
+		FirstSeq:  100,
+		LastSeq:   200,
+	}
+	tests := []struct {
+		name string
+		f    Filter
+		want bool
+	}{
+		{
+			name: "Since well after archive rotation is skippable",
+			f:    Filter{Since: time.Date(2026, 7, 24, 0, 0, 0, 0, time.UTC)},
+			want: false,
+		},
+		{
+			name: "Since one second after archive rotation must still be read (true rotation instant is unknown within the truncation second)",
+			f:    Filter{Since: time.Date(2026, 5, 7, 0, 0, 1, 0, time.UTC)},
+			want: true,
+		},
+		{
+			name: "Since one second and one nanosecond after archive rotation is skippable",
+			f:    Filter{Since: time.Date(2026, 5, 7, 0, 0, 1, 1, time.UTC)},
+			want: false,
+		},
+		{
+			name: "Since strictly inside the rotation's truncation second must still be read",
+			f:    Filter{Since: time.Date(2026, 5, 7, 0, 0, 0, 500000000, time.UTC)},
+			want: true,
+		},
+		{
+			name: "Since before archive rotation must still be read",
+			f:    Filter{Since: time.Date(2026, 5, 6, 0, 0, 0, 0, time.UTC)},
+			want: true,
+		},
+		{
+			name: "Since exactly at rotation must still be read (inclusive bound)",
+			f:    Filter{Since: time.Date(2026, 5, 7, 0, 0, 0, 0, time.UTC)},
+			want: true,
+		},
+		{
+			name: "zero Since is unbounded and must still be read",
+			f:    Filter{},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := archiveOverlapsFilter(info, tc.f); got != tc.want {
+				t.Errorf("archiveOverlapsFilter(Since=%v) = %v, want %v",
+					tc.f.Since, got, tc.want)
+			}
+		})
+	}
+}

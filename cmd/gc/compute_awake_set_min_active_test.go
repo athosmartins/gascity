@@ -44,6 +44,63 @@ func TestMinActive_ActiveSatisfiesMin(t *testing.T) {
 	assertAsleep(t, result, "rig--pl-2")
 }
 
+// TestMinActive_ActiveGetsWakeReason verifies the live bead satisfying the
+// min-active guarantee is itself marked awake with reason "min-active".
+// Before ga-yg6e1, a live bead was only COUNTED toward the guarantee, never
+// added to desired: with no other demand signal (no assigned work, no pin,
+// no attach), ComputeAwakeSet computed ShouldWake=false for an
+// already-alive session, and the reconciler drained it as "no-wake-reason"
+// on the very next tick — while poolDesired (build_desired_state.go)
+// independently recreated a session for the same min_active_sessions>0
+// agent regardless of this verdict, producing an unbounded
+// create/drain/create loop.
+func TestMinActive_ActiveGetsWakeReason(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "rig/pl", MinActiveSessions: 1}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "s-live", SessionName: "rig--pl-1", Template: "rig/pl", State: "active"},
+		},
+		Now: now,
+	})
+	assertAwake(t, result, "rig--pl-1")
+	assertReason(t, result, "rig--pl-1", "min-active")
+}
+
+// TestMinActive_CreatingGetsWakeReason mirrors
+// TestMinActive_ActiveGetsWakeReason for a "creating" bead — a session
+// mid-spawn is on its way to active and must not be drained mid-flight for
+// lack of a wake reason either.
+func TestMinActive_CreatingGetsWakeReason(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "rig/pl", MinActiveSessions: 1}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "s-new", SessionName: "rig--pl-1", Template: "rig/pl", State: "creating"},
+		},
+		Now: now,
+	})
+	assertAwake(t, result, "rig--pl-1")
+	assertReason(t, result, "rig--pl-1", "min-active")
+}
+
+// TestMinActive_ExcessLiveBeadsNotForcedAwake verifies the live-credit half
+// of the pass is capped at MinActiveSessions: with min=1 and two live
+// beads, only the lowest-ID one is guaranteed a "min-active" wake reason —
+// the extra live session beyond the guarantee is left to the normal
+// demand/idle passes rather than being unconditionally pinned awake.
+func TestMinActive_ExcessLiveBeadsNotForcedAwake(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "rig/pl", MinActiveSessions: 1}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "s-a", SessionName: "rig--pl-a", Template: "rig/pl", State: "active"},
+			{ID: "s-b", SessionName: "rig--pl-b", Template: "rig/pl", State: "active"},
+		},
+		Now: now,
+	})
+	assertAwake(t, result, "rig--pl-a")
+	assertReason(t, result, "rig--pl-a", "min-active")
+	assertAsleep(t, result, "rig--pl-b")
+}
+
 // TestMinActive_FillsDeficitAcrossMultiple verifies that when min=2 and one
 // session is live, exactly one additional city-stop bead is revived (not more).
 func TestMinActive_FillsDeficitAcrossMultiple(t *testing.T) {

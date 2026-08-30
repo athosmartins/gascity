@@ -304,13 +304,13 @@ func doRigStatusWithStoreAndSnapshot(
 		if !a.SupportsInstanceExpansion() {
 			target := statusObservationTargetForIdentity(statusSnapshot, cityName, a.QualifiedName(), sessionTemplate)
 			obs := observeSessionTargetWithWarning("gc rig status", cityPath, store, sp, cfg, target, stderr)
-			status := agentStatusLine(obs.Running, dops, target.runtimeSessionName, a.Suspended || obs.Suspended)
+			status := agentStatusLineWithPartial(obs.Running, dops, target.runtimeSessionName, a.Suspended || obs.Suspended, statusProviderPartial(sp))
 			fmt.Fprintf(stdout, "    %-12s%s\n", a.QualifiedName(), status) //nolint:errcheck // best-effort stdout
 		} else {
 			for _, qualifiedInstance := range discoverPoolInstances(a.Name, a.Dir, sp0, &a, cityName, sessionTemplate, sp) {
 				target := statusObservationTargetForIdentity(statusSnapshot, cityName, qualifiedInstance, sessionTemplate)
 				obs := observeSessionTargetWithWarning("gc rig status", cityPath, store, sp, cfg, target, stderr)
-				status := agentStatusLine(obs.Running, dops, target.runtimeSessionName, a.Suspended || obs.Suspended)
+				status := agentStatusLineWithPartial(obs.Running, dops, target.runtimeSessionName, a.Suspended || obs.Suspended, statusProviderPartial(sp))
 				fmt.Fprintf(stdout, "    %-12s%s\n", qualifiedInstance, status) //nolint:errcheck // best-effort stdout
 			}
 		}
@@ -396,7 +396,25 @@ func rigStatusAgentJSON(name, qualifiedName string, target statusObservationTarg
 // session; skip it when the session is not running because the draining flag
 // is meaningless then and the probe dominates wall time on idle cities.
 func agentStatusLine(running bool, dops drainOps, sn string, suspended bool) string {
+	return agentStatusLineWithPartial(running, dops, sn, suspended, false)
+}
+
+// agentStatusLineWithPartial is agentStatusLine plus a partial flag from the
+// bounded runtime status provider (gt-4qi2t). A non-running row observed
+// through a partial provider means the probe timed out, not that the agent
+// was confirmed stopped — boundedStatusCall's fallback value is the same
+// `false` for both cases, so without this flag a timeout renders identically
+// to a real stop. Rendering it as "unknown" instead keeps a degraded probe
+// from looking like a confirmed-dead city to whoever reads `gc status` to
+// decide whether to trigger a restart.
+func agentStatusLineWithPartial(running bool, dops drainOps, sn string, suspended bool, partial bool) string {
 	if !running {
+		if partial {
+			if suspended {
+				return "unknown  (partial status, suspended)"
+			}
+			return "unknown  (partial status)"
+		}
 		if suspended {
 			return "stopped  (suspended)"
 		}

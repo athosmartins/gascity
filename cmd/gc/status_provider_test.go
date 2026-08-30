@@ -62,6 +62,52 @@ func TestStatusProviderTimeoutDoesNotStickAcrossCalls(t *testing.T) {
 	}
 }
 
+// TestStatusProviderTimeoutMarksPartial fails on the pre-gt-4qi2t code: the
+// bounded provider's timeout fallback and a genuine negative result both
+// returned bare `false` with no way to tell them apart. This asserts the
+// distinguishing signal exists and is set exactly when a probe times out.
+func TestStatusProviderTimeoutMarksPartial(t *testing.T) {
+	origTimeout := statusProviderCallTimeout
+	origWarn := statusProviderTimeoutWarning
+	t.Cleanup(func() {
+		statusProviderCallTimeout = origTimeout
+		statusProviderTimeoutWarning = origWarn
+	})
+	statusProviderCallTimeout = 10 * time.Millisecond
+	statusProviderTimeoutWarning = func() {}
+
+	base := newStatusProbeProvider()
+	base.running.Store(true)
+	base.delay.Store(int64(100 * time.Millisecond))
+	wrapped := newBoundedStatusProvider(base)
+
+	if statusProviderPartial(wrapped) {
+		t.Fatal("statusProviderPartial = true before any call, want false")
+	}
+	if wrapped.IsRunning("worker") {
+		t.Fatal("IsRunning returned true, want timeout fallback false")
+	}
+	if !statusProviderPartial(wrapped) {
+		t.Fatal("statusProviderPartial = false, want true after runtime probe timeout")
+	}
+}
+
+// TestStatusProviderPartialFalseWhenNoTimeoutOccurs guards against a
+// trivially-true implementation (e.g. defaulting partial to true): a probe
+// that returns well within the bound must never be reported as partial.
+func TestStatusProviderPartialFalseWhenNoTimeoutOccurs(t *testing.T) {
+	base := newStatusProbeProvider()
+	base.running.Store(true)
+	wrapped := newBoundedStatusProvider(base)
+
+	if !wrapped.IsRunning("worker") {
+		t.Fatal("IsRunning returned false, want true from the fast, non-timing-out probe")
+	}
+	if statusProviderPartial(wrapped) {
+		t.Fatal("statusProviderPartial = true after a fast call with no timeout, want false")
+	}
+}
+
 func TestStatusProviderPreservesNativeLivenessObservation(t *testing.T) {
 	base := newStatusProbeProvider()
 	base.liveness.Store(runtime.Liveness{Running: true, Alive: true})

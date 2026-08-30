@@ -1418,7 +1418,7 @@ func commitAsyncStartResultWithContext(
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreate(refreshed.prepared.candidate.session) {
 			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
-			rollbackPendingCreate(refreshed.prepared.candidate.session, store, clk.Now().UTC(), stderr,
+			rollbackPendingCreate(refreshed.prepared.candidate.session, store, nil, clk.Now().UTC(), stderr,
 				"pending_create_context_canceled", fmt.Sprintf("context canceled during async start refresh: %v", ctx.Err()))
 		}
 		logLifecycleOutcome(stderr, "start", wave, name, template, "context_canceled", refreshed.started, time.Now(), ctx.Err(), refreshed.phases)
@@ -1728,7 +1728,7 @@ func commitStartResultTraced(
 			if rollbackDetail == "" {
 				rollbackDetail = "rollback pending with no recorded error"
 			}
-			rollbackPendingCreate(session, store, clk.Now().UTC(), stderr, "pending_create_rollback_pending", rollbackDetail)
+			rollbackPendingCreate(session, store, nil, clk.Now().UTC(), stderr, "pending_create_rollback_pending", rollbackDetail)
 			logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, result.err, result.phases)
 			return false
 		}
@@ -2034,7 +2034,7 @@ func recordPendingCreateRollback(store beads.Store, id, action, detail string, n
 	}
 }
 
-func rollbackPendingCreate(session *beads.Bead, store beads.Store, now time.Time, stderr io.Writer, action, detail string) {
+func rollbackPendingCreate(session *beads.Bead, store beads.Store, workStore beads.Store, now time.Time, stderr io.Writer, action, detail string) {
 	if session == nil || store == nil {
 		return
 	}
@@ -2048,10 +2048,11 @@ func rollbackPendingCreate(session *beads.Bead, store beads.Store, now time.Time
 		}
 	}
 	recordPendingCreateRollback(store, session.ID, action, detail, now, stderr)
+	compensateOrphanedPilotDispatch(session, workStore, stderr)
 	closeBead(store, session.ID, string(sessionpkg.StateFailedCreate), now, stderr)
 }
 
-func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, now time.Time, stderr io.Writer, action, detail string) {
+func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, workStore beads.Store, now time.Time, stderr io.Writer, action, detail string) {
 	if session == nil || store == nil {
 		return
 	}
@@ -2065,6 +2066,7 @@ func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, 
 		}
 	}
 	recordPendingCreateRollback(store, session.ID, action, detail, now, stderr)
+	compensateOrphanedPilotDispatch(session, workStore, stderr)
 	if !closeFailedCreateBead(store, session.ID, now, stderr) {
 		return
 	}
@@ -2076,6 +2078,92 @@ func rollbackPendingCreateClearingClaim(session *beads.Bead, store beads.Store, 
 	}
 	session.Metadata["pending_create_claim"] = ""
 	session.Metadata["pending_create_started_at"] = ""
+}
+
+// compensateOrphanedPilotDispatch is the ga-owqsg fix: today, when a
+// pending-create session is rolled back, only the SESSION bead is touched
+// (closed, annotated via recordPendingCreateRollback above). The Pilot
+// dispatch markers (pilot:dispatched / story:in-flight) that were stamped
+// onto the WORK bead at dispatch time are never revisited by the engine --
+// only the external inflight-reclaim-guard eventually notices via polling,
+// ~30-40min later (measured live, ga-owqsg). Every rollback in that gap
+// burns a lane slot for nothing.
+//
+// This closes the gap for the one case the engine can identify
+// UNAMBIGUOUSLY without guessing: "wake-known-identity" tier dispatch, where
+// Pilot assigns the work bead directly to the bare template name before a
+// concrete session exists to claim it (see ComputePoolDesiredStates in
+// pool_desired_state.go). If the session meant to materialize that identity
+// never comes alive, the work bead's assignee is STILL the literal template
+// string -- nothing else could legitimately be "in flight" under that exact
+// identity, since no concrete session for it ever started. Matching on that
+// exact string is precise, not a heuristic guess.
+//
+// Deliberately does NOT cover "new" tier (scale_check) rollbacks: that
+// tier's SessionRequest carries no work-bead identity by design --
+// scale_check reports an aggregate COUNT per template, never bead IDs,
+// specifically so an already-dispatched bead is not double-counted as fresh
+// demand (see poolDemandBeadInFlight / defaultScaleCheckCounts). There is no
+// reliable way to identify which specific bead(s) drove a given anonymous
+// "new" pending-create without guessing among possibly several waiting
+// candidates for the same template -- guessing wrong would strip markers
+// out from under a sibling session that is legitimately about to claim that
+// work. That residual gap still relies on inflight-reclaim-guard's polling;
+// see the ga-owqsg bead for the follow-up.
+//
+// workStore may be nil (call sites that cannot cheaply resolve the target
+// template's store, or tests exercising unrelated behavior) -- this is a
+// no-op in that case, identical to today's behavior. Best-effort throughout:
+// a failure here must never block the rollback itself.
+func compensateOrphanedPilotDispatch(session *beads.Bead, workStore beads.Store, stderr io.Writer) {
+	if session == nil || workStore == nil {
+		return
+	}
+	template := strings.TrimSpace(session.Metadata["template"])
+	if template == "" {
+		return
+	}
+	orphans, err := workStore.List(beads.ListQuery{Status: "open", Assignee: template})
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: compensating orphaned pilot dispatch for template %s: listing assignee matches: %v\n", template, err) //nolint:errcheck
+		return
+	}
+	for _, wb := range orphans {
+		if !poolDemandBeadInFlight(wb) {
+			continue
+		}
+		if err := workStore.Update(wb.ID, beads.UpdateOpts{RemoveLabels: poolDemandInFlightLabels}); err != nil {
+			fmt.Fprintf(stderr, "session reconciler: compensating orphaned pilot dispatch: clearing markers on %s: %v\n", wb.ID, err) //nolint:errcheck
+			continue
+		}
+		fmt.Fprintf(stderr, "session reconciler: compensated orphaned pilot dispatch on %s (assignee=%s, rolled-back session=%s)\n", wb.ID, template, session.ID) //nolint:errcheck
+	}
+}
+
+// resolveTemplateWorkStore finds the beads.Store that holds work beads for
+// the given agent template, mirroring the same city-store-vs-rig-store
+// resolution defaultScaleCheckTargetForAgent already uses (build_desired_state.go).
+// Returns nil when the template is unknown or names a rig whose store isn't
+// available -- callers must treat nil as "cannot resolve, skip" rather than
+// falling back to the wrong store.
+func resolveTemplateWorkStore(cityPath string, cfg *config.City, rigStores map[string]beads.Store, cityStore beads.Store, template string) beads.Store {
+	if cfg == nil || template == "" {
+		return nil
+	}
+	agentCfg := config.FindAgent(cfg, template)
+	if agentCfg == nil {
+		return cityStore
+	}
+	rigName := configuredRigName(cityPath, agentCfg, cfg.Rigs)
+	if rigName == "" {
+		return cityStore
+	}
+	if rigStores != nil {
+		if s := rigStores[rigName]; s != nil {
+			return s
+		}
+	}
+	return nil
 }
 
 func executePlannedStarts(

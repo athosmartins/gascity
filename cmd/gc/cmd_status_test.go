@@ -473,3 +473,49 @@ func TestRouteRigStatus_APIStaleBanner(t *testing.T) {
 		t.Errorf("human output should include stale banner, got:\n%s", stdout.String())
 	}
 }
+
+// TestAgentStatusLineWithPartialRendersUnknownNotStopped fails on the
+// pre-gt-4qi2t code (agentStatusLine has no partial parameter at all, so a
+// timed-out probe and a confirmed-stopped agent render identically as
+// "stopped"). A non-running row observed through a partial provider must
+// read "unknown", never an authoritative "stopped" — that false confidence
+// is what makes a degraded probe look like a dead city.
+func TestAgentStatusLineWithPartialRendersUnknownNotStopped(t *testing.T) {
+	dops := newFakeDrainOps()
+	cases := []struct {
+		name      string
+		running   bool
+		suspended bool
+		partial   bool
+		want      string
+	}{
+		{"running, not partial", true, false, false, "running"},
+		{"stopped, not partial", false, false, false, "stopped"},
+		{"stopped+suspended, not partial", false, true, false, "stopped  (suspended)"},
+		{"stopped, partial", false, false, true, "unknown  (partial status)"},
+		{"stopped+suspended, partial", false, true, true, "unknown  (partial status, suspended)"},
+		{"running, partial (partial only matters when not running)", true, false, true, "running"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentStatusLineWithPartial(tc.running, dops, "worker", tc.suspended, tc.partial)
+			if got != tc.want {
+				t.Errorf("agentStatusLineWithPartial(running=%v, suspended=%v, partial=%v) = %q, want %q",
+					tc.running, tc.suspended, tc.partial, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAgentStatusLineUnchangedForExistingCallers guards the back-compat
+// wrapper: existing callers that never pass a partial flag must keep
+// rendering exactly as before this fix.
+func TestAgentStatusLineUnchangedForExistingCallers(t *testing.T) {
+	dops := newFakeDrainOps()
+	if got := agentStatusLine(false, dops, "worker", false); got != "stopped" {
+		t.Errorf("agentStatusLine(false, _, _, false) = %q, want %q", got, "stopped")
+	}
+	if got := agentStatusLine(true, dops, "worker", false); got != "running" {
+		t.Errorf("agentStatusLine(true, _, _, false) = %q, want %q", got, "running")
+	}
+}

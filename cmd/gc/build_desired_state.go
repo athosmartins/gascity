@@ -127,9 +127,19 @@ func fairPoolSessionCreateShares(states []PoolDesiredState, limit int, seed uint
 	for _, state := range states {
 		count := 0
 		for _, request := range state.Requests {
-			// Requests with a session bead ID represent in-flight capacity and
-			// should not reserve fresh-create budget for this template.
-			if request.Tier == "new" && request.SessionBeadID == "" {
+			// Fresh-create demand is "selectOrPlanPoolSessionBead has no
+			// preferred bead to resume", i.e. SessionBeadID == "" — not
+			// Tier == "new". A "wake-known-identity" request (Pilot
+			// rig-native dispatch assigning a bead to the bare template
+			// name before any session bead exists) also has an empty
+			// SessionBeadID and also calls tryClaimPoolSessionCreate, but
+			// the old Tier == "new" check made it invisible here: a
+			// template whose ONLY create-needing demand was
+			// wake-known-identity never entered `demands`, fair share
+			// never engaged (len(demands) <= 1 below), and it lost every
+			// tick's whole shared budget to whichever counted template
+			// happened to be processed first (ga-815mi).
+			if request.SessionBeadID == "" {
 				count++
 			}
 		}

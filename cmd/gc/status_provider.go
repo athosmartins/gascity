@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -20,6 +21,28 @@ var (
 type statusProvider struct {
 	base     runtime.Provider
 	warnOnce sync.Once
+	partial  atomic.Bool
+}
+
+// statusProviderPartial reports whether sp is a bounded statusProvider that
+// has hit at least one probe timeout since it was constructed. Non-running
+// rows observed through a partial provider are unknown, not confirmed
+// stopped (gt-4qi2t): the bounded fallback below returns the same `false`
+// for "timed out" as a real negative result, so callers need this signal to
+// avoid rendering a timeout as an authoritative "stopped".
+func statusProviderPartial(sp any) bool {
+	p, ok := sp.(*statusProvider)
+	return ok && p.partial.Load()
+}
+
+// markStatusProviderPartial flags sp as partial from an external bounded
+// call site (e.g. an outer observation timeout in cmd_citystatus.go) that
+// doesn't go through boundedStatusCall directly. No-op if sp isn't a
+// *statusProvider.
+func markStatusProviderPartial(sp any) {
+	if p, ok := sp.(*statusProvider); ok {
+		p.partial.Store(true)
+	}
 }
 
 func newBoundedStatusProvider(base runtime.Provider) runtime.Provider {
@@ -41,6 +64,7 @@ func boundedStatusCall[T any](p *statusProvider, fallback T, fn func() T) T {
 	case result := <-resultCh:
 		return result
 	case <-time.After(statusProviderCallTimeout):
+		p.partial.Store(true)
 		p.warnOnce.Do(statusProviderTimeoutWarning)
 		return fallback
 	}
