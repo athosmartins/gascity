@@ -2171,6 +2171,46 @@ func TestPoolDemandLabelFilterJQExcludesParkLabels(t *testing.T) {
 	}
 }
 
+// TestPoolDemandLabelFilterJQExcludesTextVeto (ga-42mlf) closes the last
+// missing class from ga-ojh09's acceptance criteria: pilot:text-veto:<slug>
+// is the label _reconcile_text_veto_labels (pilot-dispatcher.sh) stamps on a
+// bead vetoed by TEXT content — it makes a veto that used to live only in the
+// Pilot's log VISIBLE on the bead. poolDemandLabelFilterJQ never learned the
+// prefix, so the dog pool's self-serve probe disagreed with the Pilot: the
+// Pilot honors the veto, the probe handed the bead out as available work
+// anyway. Like pool:refused:*/pilot:held*/pilot:refused-reason:*, the slug
+// suffix means bd's exact-match --exclude-label cannot express this; it has
+// to be a jq prefix check. Negative control: a label merely containing the
+// substring "text-veto" without the "pilot:" owner prefix must survive —
+// proves the check is anchored to the whole "pilot:text-veto" prefix, not a
+// loose substring match.
+func TestPoolDemandLabelFilterJQExcludesTextVeto(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; poolDemandLabelFilterJQ is a jq pipeline")
+	}
+
+	input := `[{"id":"text-veto-engine-rebuild","labels":["pilot:text-veto:engine-rebuild-text-pattern"]},{"id":"text-veto-athos-decide","labels":["area:infra","pilot:text-veto:athos-decide-phrase-text-pattern"]},{"id":"lookalike-survives","labels":["story:text-veto-mentioned"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
+
+	shellCmd := "printf '%s' '" + input + "' | " + poolDemandLabelFilterJQ()
+	cmd := exec.Command("sh", "-c", shellCmd)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run poolDemandLabelFilterJQ: %v", err)
+	}
+
+	got := strings.TrimSpace(string(out))
+	for _, wantAbsent := range []string{`"text-veto-engine-rebuild"`, `"text-veto-athos-decide"`} {
+		if strings.Contains(got, wantAbsent) {
+			t.Errorf("poolDemandLabelFilterJQ() output = %s, must not contain text-veto-labeled id %s", got, wantAbsent)
+		}
+	}
+	for _, wantPresent := range []string{`"lookalike-survives"`, `"clean-survives"`} {
+		if !strings.Contains(got, wantPresent) {
+			t.Errorf("poolDemandLabelFilterJQ() output = %s, missing non-vetoed id %s (over-matched)", got, wantPresent)
+		}
+	}
+}
+
 func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.T) {
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	got := a.EffectiveAssignedReadyQuery()

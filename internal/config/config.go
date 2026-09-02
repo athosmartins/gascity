@@ -3379,7 +3379,15 @@ func poolDemandLabelFilterJQ() string {
 			// pilot:refused-reason:* likewise. Kept here rather than in
 			// bdReadyPoolDemandExcludeLabelArgs precisely because bd's
 			// --exclude-label is exact-match only.
-			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:"))) | length) == 0) ]`)
+			// ga-42mlf: pilot:text-veto:<slug> is the 5th veto class ga-ojh09
+			// required and the only one still missing. _reconcile_text_veto_labels
+			// (pilot-dispatcher.sh) stamps it on a bead the Pilot vetoed by TEXT
+			// content (engine-rebuild mention, DECISAO title, "only Athos decides"
+			// phrase, compliance marker, diagnostic-only body), making a veto that
+			// used to live only in the Pilot's log visible on the bead. Without it
+			// the dog pool's self-serve probe DISAGREED with the Pilot it mirrors:
+			// Pilot honors the veto, probe handed the bead out as available work.
+			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]`)
 }
 
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
