@@ -2542,6 +2542,118 @@ esac
 	}
 }
 
+// TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveMoleculeStep is the
+// ga-i5bu7 regression: during a mol-do-work run the STORY bead stays
+// open+unassigned for the run's whole duration (only its STEP bead carries
+// in_progress state), so before this fix the routed-pool probe kept
+// re-offering the story to every fresh worker that polled while the real
+// owner (a different worker, holding the live step) was still executing it —
+// burning a claim cycle each time, worst case racing a less careful worker
+// into redoing work already in flight. Two candidates are offered: the live
+// one must be excluded, and the untouched survivor behind it must still be
+// served — proving the filter runs before the sort/slice, not that it
+// merely empties the result.
+func TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveMoleculeStep(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+    printf '[{"id":"story-live-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-live"}},{"id":"story-no-molecule","priority":2,"created_at":"2026-08-27T20:00:00Z","metadata":{}}]'
+    ;;
+  *"list --parent mol-live --status in_progress --json --limit 1"*)
+    printf '[{"id":"step-live","status":"in_progress"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if strings.Contains(out, "story-live-molecule") {
+		t.Fatalf("EffectiveWorkQuery() re-offered a story whose molecule has a live in_progress step: %q", out)
+	}
+	if !strings.Contains(out, "story-no-molecule") {
+		t.Fatalf("EffectiveWorkQuery() dropped the untouched survivor behind the excluded live-molecule story: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueKeepsStoryWithClosedMoleculeStep proves the
+// filter is narrow: a story whose molecule run has already finished (its step
+// closed, or the molecule id dangling/unknown) must still be served normally.
+// bd list --parent returns [] (exit 0) for both a closed step and an unknown
+// parent id — verified live against the real bd binary, not assumed — so a
+// single fixture covers both cases.
+func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithClosedMoleculeStep(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+    printf '[{"id":"story-closed-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-closed"}}]'
+    ;;
+  *"list --parent mol-closed --status in_progress --json --limit 1"*)
+    printf '[]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "story-closed-molecule") {
+		t.Fatalf("EffectiveWorkQuery() dropped a story whose molecule step is no longer live: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueKeepsStoryWithNoMoleculeID locks in the
+// majority-case default: most routed-pool work is not a graph.v2 molecule run
+// at all, so a candidate with no metadata.molecule_id must pass through
+// unfiltered. This is the shape every other EffectiveWorkQuery test already
+// exercises implicitly; it is asserted explicitly here so a future change to
+// moleculeLiveStepFilterShell that narrows this default is caught directly
+// rather than only as collateral damage in unrelated tests.
+func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithNoMoleculeID(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+    printf '[{"id":"story-plain","priority":2,"created_at":"2026-08-27T19:00:00Z"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "story-plain") {
+		t.Fatalf("EffectiveWorkQuery() dropped a plain candidate with no molecule_id at all: %q", out)
+	}
+}
+
+// TestMoleculeLiveStepFilterShellNeverUsesCaseInPipedWhile pins down a real,
+// non-obvious parser constraint discovered while writing this filter: a
+// `case` statement nested inside a `while read` loop that is itself inside a
+// `$(...)` command substitution fails to PARSE (not just behave wrong) under
+// this fleet's actual `/bin/sh` (Apple's bash 3.2 running in `sh` mode) —
+// "syntax error near unexpected token `;;'" — even though the identical
+// construct parses fine under `bash` invoked directly or `bash --posix`.
+// Confirmed by direct execution against /bin/sh on the machine this was
+// written on, not inferred from documentation. Every pool probe in this file
+// runs via `sh -c`, so a future refactor that "simplifies" the if/elif in
+// moleculeLiveStepFilterShell back into a case statement would silently ship
+// a script that cannot parse — this guard fails the build instead.
+func TestMoleculeLiveStepFilterShellNeverUsesCaseInPipedWhile(t *testing.T) {
+	got := moleculeLiveStepFilterShell()
+	if strings.Contains(got, "case ") {
+		t.Fatalf("moleculeLiveStepFilterShell() = %q, must not use a case statement inside its while-read-in-$() loop — this fails to parse under this fleet's /bin/sh, see the function's own doc-comment", got)
+	}
+}
+
 func TestEffectiveSlingQueryPoolNameOverride(t *testing.T) {
 	a := Agent{
 		Name:              "dog-1",

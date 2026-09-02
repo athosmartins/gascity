@@ -3390,6 +3390,76 @@ func poolDemandLabelFilterJQ() string {
 			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]`)
 }
 
+// moleculeLiveStepFilterShell returns a shell pipeline stage that reads a bd
+// JSON candidate array on stdin and drops any candidate whose graph.v2
+// molecule run already has a live (status=in_progress) step bead — i.e. a
+// different worker is already executing this story's molecule right now.
+//
+// ga-i5bu7: during a mol-do-work run the STORY bead stays open+unassigned for
+// the run's whole duration (only the STEP bead carries in_progress state), so
+// the routed-pool probe kept re-offering the story to every fresh worker that
+// polled while the real owner (a different worker, holding the live step) was
+// still executing it — burning a claim cycle each time, worst case racing a
+// less careful worker into redoing work already in flight. Traced against a
+// real closed example (wa-e30u5/wa-3hrgk/wa-1kszx, structure confirmed live
+// via bd show --json, not assumed): the story carries metadata.molecule_id
+// pointing at the molecule bead, and the molecule's live step is a plain
+// parent-child dependency edge — `bd list --parent <molecule-id> --status
+// in_progress --json` — not a second metadata hop.
+//
+// A candidate with no molecule_id (the majority case: most routed-pool work
+// is not a graph.v2 molecule run) passes through unfiltered — this check only
+// ever narrows a molecule-run story, never anything else.
+//
+// bd list --parent returns [] (exit 0) for an unknown/dangling parent id
+// rather than erroring (verified live against the real bd binary), so a
+// candidate is excluded ONLY when the lookup returns a confirmed non-empty
+// JSON array (starts with "[", ends with "]", is not literally "[]");
+// anything else — "[]", empty stdout from a systemic bd failure, or an
+// unexpected shape such as a stdout-emitted `{"error":...}` (bd does this on
+// other subcommands, e.g. `bd show` on an unknown id) — falls through to the
+// KEEP branch. This is deliberate fail-open: this stage refines an
+// already-successfully-fetched candidate set, not the primary demand fetch
+// poolDemandCountShell's own doc-comment protects against masking, and the
+// failure this bug fixes (an occasional wasted claim cycle) is far cheaper
+// than the failure fail-closed would risk (a healthy candidate hidden,
+// starving the pool of real ready work).
+//
+// The shape check deliberately uses `if`/`elif` with parameter-expansion
+// prefix/suffix stripping (`${live#\[}` / `${live%\]}`) instead of a `case`
+// statement. A `case` block nested inside this exact shape — a `while read`
+// loop that is itself inside a `$(...)` command substitution — fails to
+// parse under this fleet's actual `/bin/sh` (Apple's bash 3.2 running as
+// `sh`, not as `bash`) with "syntax error near unexpected token `;;'",
+// confirmed by direct execution, even though the identical script parses
+// fine under `bash` invoked directly or under `bash --posix`. Every pool
+// probe in this file runs via `sh -c`, so this is a real constraint on this
+// file, not a portability nicety — verify any future edit to this function
+// by executing it with `sh`, not just `bash`, before trusting it.
+//
+// No stderr redirection is used inside this stage by design: bd list
+// --parent's own empty/[] fail-open behavior on a bad parent id makes an
+// internal `2>/dev/null` unnecessary for correctness, which keeps this stage
+// safe to call unmodified from both routedReadyTierCommand (which wraps it in
+// its own tolerant `2>/dev/null`) and poolDemandCountShell (whose
+// TestEffectiveScaleCheckUsesReadyOnly regression test asserts the generated
+// script never contains "2>/dev/null" at all — see bdReadyPoolDemandShell's
+// doc-comment on why the two callers must share one predicate).
+func moleculeLiveStepFilterShell() string {
+	return `{ ` +
+		`cands=$(cat); ` +
+		`keep_ids=$(printf "%s" "$cands" | jq -r ` + shellquote.Quote(`.[] | [.id, (.metadata["molecule_id"] // "")] | @tsv`) + ` | while IFS="$(printf '\t')" read -r cid mid; do ` +
+		`[ -z "$cid" ] && continue; ` +
+		`if [ -z "$mid" ]; then printf "%s\n" "$cid"; continue; fi; ` +
+		`live=$(bd list --parent "$mid" --status in_progress --json --limit 1); ` +
+		`if [ "$live" = "[]" ] || [ -z "$live" ]; then printf "%s\n" "$cid"; ` +
+		`elif [ "${live#\[}" != "$live" ] && [ "${live%\]}" != "$live" ]; then :; ` +
+		`else printf "%s\n" "$cid"; fi; ` +
+		`done); ` +
+		`printf "%s" "$cands" | jq -c --arg ids "$keep_ids" ` + shellquote.Quote(`($ids | split("\n") | map(select(length > 0))) as $keep | [.[] | select(.id as $i | $keep | index($i) != null)]`) + `; ` +
+		`}`
+}
+
 // bdReadyPoolDemandMigrationShell is a temporary raw compatibility probe for
 // graph.v2 workflow roots created before gc.routed_to root stamping shipped.
 // It is scoped to workflow roots so gc.run_target remains an authoring hint
@@ -3510,7 +3580,12 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// switch to --sort newest (see bead body: that starves the old backlog
 	// instead) and not a new label/state — LRU-by-existing-timestamp is the
 	// minimal change that stops one bead from monopolizing the only slot served.
-	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
+	//
+	// ga-i5bu7: moleculeLiveStepFilterShell runs AFTER poolDemandLabelFilterJQ
+	// but BEFORE the sort_by/.[0:1] slice, for the same filter-then-slice
+	// reason as ga-zgfxx/ga-avvu2 AC1 above — excluding it from the unsliced
+	// survivor set could hide a real candidate behind a filtered-out head.
+	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3553,9 +3628,21 @@ func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 	// function exists to prevent (caught live by
 	// TestEffectiveScaleCheckUsesReadyOnly, which asserts the generated
 	// script never contains "2>/dev/null").
+	// ga-i5bu7: moleculeLiveStepFilterShell is applied only to ready_json (the
+	// PRIMARY gc.routed_to tier) — this is deliberately scoped to match the
+	// traced bug exactly, not extended to the legacy_json/legacy_ephemeral_json
+	// fallback tiers below, which predate the graph.v2 stamping this filter
+	// depends on (metadata.molecule_id) and were never verified to carry it. It
+	// gets `|| exit $?` like every other filter stage per this function's own
+	// no-masking doc-comment above, but — per moleculeLiveStepFilterShell's own
+	// doc-comment — that stage never emits "2>/dev/null" internally and only
+	// fails (non-zero) on a genuine jq crash, never on an ordinary bd list
+	// --parent miss, so this does not reintroduce the masking failure mode
+	// TestEffectiveScaleCheckUsesReadyOnly guards against.
 	script := `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
+		`ready_json=$(printf "%s" "$ready_json" | ` + moleculeLiveStepFilterShell() + `) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
