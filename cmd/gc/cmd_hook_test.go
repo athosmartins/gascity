@@ -1218,6 +1218,71 @@ dir = "myrig"
 	}
 }
 
+// TestCmdHookNoArgFallsBackToBareAgentWhenTemplateUnresolvable is the
+// ga-f9zou regression. A named crew agent (e.g. batista-wa) is configured
+// without a rig-prefixed dir — its QualifiedName() is just its bare name —
+// even though it runs inside a rig via work_dir. The runtime nonetheless
+// sets GC_TEMPLATE to a rig-qualified form ("whatsapp_automation/batista-wa")
+// for its session (confirmed live: `gc agent list --json` shows
+// qualified_name == "batista-wa", scope == null). Before this fix, the
+// no-arg path unconditionally resolved against that qualified template and
+// failed with "agent ... not found in config", because
+// resolveAgentIdentity's unqualified-name paths (contextual rig join,
+// unambiguous bare-name scan) are both skipped whenever the input contains
+// "/". `gc hook batista-wa` (positional) already worked; bare `gc hook` —
+// the form the documented contract and the session-start protocol use —
+// did not.
+func TestCmdHookNoArgFallsBackToBareAgentWhenTemplateUnresolvable(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	cityDir := t.TempDir()
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// No "dir" field, matching the live batista-wa config entry.
+	cityToml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "batista-wa"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeBD := filepath.Join(fakeBin, "bd")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %q\nprintf '[]'\n", logPath)
+	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_CITY", cityDir)
+	// Mirrors the live env captured in ga-f9zou: GC_TEMPLATE is rig-qualified
+	// even though the agent's own config entry has no rig prefix.
+	t.Setenv("GC_TEMPLATE", "whatsapp_automation/batista-wa")
+	t.Setenv("GC_AGENT", "batista-wa")
+	t.Setenv("GC_SESSION_ID", "sess-hook-789")
+	t.Setenv("GC_SESSION_NAME", "batista-wa-runtime-session")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithFormat(nil, false, "", &stdout, &stderr)
+	if strings.Contains(stderr.String(), "not found in config") {
+		t.Fatalf("gc hook (no arg) did not fall back to bare $GC_AGENT; stderr=%s", stderr.String())
+	}
+	if code != 1 {
+		t.Fatalf("cmdHookWithFormat() = %d, want 1 for empty work; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("work query never ran (agent resolution must have failed): %v", err)
+	}
+	if !strings.Contains(string(logData), "--assignee=batista-wa-runtime-session") {
+		t.Fatalf("bd log = %q, want work query to run with the runtime session identity", string(logData))
+	}
+}
+
 func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	runner := func(_, _ string) (string, error) {

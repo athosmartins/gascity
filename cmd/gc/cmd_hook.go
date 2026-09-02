@@ -63,6 +63,7 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 	if agentName == "" {
 		agentName = os.Getenv("GC_AGENT")
 	}
+	bareAgentName := agentName
 	sessionTemplateContext := false
 	if len(args) == 0 {
 		template := strings.TrimSpace(os.Getenv("GC_TEMPLATE"))
@@ -75,6 +76,7 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 	}
 	if len(args) > 0 {
 		agentName = args[0]
+		bareAgentName = args[0]
 	}
 	if agentName == "" {
 		fmt.Fprintln(stderr, "gc hook: agent not specified (set $GC_AGENT or pass as argument)") //nolint:errcheck // best-effort stderr
@@ -103,6 +105,22 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 	}
 
 	a, ok := resolveAgentIdentity(cfg, agentName, currentRigContext(cfg))
+	if !ok && sessionTemplateContext && bareAgentName != "" && bareAgentName != agentName {
+		// GC_TEMPLATE can be rig-qualified (e.g. "whatsapp_automation/batista-wa")
+		// for an agent whose own config entry has no Dir/rig prefix (Dir == "",
+		// QualifiedName() == "batista-wa") — a named crew agent addressed by
+		// work_dir rather than the Dir field. resolveAgentIdentity only tries
+		// its unqualified-name paths (contextual rig join, unambiguous bare-name
+		// scan) when the input has no "/", so the qualified template string
+		// above resolves to nothing even though the agent is configured and the
+		// bare identity resolves fine. Falling back here restores the
+		// documented contract ("The agent is determined from $GC_AGENT or a
+		// positional argument") for this class of agent. #ga-f9zou.
+		if fallback, fallbackOK := resolveAgentIdentity(cfg, bareAgentName, currentRigContext(cfg)); fallbackOK {
+			a, ok = fallback, true
+			agentName = bareAgentName
+		}
+	}
 	if !ok {
 		fmt.Fprintf(stderr, "gc hook: agent %q not found in config\n", agentName) //nolint:errcheck // best-effort stderr
 		return 1
