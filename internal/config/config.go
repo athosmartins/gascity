@@ -3358,13 +3358,30 @@ func bdReadyPoolDemandExcludeLabelArgs() string {
 // are required, neither is redundant. Anchored at the start with a colon/
 // whitespace delimiter so a title that merely mentions "epic" mid-sentence
 // (e.g. a bug report about this exact gap) is never over-matched.
+// assignedTierRefusalAndHoldJQStages returns the jq `select(...)` pipeline
+// stages for the two veto classes that answer "did a PRIOR incarnation of
+// THIS EXACT assignee already decide against this bead" — pool:refused:*
+// (an explicit worker refusal) and pilot:held/pilot:held-until:* (a live
+// Pilot hold). Shared verbatim between poolDemandLabelFilterJQ (Tier 3:
+// should ANYONE ever be offered this bead as NEW work) and
+// assignedTierExclusionFilterJQ (Tier 1/2: is this bead already MINE)
+// because both questions legitimately want the same answer for these two
+// families — see each caller's own doc-comment for why the other veto
+// families below do NOT belong in both.
+//
+// Emits pipeline stages only (not a complete filter) — the caller supplies
+// the enclosing `[ .[] ... ]` wrapper.
+func assignedTierRefusalAndHoldJQStages() string {
+	return `| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) ` +
+		`| select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) ` +
+		`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) ` +
+		`| if length > 0 then (max < $now_ts) else false end)) `
+}
+
 func poolDemandLabelFilterJQ() string {
 	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
 		`[ .[] `+
-			`| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) `+
-			`| select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) `+
-			`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) `+
-			`| if length > 0 then (max < $now_ts) else false end)) `+
+			assignedTierRefusalAndHoldJQStages()+
 			`| select(((.title // "") | test("^(EPIC|ÉPICO)[:\\s]"; "i")) | not) `+
 			// ga-5huvs: the PREFIX half of the same three vetoes. blocked:<reason>
 			// ga-87cgp: blocked-reason:<slug> is a SEPARATE family (hyphen, not
@@ -3387,7 +3404,62 @@ func poolDemandLabelFilterJQ() string {
 			// used to live only in the Pilot's log visible on the bead. Without it
 			// the dog pool's self-serve probe DISAGREED with the Pilot it mirrors:
 			// Pilot honors the veto, probe handed the bead out as available work.
+			//
+			// ga-hiz5d: this function answers "is this bead fresh, offerable, NEW
+			// work" — it must stay this broad, and it must stay Tier-3-only. Do
+			// NOT reuse it for an "is this already MINE" check (Tier 1/2); see
+			// assignedTierExclusionFilterJQ's doc-comment for why that conflation
+			// is a live double-dispatch bug, not just an over-match.
 			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]`)
+}
+
+// assignedTierExclusionFilterJQ is the "is this already mine" filter for the
+// assigned-in-progress (Step 1a/Tier 1) and assigned-ready (Step 1b/Tier 2)
+// work-query tiers — deliberately narrower than poolDemandLabelFilterJQ.
+//
+// ga-hiz5d (root-cause remedy #1 for ga-zbrbt — a session became assignee of
+// two different in-flight beads at once): for as long as it existed, the
+// assigned tiers reused poolDemandLabelFilterJQ() wholesale — the exact
+// filter Tier 3 (routed-pool: "should ANYONE ever be offered this bead as
+// NEW work") uses. That conflated two different questions.
+// pool:refused:* and pilot:held/pilot:held-until: legitimately answer BOTH
+// questions: they mean "a PRIOR incarnation of THIS EXACT assignee already
+// decided against this bead" (ga-ael6v/ga-ox2yw), so hiding it from a
+// resume-check is correct — otherwise a freshly-reassigned identity
+// (inflight-reclaim-guard handed the same slot to a new session) treats a
+// refused bead as its own live crash-recovery and redoes work a prior
+// incarnation already declined.
+//
+// But the other four veto families poolDemandLabelFilterJQ grew over
+// time — blocked:*/blocked-reason:*, gate:needs-human, pilot:refused-
+// reason:*, pilot:text-veto:* — plus the EPIC-title heuristic, all mean
+// "this bead is currently parked/vetoed for some reason a FUTURE claimant
+// must respect." None of them say anything about MY OWN prior claim. A LIVE
+// session that parks its own in-progress bead — e.g. adds
+// blocked-reason:decision while waiting on an Athos decision (the wa-0wvss
+// "Sua vez" pattern), without releasing assignee/status (there is nothing
+// else to release: the session is still alive, still owns the work, just
+// blocked on an answer) — used to vanish from its own Step 1a/1b on the
+// very next hook cycle, because a filter meant for "should a DIFFERENT
+// claimant see this" was also gating "do I already own this." Finding
+// nothing of its own, the session fell through to Tier 3 and self-served a
+// completely different bead — leaving the parked bead assigned-but-
+// invisible and the session double-booked: exactly ga-zbrbt's measured
+// symptom (a session shows as assignee on two in-flight beads, the
+// reclaim-guard treats the session's OTHER live work as proof of life for
+// BOTH, and the parked bead never gets reclaimed within RECLAIM_TTL).
+//
+// This mirrors a principle gc-udx already established for issue TYPE
+// (TestEffectiveWorkQueryExcludesEpics: "assigned tiers do NOT exclude
+// epics — an agent must resume its own assigned ephemeral epic wisp") —
+// same reasoning, generalized from one exclusion (--exclude-type=epic) to
+// the rest of the label surface poolDemandLabelFilterJQ grew without the
+// same scrutiny. Ownership (assignee + status) is the only thing that
+// should ever answer "is this mine" — never a label whose entire purpose is
+// steering whether a DIFFERENT, future claimant may pick the bead up.
+func assignedTierExclusionFilterJQ() string {
+	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
+		`[ .[] `+assignedTierRefusalAndHoldJQStages()+`]`)
 }
 
 // moleculeLiveStepFilterShell returns a shell pipeline stage that reads a bd
@@ -3665,42 +3737,51 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 		standardAssignedReadyWorkQueryScript(includeEphemeralReady)
 }
 
-// ga-ael6v: applies poolDemandLabelFilterJQ to the assigned-in-progress tier.
-// A refused bead (pool:refused:<reason>) deliberately keeps status=in_progress
-// and its assignee — refuse doesn't clear either, so inflight-reclaim-guard can
-// still find it as in-flight — but if that assignee later gets reassigned to a
-// FRESH session (the reclaim-guard's own job), the new session's Step 1a saw
-// "assigned in-progress work" and resumed it as if it were live crash-recovery,
-// re-doing (and re-refusing) work a prior incarnation already decided against.
-// Same root as ga-g7yt/ga-y8qh (routed-pool tier): the pool:refused:* prefix
-// can't be expressed by an exact bd flag, so every reader of a pool-owned bead
-// must apply poolDemandLabelFilterJQ, not just the tier that discovers NEW work.
+// ga-ael6v: applies the assigned-tier refusal/hold filter to the
+// assigned-in-progress tier. A refused bead (pool:refused:<reason>)
+// deliberately keeps status=in_progress and its assignee — refuse doesn't
+// clear either, so inflight-reclaim-guard can still find it as in-flight —
+// but if that assignee later gets reassigned to a FRESH session (the
+// reclaim-guard's own job), the new session's Step 1a saw "assigned
+// in-progress work" and resumed it as if it were live crash-recovery,
+// re-doing (and re-refusing) work a prior incarnation already decided
+// against. Same root as ga-g7yt/ga-y8qh (routed-pool tier): the
+// pool:refused:* prefix can't be expressed by an exact bd flag, so every
+// reader of a pool-owned bead must apply this filter, not just the tier
+// that discovers NEW work.
+// ga-hiz5d: uses assignedTierExclusionFilterJQ, NOT the full
+// poolDemandLabelFilterJQ — see that function's doc-comment for why
+// applying the broader NEW-work filter here caused a session to lose track
+// of its own parked-but-still-owned bead and double-book itself.
 // --limit=1 widened to 20 for the same reason as routedReadyTierCommand: a
 // filtered-out top row must not hide a real in-progress bead behind it.
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
 }
 
-// ga-ox2yw: applies poolDemandLabelFilterJQ to the assigned-ready tier — the
-// third and last instance of the same bug class ga-ael6v fixed for
-// assigned-in-progress and ga-avvu2 fixed for routed-pool. A refused bead
-// (pool:refused:<reason>) keeps its assignee after reclaim; Step 1a now
-// filters that case for the in-progress tier, but Step 1b (this function)
-// read straight from `bd ready` with no filter, so the SAME refused bead
-// re-surfaces here the moment reclaim flips status back to open. Observed
-// live 3+ times in one day on the same bead/pool-slot (ga-mww6n, dog pool
-// gastown.dog-3) before this fix. --limit=1 widened to 20 for the same
+// ga-ox2yw: applies the assigned-tier refusal/hold filter to the
+// assigned-ready tier — the third and last instance of the same bug class
+// ga-ael6v fixed for assigned-in-progress and ga-avvu2 fixed for
+// routed-pool. A refused bead (pool:refused:<reason>) keeps its assignee
+// after reclaim; Step 1a now filters that case for the in-progress tier,
+// but Step 1b (this function) read straight from `bd ready` with no filter,
+// so the SAME refused bead re-surfaces here the moment reclaim flips status
+// back to open. Observed live 3+ times in one day on the same bead/pool-slot
+// (ga-mww6n, dog pool gastown.dog-3) before this fix.
+// ga-hiz5d: uses assignedTierExclusionFilterJQ, NOT the full
+// poolDemandLabelFilterJQ — see that function's doc-comment.
+// --limit=1 widened to 20 for the same
 // reason as routedReadyTierCommand/standardAssignedInProgressWorkQueryScript:
 // a filtered-out top row must not hide real ready work behind it.
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -3721,7 +3802,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3737,7 +3818,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3748,11 +3829,14 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 // routedReadyTierCommand) — matches on assignee first, then applies the
 // canonical pool:refused:*/pilot:held* predicate to the matched set before
 // taking the first row, so a refused ephemeral wisp can't shadow a real one.
+// ga-hiz5d: this is the ephemeral-wisp sibling of the assigned-in-progress
+// tier, so it uses assignedTierExclusionFilterJQ (not the full
+// poolDemandLabelFilterJQ) for the same "is this already mine" reasoning.
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
-		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
@@ -3762,6 +3846,9 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
 // call with no pool:refused check at all; limit widened to 0 (no pre-slice) so
 // the pool:refused/pilot:held predicate sees every assignee-matched candidate
 // before anything is dropped, then a separate jq call takes the first survivor.
+// ga-hiz5d: uses assignedTierExclusionFilterJQ (not the full
+// poolDemandLabelFilterJQ) for the same "is this already mine" reasoning as
+// its assigned-in-progress sibling above.
 func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bool) string {
 	if includeEphemeralReady {
 		return ""
@@ -3769,7 +3856,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 0)
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null | ` +
-		poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
