@@ -268,6 +268,12 @@ func defaultRunRepoCacheGit(dir string, args ...string) (string, error) {
 		}
 		cmd.Env = append(cmd.Env, e)
 	}
+	// Pin GIT_DIR/GIT_WORK_TREE to this exact cache directory so a missing or
+	// incomplete .git here (partial clone, interrupted install) fails cleanly
+	// instead of git's repository discovery silently walking up to whatever
+	// real repository happens to sit in an ancestor directory (e.g. the
+	// process's own $TMPDIR or $HOME) and returning ITS unrelated HEAD/status.
+	cmd.Env = append(cmd.Env, "GIT_DIR="+filepath.Join(dir, ".git"), "GIT_WORK_TREE="+dir)
 	cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
