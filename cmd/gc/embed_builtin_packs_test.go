@@ -1568,3 +1568,249 @@ func TestMaterializeFS_PreservesExistingFiles(t *testing.T) {
 		t.Fatalf("missing-file rescaffold failed: got %q, want %q", got, "embedded-b")
 	}
 }
+
+// captureBuiltinPackDriftWarnings redirects pack drift warnings into a buffer
+// for the duration of the test. Not parallel-safe by construction — callers
+// must not call t.Parallel().
+func captureBuiltinPackDriftWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := builtinPackDriftWarningWriter
+	builtinPackDriftWarningWriter = func() io.Writer { return &buf }
+	t.Cleanup(func() { builtinPackDriftWarningWriter = prev })
+	return &buf
+}
+
+// overwritePreservingMode rewrites a file with new content but keeps its mode,
+// which is what makes materializeFS take the preserve-operator-edits branch —
+// a wrong-mode file would be repaired instead of preserved, and no drift would
+// ever be observable.
+func overwritePreservingMode(t *testing.T, path string, content []byte) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat(%s): %v", path, err)
+	}
+	if err := os.WriteFile(path, content, info.Mode().Perm()); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
+	if err := os.Chmod(path, info.Mode().Perm()); err != nil {
+		t.Fatalf("Chmod(%s): %v", path, err)
+	}
+}
+
+// TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits is the unit
+// guard for ga-8j89i part 1: a non-required pack file that materializeFS
+// leaves in place because it might be an operator edit must still be REPORTED
+// when it no longer matches the embedded bytes. Preserving it silently is what
+// let .gc/system/packs/dolt/commands/compact/run.sh run 6+ days behind the
+// binary while gc config show/gc reload ran repeatedly.
+func TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits(t *testing.T) {
+	dst := t.TempDir()
+	embedded := fstest.MapFS{
+		"a.txt":     {Data: []byte("embedded-a"), Mode: 0o644},
+		"b.txt":     {Data: []byte("embedded-b"), Mode: 0o644},
+		"sub/c.txt": {Data: []byte("embedded-c"), Mode: 0o644},
+	}
+
+	// First materialize scaffolds everything: nothing is preserved, so nothing
+	// can have drifted.
+	first := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &first); err != nil {
+		t.Fatalf("first materializeFSCollectingDrift: %v", err)
+	}
+	if first.hasFindings() {
+		t.Fatalf("fresh materialize reported drift: changed=%v unreadable=%v", first.changed, first.unreadable)
+	}
+
+	// Second materialize with untouched files: still no drift. This is the
+	// false-positive guard — every gc invocation would warn otherwise.
+	second := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &second); err != nil {
+		t.Fatalf("second materializeFSCollectingDrift: %v", err)
+	}
+	if second.hasFindings() {
+		t.Fatalf("clean materialize reported drift: changed=%v unreadable=%v", second.changed, second.unreadable)
+	}
+
+	// Now the file on disk diverges from the binary. Same length as the
+	// embedded bytes on purpose: a size-only comparison would miss it.
+	overwritePreservingMode(t, filepath.Join(dst, "b.txt"), []byte("EMBEDDED-B"))
+
+	third := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &third); err != nil {
+		t.Fatalf("third materializeFSCollectingDrift: %v", err)
+	}
+	if len(third.changed) != 1 || third.changed[0] != "b.txt" {
+		t.Fatalf("changed = %v, want exactly [b.txt]", third.changed)
+	}
+	if len(third.unreadable) != 0 {
+		t.Fatalf("unreadable = %v, want empty", third.unreadable)
+	}
+
+	// The edit must still be preserved — the warning reports, it never repairs.
+	got, err := os.ReadFile(filepath.Join(dst, "b.txt"))
+	if err != nil {
+		t.Fatalf("read b.txt: %v", err)
+	}
+	if string(got) != "EMBEDDED-B" {
+		t.Fatalf("drift reporting overwrote the operator edit: got %q", got)
+	}
+
+	// nil report keeps the old behaviour and does no comparison work.
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, nil); err != nil {
+		t.Fatalf("nil-report materializeFSCollectingDrift: %v", err)
+	}
+}
+
+// TestMaterializeFSCollectingDrift_RequiredPackRepairsInsteadOfReporting
+// asserts the warning is scoped to the packs that actually go stale. Required
+// packs (preserveOperatorEdits == false) are rewritten from the embedded bytes,
+// so they must never appear as drift.
+func TestMaterializeFSCollectingDrift_RequiredPackRepairsInsteadOfReporting(t *testing.T) {
+	dst := t.TempDir()
+	embedded := fstest.MapFS{"a.txt": {Data: []byte("embedded-a"), Mode: 0o644}}
+
+	if _, err := materializeFSCollectingDrift(embedded, dst, false, nil); err != nil {
+		t.Fatalf("first materialize: %v", err)
+	}
+	overwritePreservingMode(t, filepath.Join(dst, "a.txt"), []byte("stale-abcd"))
+
+	report := packDriftReport{pack: "required"}
+	if _, err := materializeFSCollectingDrift(embedded, dst, false, &report); err != nil {
+		t.Fatalf("second materialize: %v", err)
+	}
+	if report.hasFindings() {
+		t.Fatalf("required pack reported drift instead of being repaired: %+v", report)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil {
+		t.Fatalf("read a.txt: %v", err)
+	}
+	if string(got) != "embedded-a" {
+		t.Fatalf("required pack not repaired: got %q", got)
+	}
+}
+
+// TestRecordPreservedPackDrift_UnreadableFileIsUnknownNotClean is the
+// third-state guard. A file we cannot read must land in `unreadable`, never be
+// silently counted as matching — "could not compare" and "compares equal" must
+// not produce the same value.
+func TestRecordPreservedPackDrift_UnreadableFileIsUnknownNotClean(t *testing.T) {
+	dir := t.TempDir()
+	embedded := fstest.MapFS{"a.txt": {Data: []byte("embedded-a"), Mode: 0o644}}
+
+	report := packDriftReport{pack: "test"}
+	recordPreservedPackDrift(&report, embedded, "a.txt", filepath.Join(dir, "does-not-exist.txt"))
+
+	if len(report.changed) != 0 {
+		t.Fatalf("changed = %v, want empty", report.changed)
+	}
+	if len(report.unreadable) != 1 || !strings.HasPrefix(report.unreadable[0], "a.txt (") {
+		t.Fatalf("unreadable = %v, want one entry for a.txt", report.unreadable)
+	}
+	if !report.hasFindings() {
+		t.Fatal("hasFindings() = false for an uncomparable file; drift unknown must not read as clean")
+	}
+
+	lines := builtinPackDriftWarningLines(dir, report)
+	if len(lines) != 1 || !strings.Contains(lines[0], "drift is unknown, not absent") {
+		t.Fatalf("warning lines = %q, want an explicit unknown-drift warning", lines)
+	}
+}
+
+// TestMaterializeBuiltinPacksWarnsWhenNonRequiredPackDriftsFromBinary is the
+// end-to-end guard for ga-8j89i: after a binary upgrade the materialized dolt
+// pack keeps running its old content, and the only thing that can tell the
+// operator is this warning. Four sessions (3 dogs + the Mayor) burned full
+// investigations on ga-qu0hi chasing "the patch does not apply" when the real
+// cause was "the file on disk was never updated".
+func TestMaterializeBuiltinPacksWarnsWhenNonRequiredPackDriftsFromBinary(t *testing.T) {
+	t.Setenv("GC_BEADS", "")
+	dir := t.TempDir()
+	if err := writeBuiltinPackLoadTestCity(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializeBuiltinPacks(dir); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
+	}
+
+	stderr := captureBuiltinPackDriftWarnings(t)
+
+	// A clean city must stay silent.
+	if err := MaterializeBuiltinPacks(dir); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks() clean rerun error: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("clean city emitted a drift warning: %q", stderr.String())
+	}
+
+	// dolt is non-required under the default provider, so this edit survives
+	// every future materialize — exactly the silent staleness being reported.
+	target := filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "commands", "compact", "run.sh")
+	overwritePreservingMode(t, target, []byte("#!/bin/sh\necho stale-from-an-older-binary\n"))
+
+	if err := MaterializeBuiltinPacks(dir); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks() after drift error: %v", err)
+	}
+
+	got := stderr.String()
+	if !strings.Contains(got, `builtin pack "dolt"`) {
+		t.Fatalf("drift warning does not name the pack: %q", got)
+	}
+	if !strings.Contains(got, "commands/compact/run.sh") {
+		t.Fatalf("drift warning does not name the drifted file: %q", got)
+	}
+	if !strings.Contains(got, "differs from the copy embedded in this gc binary") {
+		t.Fatalf("drift warning does not state the cause: %q", got)
+	}
+
+	// Reporting must not repair: the on-disk file is still the operator's.
+	after, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	if !strings.Contains(string(after), "stale-from-an-older-binary") {
+		t.Fatalf("drift warning overwrote the preserved file: %q", after)
+	}
+}
+
+// TestMaterializeBuiltinPacksDriftWarningDedupesUntilDriftChanges keeps the
+// warning from becoming noise a long-lived process prints on every
+// materialize, while still re-reporting when the drift set actually changes
+// (a new drifted file, or a repaired one).
+func TestMaterializeBuiltinPacksDriftWarningDedupesUntilDriftChanges(t *testing.T) {
+	t.Setenv("GC_BEADS", "")
+	dir := t.TempDir()
+	if err := writeBuiltinPackLoadTestCity(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializeBuiltinPacks(dir); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
+	}
+
+	stderr := captureBuiltinPackDriftWarnings(t)
+	target := filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "commands", "compact", "run.sh")
+	overwritePreservingMode(t, target, []byte("#!/bin/sh\necho stale\n"))
+
+	for i := 0; i < 3; i++ {
+		if err := MaterializeBuiltinPacks(dir); err != nil {
+			t.Fatalf("MaterializeBuiltinPacks() attempt %d: %v", i+1, err)
+		}
+	}
+	if got := strings.Count(stderr.String(), `builtin pack "dolt"`); got != 1 {
+		t.Fatalf("warning count = %d, want 1; stderr=%q", got, stderr.String())
+	}
+
+	// A second drifted file is a different state and must be reported again,
+	// not swallowed by the dedup.
+	stderr.Reset()
+	second := filepath.Join(dir, citylayout.SystemPacksRoot, "dolt", "pack.toml")
+	overwritePreservingMode(t, second, []byte("# edited\n"))
+	if err := MaterializeBuiltinPacks(dir); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks() after second drift: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "pack.toml") {
+		t.Fatalf("new drift was suppressed by dedup: %q", stderr.String())
+	}
+}

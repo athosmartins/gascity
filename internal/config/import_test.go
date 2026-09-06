@@ -929,6 +929,52 @@ fetched = "2026-04-10T00:00:00Z"
 	}
 }
 
+// TestValidateLockedRemoteCacheDoesNotAdoptAncestorRepoHead guards against a
+// git behavior, not a code path: when cacheDir/.git exists but is incomplete
+// (no HEAD, as after an interrupted clone), git's own repository discovery
+// does not fail there -- it walks up the directory tree and silently uses
+// the first *valid* repository it finds, e.g. a real git repo that happens
+// to live at an ancestor directory such as $TMPDIR or $HOME. Without pinning
+// GIT_DIR/GIT_WORK_TREE, validateLockedRemoteCache would then "successfully"
+// read that unrelated ancestor's HEAD instead of failing on the broken
+// cache. This test builds a real ancestor repo explicitly so the regression
+// is deterministic regardless of what the host machine's own $TMPDIR/$HOME
+// happen to contain (see ga-g3fd4).
+func TestValidateLockedRemoteCacheDoesNotAdoptAncestorRepoHead(t *testing.T) {
+	dir := t.TempDir()
+
+	if _, err := runRepoCacheGit(dir, "init"); err != nil {
+		t.Fatalf("git init ancestor: %v", err)
+	}
+	writeTestFile(t, dir, "ancestor.txt", "unrelated ancestor repo\n")
+	if _, err := runRepoCacheGit(dir, "add", "ancestor.txt"); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+	if _, err := runRepoCacheGit(dir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "ancestor"); err != nil {
+		t.Fatalf("git commit: %v", err)
+	}
+	ancestorHead, err := runRepoCacheGit(dir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("git rev-parse ancestor: %v", err)
+	}
+
+	// cacheDir is nested deep inside the ancestor repo and has only an
+	// incomplete .git marker, as if a clone into it was interrupted.
+	cacheDir := filepath.Join(dir, "cache", "repos", "somekey")
+	mustMkdirAll(t, filepath.Join(cacheDir, ".git"), 0o755)
+
+	err = validateLockedRemoteCache("https://github.com/example/gastown.git", cacheDir, "abc123def456")
+	if err == nil {
+		t.Fatal("validateLockedRemoteCache succeeded against an incomplete cache by adopting an ancestor repo's HEAD")
+	}
+	if strings.Contains(err.Error(), ancestorHead) {
+		t.Fatalf("error leaked the unrelated ancestor repo's HEAD (%s): %v", ancestorHead, err)
+	}
+	if !strings.Contains(err.Error(), "reading cached import") || !strings.Contains(err.Error(), "HEAD") {
+		t.Fatalf("error = %v, want cached import HEAD error", err)
+	}
+}
+
 func TestValidateLockedRemoteCacheRequiresGit(t *testing.T) {
 	cacheDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cacheDir, ".git"), 0o755); err != nil {

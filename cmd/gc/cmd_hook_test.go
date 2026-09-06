@@ -782,7 +782,13 @@ dir = "myrig"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\nrig=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
+	// Emits a valid single-element JSON array (not the bare "beads_dir=..."
+	// text a real bd would never produce) so the default work-query script's
+	// jq filter chain (added after this test was written) doesn't silently
+	// swallow the diagnostic payload and fall through to its no-work "[]"
+	// sentinel — see ga-r908y. The diagnostic key=value substrings this
+	// test's assertions look for are embedded as JSON string VALUES.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"beads_dir\":\"beads_dir=%s\",\"rig_root\":\"rig_root=%s\",\"rig\":\"rig=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -855,7 +861,13 @@ dir = "myrig"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\nrig=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
+	// Emits a valid single-element JSON array (not the bare "beads_dir=..."
+	// text a real bd would never produce) so the default work-query script's
+	// jq filter chain (added after this test was written) doesn't silently
+	// swallow the diagnostic payload and fall through to its no-work "[]"
+	// sentinel — see ga-r908y. The diagnostic key=value substrings this
+	// test's assertions look for are embedded as JSON string VALUES.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"beads_dir\":\"beads_dir=%s\",\"rig_root\":\"rig_root=%s\",\"rig\":\"rig=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\" \"$GC_RIG\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +975,10 @@ dir = "workdir"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'beads_dir=%s\\nrig_root=%s\\n' \"$BEADS_DIR\" \"$GC_RIG_ROOT\"\n"
+	// See the comment on the analogous script in
+	// TestCmdHookOverridesInheritedCityBeadsDir above: must emit valid JSON
+	// or the default work-query script's jq filter chain drops it silently.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"beads_dir\":\"beads_dir=%s\",\"rig_root\":\"rig_root=%s\"}]' \"$BEADS_DIR\" \"$GC_RIG_ROOT\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -982,9 +997,12 @@ dir = "workdir"
 	if !strings.Contains(out, "beads_dir="+wantBeads) {
 		t.Fatalf("stdout = %q, want BEADS_DIR=%s (city store), non-rig agent must not be pointed at <dir>/.beads", out, wantBeads)
 	}
-	// Non-rig agents must not receive GC_RIG_ROOT. doHook strips trailing
-	// whitespace, so the empty value lands at the very end of the output.
-	if !strings.HasSuffix(out, "rig_root=") {
+	// Non-rig agents must not receive GC_RIG_ROOT. The fake bd embeds the
+	// diagnostic value as a JSON string ("rig_root":"rig_root=<value>"), so
+	// an empty GC_RIG_ROOT means the "rig_root=" text is immediately closed
+	// by the JSON string's own closing quote with nothing in between — a
+	// non-empty value would break this exact substring match.
+	if !strings.Contains(out, `"rig_root":"rig_root="`) {
 		t.Fatalf("stdout = %q, want empty GC_RIG_ROOT for non-rig agent", out)
 	}
 }
@@ -1295,5 +1313,78 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 	}
 	if got := strings.TrimSpace(stdout.String()); got != `[{"id":"bd-1","title":"Work"}]` {
 		t.Fatalf("stdout = %q, want normalized JSON array", got)
+	}
+}
+
+// TestCmdHookNoWorkCacheSkipsRepeatedSubprocessInvocation is the ga-i3rx
+// regression test at the actual process boundary: before this change,
+// every gc hook invocation re-ran the configured work_query (and every bd
+// subprocess inside it) from scratch, even when an identical check for the
+// exact same agent/session had come back empty moments earlier. This is
+// the dominant Dolt CPU cost (poll FREQUENCY times the ~70ms per-bd
+// connection floor, not query cost — see memory
+// dolt-cpu-root-poll-freq-not-ftmci-layer). This test FAILS against the
+// pre-fix code: the fake-bd invocation log would show 2 runs after 2
+// calls, not 1.
+func TestCmdHookNoWorkCacheSkipsRepeatedSubprocessInvocation(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	cityDir := t.TempDir()
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "worker"
+work_query = "bd ready"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeBD := filepath.Join(fakeBin, "bd")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\nprintf '[]'\n", logPath)
+	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_TEMPLATE", "worker")
+	t.Setenv("GC_SESSION_ID", "sess-cache-1")
+	t.Setenv("GC_SESSION_NAME", "worker-cache-1")
+
+	oldTTL := hookNoWorkCacheTTL
+	hookNoWorkCacheTTL = time.Minute
+	t.Cleanup(func() { hookNoWorkCacheTTL = oldTTL })
+
+	countRuns := func() int {
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return 0
+			}
+			t.Fatalf("reading bd log: %v", err)
+		}
+		return strings.Count(string(data), "run\n")
+	}
+
+	var stdout1, stderr1 bytes.Buffer
+	if code := cmdHookWithFormat(nil, false, "", &stdout1, &stderr1); code != 1 {
+		t.Fatalf("first cmdHookWithFormat() = %d, want 1 (no work); stderr=%s", code, stderr1.String())
+	}
+	if got := countRuns(); got != 1 {
+		t.Fatalf("bd invocations after first call = %d, want 1", got)
+	}
+
+	var stdout2, stderr2 bytes.Buffer
+	if code := cmdHookWithFormat(nil, false, "", &stdout2, &stderr2); code != 1 {
+		t.Fatalf("second cmdHookWithFormat() = %d, want 1 (still no work); stderr=%s", code, stderr2.String())
+	}
+	if got := countRuns(); got != 1 {
+		t.Fatalf("bd invocations after second call = %d, want still 1 (cache hit must skip the subprocess entirely)", got)
 	}
 }

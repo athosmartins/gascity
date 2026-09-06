@@ -102,8 +102,23 @@ Work is done. Close this drain step, then signal the controller to reclaim this
 session:
 
 ```bash
-if [ -n "${GC_BEAD_ID:-}" ]; then
-  bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged."
+# ga-fzgi2g (porta fd56f1048 upstream): $GC_BEAD_ID reflete o bead a que a
+# SESSAO foi originalmente despachada -- ele NAO e re-escopado quando a mesma
+# sessao avanca internamente para este step de drain. Observado ao vivo
+# (ga-0ttcdl): vazio aqui mesmo com o step genuinamente in_progress e
+# atribuido a esta sessao. O provider claude rastreia "o bead deste turno"
+# separadamente como $GC_TRIGGER_BEAD_ID, corretamente re-escopado por step
+# (drain incluso). Tente os dois antes de desistir.
+STEP_BEAD_ID="${GC_BEAD_ID:-${GC_TRIGGER_BEAD_ID:-}}"
+if [ -n "$STEP_BEAD_ID" ]; then
+  bd update "$STEP_BEAD_ID" --set-metadata gc.outcome=pass --status=closed --notes "Drain acknowledged."
+else
+  # TERCEIRO ESTADO -- nao colapse "nao consegui saber" em "nada a fazer".
+  # Seguir para o drain-ack em silencio e exatamente como este bug produziu um
+  # step bead preso + respawn silencioso de pool worker. Registre alto e siga
+  # drenando (as varreduras de reclaim/reaper da cidade cobrem um sling
+  # genuinamente preso), mas nunca em silencio.
+  echo "ERROR(ga-fzgi2g): drain step nao resolveu o proprio bead id -- GC_BEAD_ID e GC_TRIGGER_BEAD_ID ambos vazios. Fechamento pulado; este step bead pode ficar preso aberto." >&2
 fi
 gc runtime drain-ack
 ```

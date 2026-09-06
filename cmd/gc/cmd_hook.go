@@ -204,6 +204,12 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 		}
 		return out, err
 	}
+	// Skip the work_query (and every bd subprocess it fires) entirely when
+	// a recent check for this exact agent/session/dir already came back
+	// empty — the dominant Dolt CPU cost is poll frequency times the
+	// per-bd-invocation connection floor, not query cost (ga-i3rx). Never
+	// delays a positive result: see wrapWorkQueryRunnerWithNoWorkCache.
+	runner = wrapWorkQueryRunnerWithNoWorkCache(cityPath, agentForQuery, sessionForQuery, workDir, runner)
 	return doHook(workQuery, workDir, inject, runner, stdout, stderr)
 }
 

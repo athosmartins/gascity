@@ -806,8 +806,9 @@ func sessionViewTitle(s SessionView) string {
 	if title == "" {
 		return "-"
 	}
-	if len(title) > 30 {
-		return title[:27] + "..."
+	// ga-30xi3: rune-count, not byte-count — see sessionListTitle's comment.
+	if r := []rune(title); len(r) > 30 {
+		return string(r[:27]) + "..."
 	}
 	return title
 }
@@ -1137,8 +1138,16 @@ func sessionListTitle(s session.Info) string {
 	if title == "" {
 		title = "-"
 	}
-	if len(title) > 30 {
-		title = title[:27] + "..."
+	// ga-30xi3: slice by RUNE count, not byte count. len(title)/title[:27] on a
+	// Go string count/index BYTES — cutting mid multi-byte UTF-8 char (e.g. an
+	// ellipsis, U+2026 = e2 80 a6) leaves invalid UTF-8 in the table output.
+	// Any downstream reader that decodes this in strict mode (Python's
+	// subprocess.run(text=True) with the default error handler, notably) then
+	// raises on the FULL read, not just the one bad title — see imparavel-check.py
+	// and siblings, where that raised a UnicodeDecodeError that got swallowed
+	// into the same "command failed" None a genuinely dead session produces.
+	if r := []rune(title); len(r) > 30 {
+		title = string(r[:27]) + "..."
 	}
 	return title
 }

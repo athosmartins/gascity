@@ -156,7 +156,14 @@ start_command = "true"
 	}
 
 	fakeBD := filepath.Join(fakeBin, "bd")
-	script := "#!/bin/sh\nprintf 'id=%s\\nname=%s\\nalias=%s\\nagent=%s\\norigin=%s\\ntemplate=%s\\nargs=%s\\n' \"$GC_SESSION_ID\" \"$GC_SESSION_NAME\" \"$GC_ALIAS\" \"$GC_AGENT\" \"$GC_SESSION_ORIGIN\" \"$GC_TEMPLATE\" \"$*\"\n"
+	// Must emit valid JSON, not bare "id=...\nname=..." text: the default
+	// work-query script pipes bd's stdout through several jq filter stages
+	// (added after this test was written), and jq silently drops anything
+	// that isn't valid JSON, cascading through every tier to the script's
+	// own no-work "[]" sentinel — see ga-r908y. The diagnostic key=value
+	// substrings this test's assertions look for are embedded as JSON
+	// string VALUES so they still appear verbatim in cmdHook's stdout.
+	script := "#!/bin/sh\nprintf '[{\"id\":\"stub\",\"x_id\":\"id=%s\",\"x_name\":\"name=%s\",\"x_alias\":\"alias=%s\",\"x_agent\":\"agent=%s\",\"x_origin\":\"origin=%s\",\"x_template\":\"template=%s\",\"x_args\":\"args=%s\"}]' \"$GC_SESSION_ID\" \"$GC_SESSION_NAME\" \"$GC_ALIAS\" \"$GC_AGENT\" \"$GC_SESSION_ORIGIN\" \"$GC_TEMPLATE\" \"$*\"\n"
 	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

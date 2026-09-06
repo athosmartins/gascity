@@ -1895,6 +1895,63 @@ esac
 	}
 }
 
+// TestEffectiveAssignedReadyQuerySurfacesParkedOwnBead (ga-hiz5d, root-cause
+// remedy #1 for ga-zbrbt) is the mirror of
+// TestEffectiveAssignedReadyQuerySkipsPoolRefusedBead for the OTHER
+// direction: a bead genuinely still owned by this exact assignee must be
+// surfaced by Step 1b regardless of a park/veto label some OTHER process
+// stamped on it while the owning session was still alive and waiting.
+// blocked-reason:decision (the wa-0wvss "Sua vez" pattern), blocked:*,
+// gate:needs-human, pilot:text-veto:*, and pilot:refused-reason:* all answer
+// "should a DIFFERENT future claimant be offered this bead" — never "do I
+// still own this." Before this fix, assignedTierExclusionFilterJQ did not
+// exist and every one of these tiers reused poolDemandLabelFilterJQ (the
+// Tier 3 NEW-work filter) wholesale, so each label below hid the bead from
+// its own owner's resume-check exactly like pool:refused does — except
+// these beads are NOT refused, they are the session's own live, waiting
+// work, and must never disappear from its own query. A session that lost
+// track of its own parked bead this way would fall through to Tier 3 and
+// self-serve a second, unrelated bead: ga-zbrbt's measured symptom (a
+// session double-booked across two in-flight beads, the reclaim-guard
+// treating the session's OTHER live work as proof of life for both).
+func TestEffectiveAssignedReadyQuerySurfacesParkedOwnBead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedReadyQuery()
+
+	cases := []struct {
+		name   string
+		labels string
+	}{
+		{"blocked-reason (Sua vez park marker)", `["blocked-reason:decision"]`},
+		{"blocked (generic external block)", `["blocked:external-quota-motherduck"]`},
+		{"gate:needs-human", `["gate:needs-human"]`},
+		{"pilot:text-veto", `["pilot:text-veto:athos-decide-phrase-text-pattern"]`},
+		{"pilot:refused-reason (distinct from pool:refused)", `["pilot:refused-reason:oracle-named-executor"]`},
+		{"EPIC-titled own wisp", `[]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			title := "own-parked-bead"
+			if tc.name == "EPIC-titled own wisp" {
+				title = "EPIC: own-parked-bead"
+			}
+			bdScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+case "$*" in
+  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"own-parked-bead","title":"%s","labels":%s}]' ;;
+  *) printf '[]' ;;
+esac
+`, title, tc.labels)
+			out := runShellWithFakeBd(t, got, map[string]string{
+				"GC_SESSION_ID": "worker-bead",
+			}, bdScript)
+			if !strings.Contains(out, `"own-parked-bead"`) {
+				t.Fatalf("EffectiveAssignedReadyQuery() output = %q, want the session's own ready bead surfaced despite %s (ga-hiz5d: a park/veto label or EPIC-title heuristic must never hide MY OWN already-claimed work)", out, tc.name)
+			}
+		})
+	}
+}
+
 func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	got := a.EffectiveAssignedReadyQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
@@ -1966,6 +2023,51 @@ esac
 `)
 	if strings.TrimSpace(out) != `[]` {
 		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want [] (pool:refused bead must not be re-offered)", out)
+	}
+}
+
+// TestEffectiveAssignedInProgressQuerySurfacesParkedOwnBead (ga-hiz5d,
+// root-cause remedy #1 for ga-zbrbt: a session became assignee of two
+// different in-flight beads at once) is the Step 1a mirror of
+// TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead for the OTHER
+// direction — see that test's sibling
+// TestEffectiveAssignedReadyQuerySurfacesParkedOwnBead for the full
+// rationale (identical for both tiers). This test would have failed before
+// the fix: every label case below used to make the fake bd's in-progress
+// bead vanish from EffectiveAssignedInProgressQuery() output exactly like a
+// genuinely pool:refused bead does, even though none of these beads were
+// ever refused by this assignee — they are its own live, in-progress work.
+func TestEffectiveAssignedInProgressQuerySurfacesParkedOwnBead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedInProgressQuery()
+
+	cases := []struct {
+		name   string
+		labels string
+	}{
+		{"blocked-reason (Sua vez park marker)", `["blocked-reason:decision"]`},
+		{"blocked (generic external block)", `["blocked:external-quota-motherduck"]`},
+		{"gate:needs-human", `["gate:needs-human"]`},
+		{"pilot:text-veto", `["pilot:text-veto:athos-decide-phrase-text-pattern"]`},
+		{"pilot:refused-reason (distinct from pool:refused)", `["pilot:refused-reason:oracle-named-executor"]`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bdScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+case "$*" in
+  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"own-parked-bead","labels":%s}]' ;;
+  "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+  *) printf '[]' ;;
+esac
+`, tc.labels)
+			out := runShellWithFakeBd(t, got, map[string]string{
+				"GC_SESSION_ID": "worker-bead",
+			}, bdScript)
+			if !strings.Contains(out, `"own-parked-bead"`) {
+				t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want the session's own in-progress bead surfaced despite %s (ga-hiz5d: a park/veto label must never hide MY OWN already-claimed work)", out, tc.name)
+			}
+		})
 	}
 }
 

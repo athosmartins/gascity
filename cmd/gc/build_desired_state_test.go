@@ -6272,6 +6272,105 @@ func TestRealizePoolDesiredSessions_NamedSessionBeadRefusedAsPoolInstance(t *tes
 	}
 }
 
+// TestRealizePoolDesiredSessions_WarnsWhenFreshSlotCollidesWithBusySession
+// covers ga-wmv92: an implicit pool agent (no NamepoolNames, no
+// MaxActiveSessions — the claude-headless shape) has a live session bead
+// holding pool_slot=1 with real assigned work in progress. That bead is
+// correctly excluded from reuse (it's busy), but claimPoolSlotWithConfig's
+// fresh-create fallback has no way to see it and hands the SAME slot (1) to
+// a brand-new request, computing the identical instance identity. This test
+// asserts the new detection-only warning fires and names both the colliding
+// live session and the work it has in flight — it does NOT assert anything
+// about slot numbers or identity strings changing, because that logic is
+// deliberately left untouched.
+func TestRealizePoolDesiredSessions_WarnsWhenFreshSlotCollidesWithBusySession(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "dog",
+			StartCommand: "true",
+		}},
+	}
+	busyBead := beads.Bead{
+		ID:     "sess-dog-busy",
+		Status: "open",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "dog-1",
+			"template":     "dog",
+			"agent_name":   "dog",
+			"pool_slot":    "1",
+			"state":        "active",
+		},
+	}
+	workBead := beads.Bead{
+		ID:       "w-real-work",
+		Status:   "in_progress",
+		Assignee: busyBead.ID,
+	}
+
+	var stderr bytes.Buffer
+	bp := newAgentBuildParams("test-city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), nil, &stderr)
+	bp.sessionBeads = newSessionBeadSnapshot([]beads.Bead{busyBead})
+	bp.assignedWorkBeads = []beads.Bead{workBead}
+
+	poolState := PoolDesiredState{
+		Template: "dog",
+		Requests: []SessionRequest{{
+			Template:   "dog",
+			Tier:       "new",
+			WorkBeadID: "w-fresh-demand",
+		}},
+	}
+	desired := map[string]TemplateParams{}
+	realizePoolDesiredSessions(bp, &cfg.Agents[0], poolState, desired, &stderr)
+
+	if !strings.Contains(stderr.String(), "collides with LIVE session bead") {
+		t.Fatalf("expected silent-eviction warning, got: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), busyBead.ID) {
+		t.Errorf("expected warning to name the colliding live bead %q, got: %q", busyBead.ID, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), workBead.ID) {
+		t.Errorf("expected warning to name the in-flight work bead %q, got: %q", workBead.ID, stderr.String())
+	}
+}
+
+// TestRealizePoolDesiredSessions_NoCollisionWarningWhenSlotFree is the
+// negative twin: with no existing session bead at all, the same fresh
+// request must NOT print a collision warning. Guards against the detector
+// firing on every fresh create regardless of whether anything is actually
+// colliding.
+func TestRealizePoolDesiredSessions_NoCollisionWarningWhenSlotFree(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "dog",
+			StartCommand: "true",
+		}},
+	}
+	var stderr bytes.Buffer
+	bp := newAgentBuildParams("test-city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), nil, &stderr)
+	bp.sessionBeads = newSessionBeadSnapshot(nil)
+	bp.assignedWorkBeads = nil
+
+	poolState := PoolDesiredState{
+		Template: "dog",
+		Requests: []SessionRequest{{
+			Template:   "dog",
+			Tier:       "new",
+			WorkBeadID: "w-fresh-demand",
+		}},
+	}
+	desired := map[string]TemplateParams{}
+	realizePoolDesiredSessions(bp, &cfg.Agents[0], poolState, desired, &stderr)
+
+	if strings.Contains(stderr.String(), "collides with LIVE session bead") {
+		t.Fatalf("expected no collision warning when no busy session occupies the slot, got: %q", stderr.String())
+	}
+}
+
 func TestBuildDesiredState_OnDemandNamedSession_InProgressAssigneeMaterializes(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()

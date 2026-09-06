@@ -2284,6 +2284,7 @@ func realizePoolDesiredSessions(
 			if plan != nil {
 				item.plan = plan
 				item.slot = plan.poolSlot
+				warnIfFreshPoolSlotCollidesWithBusySession(bp, cfgAgent, qualifiedName, plan.slot, plan.qualifiedInstance, stderr)
 				return item
 			}
 			if used[sessionBead.ID] {
@@ -3137,6 +3138,56 @@ func reusablePoolSessionBeads(bp *agentBuildParams, cfgAgent *config.Agent, temp
 	}
 	sortSessionBeadsByCreatedAtThenID(candidates)
 	return candidates
+}
+
+// warnIfFreshPoolSlotCollidesWithBusySession detects — but does not alter —
+// the case where a freshly-planned pool slot's computed identity would reuse
+// the SAME slot number as an existing, currently-alive session bead for the
+// same template that has assigned work in progress. Such a bead is
+// deliberately excluded from the reuse candidates above
+// (reusablePoolSessionBead: sessionBeadHasAssignedWork) so its in-flight work
+// is never stolen for an unrelated request — but claimPoolSlotWithConfig's
+// fresh-create fallback (the `for slot := 1; ; slot++` loop in
+// claimPoolSlotWithConfig) only tracks slots claimed earlier in THIS tick
+// (usedSlots) and never consults the slot a busy, excluded bead already
+// persists in its own pool_slot metadata. So a brand-new session bead can
+// compute the identical qualifiedInstance name (e.g. "claude-headless-1") as
+// the live, working one.
+//
+// Detection-only, added per ga-wmv92 (root cause confirmed by reading this
+// file; the underlying count/identity logic is deliberately UNCHANGED here —
+// see the bead for why a deeper fix needs a live-fire test before landing,
+// the same shared-helper territory that produced the ghost-slot-cascade
+// incident). This satisfies the original minimal ask in ga-66wc: the
+// eviction must emit a warning naming who died and what work was in flight.
+func warnIfFreshPoolSlotCollidesWithBusySession(bp *agentBuildParams, cfgAgent *config.Agent, template string, plannedSlot int, qualifiedInstance string, stderr io.Writer) {
+	if bp == nil || bp.sessionBeads == nil || cfgAgent == nil || plannedSlot <= 0 || stderr == nil {
+		return
+	}
+	for _, bead := range bp.sessionBeads.Open() {
+		if resolvedSessionTemplate(bead, reuseTemplateConfig(bp)) != template {
+			continue
+		}
+		if existingPoolSlot(cfgAgent, bead) != plannedSlot {
+			continue
+		}
+		if !sessionBeadHasAssignedWork(bp.assignedWorkBeads, bead) {
+			continue
+		}
+		workID := ""
+		for _, wb := range bp.assignedWorkBeads {
+			assignee := strings.TrimSpace(wb.Assignee)
+			if assignee == "" || (wb.Status != "open" && wb.Status != "in_progress") {
+				continue
+			}
+			if assignee == bead.ID || assignee == strings.TrimSpace(bead.Metadata["session_name"]) {
+				workID = wb.ID
+				break
+			}
+		}
+		fmt.Fprintf(stderr, "buildDesiredState: pool %q: fresh session %q (slot %d) collides with LIVE session bead %s which has assigned work %s in progress — materializing this identity may silently evict that session and orphan its work\n", template, qualifiedInstance, plannedSlot, bead.ID, workID) //nolint:errcheck
+		return
+	}
 }
 
 func sortSessionBeadsByCreatedAtThenID(candidates []beads.Bead) {

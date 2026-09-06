@@ -60,12 +60,17 @@ type builtinPackFile struct {
 // Idempotent: safe to call on every gc start and gc init.
 func MaterializeBuiltinPacks(cityPath string) error {
 	required := requiredBuiltinPackSet(cityPath)
+	var drift []packDriftReport
 	for _, bp := range builtinPacks {
 		dst := filepath.Join(cityPath, citylayout.SystemPacksRoot, bp.Name)
 		_, isRequired := required[bp.Name]
-		desired, err := materializeFS(bp.FS, dst, !isRequired)
+		report := packDriftReport{pack: bp.Name}
+		desired, err := materializeFSCollectingDrift(bp.FS, dst, !isRequired, &report)
 		if err != nil {
 			return fmt.Errorf("materializing %s pack: %w", bp.Name, err)
+		}
+		if report.hasFindings() {
+			drift = append(drift, report)
 		}
 		if err := pruneStaleGeneratedPackFiles(dst, desired); err != nil {
 			return fmt.Errorf("pruning stale %s pack files: %w", bp.Name, err)
@@ -77,6 +82,7 @@ func MaterializeBuiltinPacks(cityPath string) error {
 	if err := repairLegacyGcBeadsBdScript(cityPath); err != nil {
 		return fmt.Errorf("repairing legacy gc-beads-bd script: %w", err)
 	}
+	emitBuiltinPackDriftWarnings(cityPath, drift)
 	return nil
 }
 
@@ -257,6 +263,161 @@ func emitBuiltinPackRefreshWarning(w io.Writer, err error) {
 	fmt.Fprintf(w, "warning: %v\n", err) //nolint:errcheck // best-effort warning emission
 }
 
+// maxReportedDriftedPackFiles bounds how many paths a single drift warning
+// names. A pack can hold dozens of files; the operator needs enough to
+// recognize what drifted, not a wall of text.
+const maxReportedDriftedPackFiles = 5
+
+// packDriftReport records, for one builtin pack, the files the
+// preserve-operator-edits branch left in place that do not match the bytes
+// embedded in the running gc binary.
+//
+// changed and unreadable are deliberately separate: a file we could not read
+// is drift *unknown*, not drift *absent*. Collapsing the two would make a
+// permission error look identical to a clean pack, which is the failure the
+// warning exists to prevent.
+type packDriftReport struct {
+	pack       string
+	changed    []string
+	unreadable []string
+}
+
+func (r *packDriftReport) hasFindings() bool {
+	return r != nil && (len(r.changed) > 0 || len(r.unreadable) > 0)
+}
+
+// recordPreservedPackDrift compares one preserved on-disk file against its
+// embedded counterpart and records the outcome. It is a no-op when report is
+// nil, so callers that do not want the extra reads pay nothing.
+//
+// The comparison reads both sides in full rather than trusting size or mtime:
+// mtime cannot distinguish "operator edited" from "left over from an older
+// binary" and is destroyed by checkout/cp/rsync, and a size-only check would
+// miss same-length edits. Required packs already pay the same full read via
+// WriteFileIfContentOrModeChangedAtomic, so this keeps one comparison
+// semantic in the codebase instead of two.
+func recordPreservedPackDrift(report *packDriftReport, embedded fs.FS, relPath, dstPath string) {
+	if report == nil {
+		return
+	}
+	rel := filepath.ToSlash(relPath)
+	want, err := fs.ReadFile(embedded, relPath)
+	if err != nil {
+		report.unreadable = append(report.unreadable, fmt.Sprintf("%s (embedded: %v)", rel, err))
+		return
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		report.unreadable = append(report.unreadable, fmt.Sprintf("%s (%v)", rel, err))
+		return
+	}
+	if !bytes.Equal(got, want) {
+		report.changed = append(report.changed, rel)
+	}
+}
+
+// builtinPackDriftWarningWriter resolves the destination for pack drift
+// warnings. Overridable so tests can capture the output without racing on
+// os.Stderr.
+var builtinPackDriftWarningWriter = func() io.Writer {
+	return os.Stderr
+}
+
+// builtinPackDriftWarningCache remembers the last drift signature emitted per
+// city so a long-lived process (supervisor, daemon) warns once per distinct
+// drift state instead of on every materialize. Keyed the same way as
+// builtinPackRefreshCache.
+var builtinPackDriftWarningCache sync.Map
+
+// emitBuiltinPackDriftWarnings tells the operator that a materialized pack no
+// longer matches the binary. Non-required packs are never re-materialized once
+// written (see materializeFS), so after a binary upgrade the on-disk copy can
+// keep running the old content indefinitely — silently. This warning is the
+// only signal that the file being executed is not the file that shipped.
+//
+// It writes nothing to disk and changes no materialize decision.
+func emitBuiltinPackDriftWarnings(cityPath string, reports []packDriftReport) {
+	signature := builtinPackDriftSignature(reports)
+	key := normalizePathForCompare(cityPath)
+	if prev, ok := builtinPackDriftWarningCache.Load(key); ok && prev.(string) == signature {
+		return
+	}
+	builtinPackDriftWarningCache.Store(key, signature)
+	if signature == "" {
+		return
+	}
+	w := builtinPackDriftWarningWriter()
+	if w == nil {
+		return
+	}
+	for _, report := range reports {
+		for _, line := range builtinPackDriftWarningLines(cityPath, report) {
+			fmt.Fprintln(w, line) //nolint:errcheck // best-effort warning emission
+		}
+	}
+}
+
+// builtinPackDriftSignature collapses a drift set into a comparable string so
+// repeated materializes stay quiet while the state is unchanged, and a *new*
+// drift (or a repaired one) is reported again rather than suppressed forever.
+func builtinPackDriftSignature(reports []packDriftReport) string {
+	var parts []string
+	for _, report := range reports {
+		if !report.hasFindings() {
+			continue
+		}
+		changed := append([]string(nil), report.changed...)
+		unreadable := append([]string(nil), report.unreadable...)
+		sort.Strings(changed)
+		sort.Strings(unreadable)
+		parts = append(parts, report.pack+"|"+strings.Join(changed, ",")+"|"+strings.Join(unreadable, ","))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
+}
+
+func builtinPackDriftWarningLines(cityPath string, report packDriftReport) []string {
+	packDir := filepath.Join(cityPath, citylayout.SystemPacksRoot, report.pack)
+	var lines []string
+	if len(report.changed) > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"warning: builtin pack %q on disk differs from the copy embedded in this gc binary (%s). "+
+				"Non-required packs are never re-materialized, so the on-disk version is what runs — "+
+				"either a local edit or content left over from an older binary. "+
+				"To adopt the embedded copy: mv %q %q && gc config show --validate",
+			report.pack,
+			summarizeDriftedPackFiles(report.changed),
+			packDir,
+			packDir+".bak",
+		))
+	}
+	if len(report.unreadable) > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"warning: builtin pack %q could not be compared against the embedded copy (%s); "+
+				"drift is unknown, not absent.",
+			report.pack,
+			summarizeDriftedPackFiles(report.unreadable),
+		))
+	}
+	return lines
+}
+
+func summarizeDriftedPackFiles(files []string) string {
+	sorted := append([]string(nil), files...)
+	sort.Strings(sorted)
+	noun := "files"
+	if len(sorted) == 1 {
+		noun = "file"
+	}
+	shown := sorted
+	suffix := ""
+	if len(sorted) > maxReportedDriftedPackFiles {
+		shown = sorted[:maxReportedDriftedPackFiles]
+		suffix = fmt.Sprintf(", +%d more", len(sorted)-maxReportedDriftedPackFiles)
+	}
+	return fmt.Sprintf("%d %s: %s%s", len(sorted), noun, strings.Join(shown, ", "), suffix)
+}
+
 // builtinPackIncludes returns the system pack paths that should be
 // auto-included in config loading. These are appended as extraIncludes
 // to LoadWithIncludes so they go through normal pack expansion
@@ -372,6 +533,15 @@ func peekEventsProvider(tomlPath string) string {
 // that lost its +x bit), and non-regular files (symlinks, etc.) are replaced
 // with the embedded content.
 func materializeFS(embedded fs.FS, dstDir string, preserveOperatorEdits bool) (map[string]struct{}, error) {
+	return materializeFSCollectingDrift(embedded, dstDir, preserveOperatorEdits, nil)
+}
+
+// materializeFSCollectingDrift is materializeFS plus drift reporting. When
+// drift is non-nil, every file the preserve-operator-edits branch leaves in
+// place is compared against the embedded bytes and recorded there, so callers
+// can tell the operator that what runs on disk is not what the binary ships.
+// Passing nil disables the comparison entirely (no extra reads).
+func materializeFSCollectingDrift(embedded fs.FS, dstDir string, preserveOperatorEdits bool, drift *packDriftReport) (map[string]struct{}, error) {
 	desired := make(map[string]struct{})
 	err := fs.WalkDir(embedded, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -399,6 +569,7 @@ func materializeFS(embedded fs.FS, dstDir string, preserveOperatorEdits bool) (m
 		if preserveOperatorEdits {
 			if info, statErr := os.Lstat(dst); statErr == nil {
 				if info.Mode().IsRegular() && fsys.ComparableMode(info.Mode()) == fsys.ComparableMode(perm) {
+					recordPreservedPackDrift(drift, embedded, path, dst)
 					return nil
 				}
 			} else if !os.IsNotExist(statErr) {
