@@ -22,7 +22,12 @@ type Filter struct {
 	Since    time.Time // match events at or after this time
 	Until    time.Time // match events at or before this time
 	AfterSeq uint64    // match events with Seq > AfterSeq (0 = no filter)
-	Limit    int       // cap results at this count (0 or negative = unlimited)
+	// BeforeSeq matches events with Seq < BeforeSeq (0 = no filter). The
+	// keyset page boundary for descending event walks: the log is
+	// append-only and seq-ordered, so "strictly before this seq" is a
+	// stable resume point regardless of concurrent appends.
+	BeforeSeq uint64
+	Limit     int // cap results at this count (0 or negative = unlimited)
 }
 
 // TypeMatches reports whether eventType satisfies filter, where filter is
@@ -54,6 +59,9 @@ func TypeMatches(eventType, filter string) bool {
 // It does not enforce Limit — that is applied by the caller.
 func matchesFilter(e Event, f Filter) bool {
 	if f.AfterSeq > 0 && e.Seq <= f.AfterSeq {
+		return false
+	}
+	if f.BeforeSeq > 0 && e.Seq >= f.BeforeSeq {
 		return false
 	}
 	if f.Type != "" && !TypeMatches(e.Type, f.Type) {

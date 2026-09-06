@@ -164,6 +164,8 @@ PACK_DIR="${GC_PACK_DIR:-$(unset CDPATH; cd -- "$(dirname "$0")/.." && pwd)}"
 . "$PACK_DIR/assets/scripts/runtime.sh"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/compact-gain-drift-proof.sh"
+# shellcheck disable=SC1091
+. "$PACK_DIR/assets/scripts/compact-gc-cancel-classify.sh"
 
 if [ "${GC_DOLT_MANAGED_LOCAL:-}" = "1" ]; then
   managed_port=$(managed_runtime_port "$DOLT_STATE_FILE" "$DOLT_DATA_DIR" || true)
@@ -1298,8 +1300,19 @@ run_full_gc() {
 
   elapsed=$(( $(date +%s) - start ))
   if [ "$gc_rc" -ne 0 ]; then
-    printf 'compact: db=%s %s DOLT_GC failed rc=%s duration=%ss\n' \
-      "$db" "$failure_prefix" "$gc_rc" "$elapsed" >&2
+    gc_cause=$(classify_gc_cancel_cause "$gc_rc" "$gc_err_tmp")
+    printf 'compact: db=%s %s DOLT_GC failed rc=%s duration=%ss cause=%s\n' \
+      "$db" "$failure_prefix" "$gc_rc" "$elapsed" "$gc_cause" >&2
+    case "$gc_cause" in
+      CLIENT_TIMEOUT)
+        printf 'compact: db=%s cause=CLIENT_TIMEOUT — run_bounded killed the dolt CLI after call_timeout=%ss; no server response was read. Raise GC_DOLT_COMPACT_CALL_TIMEOUT_SECS if this db legitimately needs longer, not the server listener timeout.\n' \
+          "$db" "$call_timeout" >&2
+        ;;
+      SERVER_CANCELLED)
+        printf 'compact: db=%s cause=SERVER_CANCELLED — the query ran past call_timeout=%ss with no client/wrapper kill (rc is a real SQL error, not a timeout exit code): the SERVER cancelled its own query context mid-call. The listener'"'"'s read_timeout_millis/net_read_timeout is the leading candidate for a long admin call like this — do not raise it globally (it exists to reap dead per-call sockets); a per-call SET SESSION net_read_timeout ahead of just this CALL is the scoped alternative to evaluate.\n' \
+          "$db" "$call_timeout" >&2
+        ;;
+    esac
     emit_error_file "$db" "$gc_err_tmp"
     rm -f "$gc_err_tmp"
     return 1
