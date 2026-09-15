@@ -4632,15 +4632,30 @@ func sessionHasOpenAssignedWispWorkForCloseGate(store beads.Store, assignee, sta
 	return sessionHasOpenAssignedWorkForTierForCloseGate(store, assignee, status, beads.TierWisps, true)
 }
 
-// hasNonSessionNonOwnDrainStepWork is wa.HasNonSessionWork plus the own-drain-step
-// exclusion: skips session beads/repairable session beads (as HasNonSessionWork
-// already does) AND the session's own mol-do-work drain step.
+// hasNonSessionNonOwnDrainStepWork is wa.HasNonSessionWork plus two close-gate-only
+// exclusions: the session's own mol-do-work drain step (isSessionOwnDrainStepBead)
+// and any mail message bead (hookClaimCandidateIsMessage, the same issue_type="message"
+// test hook-claim already uses to keep mail out of the assignment paths — #4419).
+//
+// A message addressed to this session's identity is mail, not work: reading it
+// never transitions the bead's status (mail.read is a metadata flag, not a status
+// close), so an unarchived-but-already-read message stays "open" and assigned
+// forever. Before this exclusion, that open message alone made the close gate
+// report assigned work, so a drain-acked session could never close: the pool
+// controller kept respawning it onto the same stale mail every wake cycle
+// (ga-h9xpwb: 99 wake/drain cycles over 3 days on one worker). Scoped to the
+// close gate only — the awake-work chain (sessionHasAwakeAssignedWorkForReachableStore)
+// does not call this helper, so a new/unread message still wakes a sleeping
+// session exactly as before.
 func hasNonSessionNonOwnDrainStepWork(store beads.Store, items []beads.Bead) bool {
 	for _, item := range items {
 		if sessionpkg.IsSessionBeadOrRepairable(item) {
 			continue
 		}
 		if isSessionOwnDrainStepBead(store, item) {
+			continue
+		}
+		if hookClaimCandidateIsMessage(item) {
 			continue
 		}
 		return true
