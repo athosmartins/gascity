@@ -2806,7 +2806,12 @@ func assignedWorkStoreRefForSession(cityPath string, cfg *config.City, session b
 	if agentCfg == nil {
 		return "", false
 	}
-	return assignedWorkStoreRefForAgent(cityPath, cfg, agentCfg), true
+	// Use the routing (WorkDir-fallback-aware) resolution, not
+	// assignedWorkStoreRefForAgent: this function answers "where does THIS
+	// session's real live work actually live", which for a dir-less
+	// pool-template agent (wa-worker, ps-worker) is its rig's store, not the
+	// city store (gt-69j2v).
+	return assignedWorkRoutingStoreRefForAgent(cityPath, cfg, agentCfg), true
 }
 
 // firstOpenAssignedWorkBeadForReachableStore returns the first open or

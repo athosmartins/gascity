@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -261,5 +263,121 @@ func TestReconcileSessionBeads_ScriptsOnlyDriftStillDrainsResumeWakeCreating(t *
 	}
 	if ds.reason != "config-drift" {
 		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// TestReconcileSessionBeads_ScriptsDriftDoesNotDrainAwakeWorkerWithAssignedWork
+// closes the gap the ga-n9bw tests above leave open (see file header): they
+// only drive a STALE-CREATING session, so only Exemptions 1/2 are exercised.
+// A wa-worker past its creating window — awake, actively doing a task — has
+// no exemption 1/2 protection at all (those are gated to wasCreating) and
+// relies entirely on the plain "live assigned work" defer at
+// session_reconciler.go (sessionHasOpenAssignedWorkForReachableStore,
+// "Skipping config-drift drain ...: live assigned work found").
+//
+// Before gt-69j2v's fix, that check resolved a dir-less wa-worker's store via
+// assignedWorkStoreRefForSession -> assignedWorkStoreRefForAgent ->
+// configuredRigName, which returns "" (city-scoped) for a dir-less agent BY
+// DESIGN (see TestConfiguredRigNameDirLessAgentWithRigWorkDirStaysCityScoped
+// in internal/workdir — that contract must NOT change, ga-f7k65a). So the
+// check looked in the CITY store instead of the whatsapp_automation rig store
+// where wa-worker's real claimed bead lives, found nothing, and the session
+// drained mid-task. This is the exact shape of the wa-x0ppe incident (P1 bug
+// lost committed-but-unpushed work twice on 2026-09-11): the reconciler's own
+// "live assigned work" protection existed and was completely inert for every
+// dir-less pool worker. The fix routes this ONE lookup through
+// assignedWorkRoutingStoreRefForAgent (workdirutil.RoutingRigName) instead,
+// leaving ConfiguredRigName/assignedWorkStoreRefForAgent's other callers
+// (pool-demand, session-wake, desired-state) untouched.
+func TestReconcileSessionBeads_ScriptsDriftDoesNotDrainAwakeWorkerWithAssignedWork(t *testing.T) {
+	name := "wa-worker-1"
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "whatsapp_automation")
+	if err := os.MkdirAll(filepath.Join(rigPath, "crew", "worker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Rigs: []config.Rig{{Name: "whatsapp_automation", Path: rigPath}},
+		Agents: []config.Agent{{
+			Name:     scriptsDriftWorkerTemplate,
+			WakeMode: "fresh",
+			WorkDir:  filepath.Join(rigPath, "crew", "worker"),
+		}},
+	}
+	tp := TemplateParams{
+		Command:      "steady-cmd",
+		SessionName:  name,
+		TemplateName: scriptsDriftWorkerTemplate,
+		Hints: agent.StartupHints{CopyFiles: []runtime.CopyEntry{
+			scriptsCopyEntry("scripts-hash-NEW"),
+		}},
+	}
+	env.desiredState[name] = tp
+	_ = env.sp.Start(context.Background(), name, runtime.Config{Command: tp.Command})
+	session := env.createSessionBead(name, scriptsDriftWorkerTemplate)
+	env.markSessionActive(&session) // awake and working, NOT creating -- the untested branch.
+
+	currentCfg := sessionCoreConfigForHash(tp, session)
+	oldCfg := currentCfg
+	oldCfg.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-OLD")}
+	started := runtime.CoreFingerprint(oldCfg)
+	if started == runtime.CoreFingerprint(currentCfg) {
+		t.Fatalf("test setup: stored (old) and live (current) core hashes must differ")
+	}
+	breakdownJSON, err := json.Marshal(runtime.CoreFingerprintBreakdown(oldCfg))
+	if err != nil {
+		t.Fatalf("marshaling stored breakdown: %v", err)
+	}
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": started,
+		"core_hash_breakdown": string(breakdownJSON),
+	})
+
+	// The session's real, live work -- claimed in its own rig's store, exactly
+	// like a real wa-worker's `bd` context, not the city store.
+	rigStore := beads.NewMemStore()
+	if _, err := rigStore.Create(beads.Bead{
+		ID:       "wa-x0ppe",
+		Title:    "in-flight P1 fix",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	}); err != nil {
+		t.Fatalf("Create rig work: %v", err)
+	}
+	rigStores := map[string]beads.Store{"whatsapp_automation": rigStore}
+
+	reconcileSessionBeadsAtPath(
+		context.Background(),
+		cityPath,
+		[]beads.Bead{session},
+		env.desiredState,
+		map[string]bool{scriptsDriftWorkerTemplate: true},
+		env.cfg,
+		env.sp,
+		env.store,
+		newFakeDrainOps(),
+		nil,
+		rigStores,
+		nil,
+		env.dt,
+		nil,
+		false,
+		nil,
+		"",
+		nil,
+		env.clk,
+		env.rec,
+		0,
+		0,
+		&env.stdout,
+		&env.stderr,
+	)
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("gt-69j2v: awake wa-worker with real in_progress work in its rig store must NOT be drained on config-drift; got drain=%+v stdout=%s stderr=%s",
+			ds, env.stdout.String(), env.stderr.String())
 	}
 }
