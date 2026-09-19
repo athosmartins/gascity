@@ -186,7 +186,7 @@ DTO or SSE envelope.`,
 				}
 				return nil
 			}
-			if cmdEvents(apiURL, typeFilter, sinceFlag, payloadMatch, stdout, stderr) != 0 {
+			if cmdEvents(apiURL, typeFilter, sinceFlag, payloadMatch, afterFlag, afterCursor, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -233,7 +233,7 @@ Output is one JSON line. Empty active logs are successful no-ops.`,
 	return cmd
 }
 
-func cmdEvents(apiURLOverride, typeFilter, sinceFlag string, payloadMatchArgs []string, stdout, stderr io.Writer) int {
+func cmdEvents(apiURLOverride, typeFilter, sinceFlag string, payloadMatchArgs []string, afterSeq uint64, afterCursor string, stdout, stderr io.Writer) int {
 	if err := validateEventsSince(sinceFlag); err != nil {
 		fmt.Fprintf(stderr, "gc events: %v\n", err) //nolint:errcheck
 		return 1
@@ -247,7 +247,11 @@ func cmdEvents(apiURLOverride, typeFilter, sinceFlag string, payloadMatchArgs []
 	if code != 0 {
 		return code
 	}
-	return doEvents(scope, typeFilter, sinceFlag, pm, stdout, stderr)
+	if err := validateEventsCursor(scope, afterSeq, afterCursor); err != nil {
+		fmt.Fprintf(stderr, "gc events: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	return doEvents(scope, typeFilter, sinceFlag, pm, afterSeq, afterCursor, stdout, stderr)
 }
 
 func cmdEventsSeq(apiURLOverride string, stdout, stderr io.Writer) int {
@@ -485,14 +489,14 @@ func validateEventsSince(sinceFlag string) error {
 	return nil
 }
 
-func doEvents(scope eventsAPIScope, typeFilter, sinceFlag string, payloadMatch map[string][]string, stdout, stderr io.Writer) int {
+func doEvents(scope eventsAPIScope, typeFilter, sinceFlag string, payloadMatch map[string][]string, afterSeq uint64, afterCursor string, stdout, stderr io.Writer) int {
 	if scope.localOnly {
 		fallback, _, fallbackErr := readLocalCityEvents(scope, stoppedCityLocalFallbackError(scope), typeFilter, sinceFlag, stderr)
 		if fallbackErr != nil {
 			fmt.Fprintf(stderr, "gc events: %v\n", fallbackErr) //nolint:errcheck
 			return 1
 		}
-		fallback = filterCityEvents(fallback, 0, typeFilter, payloadMatch)
+		fallback = filterCityEvents(fallback, afterSeq, typeFilter, payloadMatch)
 		return printJSONLines(fallback, stdout, stderr)
 	}
 
@@ -511,24 +515,31 @@ func doEvents(scope eventsAPIScope, typeFilter, sinceFlag string, payloadMatch m
 			fmt.Fprintf(stderr, "gc events: %v\n", err) //nolint:errcheck
 			return 1
 		}
+		if strings.TrimSpace(afterCursor) != "" {
+			matches := filterSupervisorEventsAfterCursor(items, afterCursor, typeFilter, payloadMatch)
+			return printJSONLines(matches, stdout, stderr)
+		}
 		items = filterSupervisorEvents(items, typeFilter, payloadMatch)
 		return printJSONLines(items, stdout, stderr)
 	}
 
-	items, err := fetchCityEvents(ctx, client, scope.cityName, typeFilter, sinceFlag)
+	items, truncated, err := fetchCityEvents(ctx, client, scope.cityName, typeFilter, sinceFlag)
 	if err != nil {
 		if fallback, ok, fallbackErr := readLocalCityEvents(scope, err, typeFilter, sinceFlag, stderr); ok {
 			if fallbackErr != nil {
 				fmt.Fprintf(stderr, "gc events: %v\n", fallbackErr) //nolint:errcheck
 				return 1
 			}
-			fallback = filterCityEvents(fallback, 0, typeFilter, payloadMatch)
+			fallback = filterCityEvents(fallback, afterSeq, typeFilter, payloadMatch)
 			return printJSONLines(fallback, stdout, stderr)
 		}
 		fmt.Fprintf(stderr, "gc events: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	items = filterCityEvents(items, 0, typeFilter, payloadMatch)
+	if truncated {
+		fmt.Fprintln(stderr, "gc events: showing the newest 500 matching events; more history exists beyond this page. Narrow --since/--type, or read .gc/events.jsonl (+ .gz archives) directly for the full history.") //nolint:errcheck
+	}
+	items = filterCityEvents(items, afterSeq, typeFilter, payloadMatch)
 	return printJSONLines(items, stdout, stderr)
 }
 
@@ -814,7 +825,14 @@ func doEventsWatch(scope eventsAPIScope, typeFilter string, payloadMatch map[str
 
 	resumeSeq := afterSeq
 	if resumeSeq > 0 {
-		items, err := fetchCityEvents(ctx, client, scope.cityName, "", "")
+		// truncated is intentionally ignored here: this is a fast-path probe
+		// of recent history, not the final answer. A miss within the capped
+		// page (full backlog >500) falls through to streamCityEvents below,
+		// which catches up from resumeSeq via the SSE stream's own forward
+		// replay — not subject to this page cap — so completeness still
+		// holds; warning here would just be page-cap noise on every --watch
+		// call against a busy city.
+		items, _, err := fetchCityEvents(ctx, client, scope.cityName, "", "")
 		if err != nil {
 			if shouldUseLocalCityEventsFallback(scope, err) {
 				printStreamingCityAPIRequirement("--watch", stderr)
@@ -954,10 +972,24 @@ func probeCityEventsReachable(ctx context.Context, client *genclient.ClientWithR
 // fetchCityEvents fetches the newest page of city events (up to 500). It
 // deliberately does NOT follow next_cursor: gc events means "recent
 // activity", and a full descending drain of a large city's event history
-// (100 MB+ logs) would blow the command timeout for no user benefit. The
-// API serves the page seq-DESC (newest first); gc events prints
+// (100 MB+ logs) would blow the command timeout for no user benefit. This
+// is upstream's own red-teamed call (gastownhall/gascity#4194, finding
+// "Major — CLI full-history drain"), pinned by
+// TestFetchCityEventsSinglePageChronological — do not restore the loop.
+//
+// The API serves the page seq-DESC (newest first); gc events prints
 // chronologically, so the page is re-sorted ascending.
-func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses, cityName, typeFilter, sinceFlag string) ([]cliWireEvent, error) {
+//
+// truncated reports whether the server minted a next_cursor, i.e. whether
+// more matching history exists beyond this page. Before ga-dzshu this was
+// silently dropped: a --since/--type/--after query could be capped at 500
+// with exit 0 and no signal, which produced wrong answers for forensic
+// reads (a 24h join concluded 13 of 14 mails never closed; the on-disk log
+// showed 12 of 14 closed). The cap itself is intentional; only the silence
+// was the bug. Callers that print results to the user should warn on
+// truncated=true; internal fast-path probes (doEventsWatch) may ignore it
+// since their fallback path is complete regardless.
+func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses, cityName, typeFilter, sinceFlag string) (items []cliWireEvent, truncated bool, err error) {
 	limit := int64(500)
 	params := &genclient.GetV0CityByCityNameEventsParams{
 		Limit: &limit,
@@ -970,24 +1002,25 @@ func fetchCityEvents(ctx context.Context, client *genclient.ClientWithResponses,
 	}
 	resp, err := client.GetV0CityByCityNameEventsWithResponse(ctx, cityName, params)
 	if err != nil {
-		return nil, &eventsAPITransportError{err: err}
+		return nil, false, &eventsAPITransportError{err: err}
 	}
 	if err := eventsListError(resp.StatusCode(), resp.ApplicationproblemJSONDefault); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if resp.JSON200 == nil || resp.JSON200.Items == nil {
-		return nil, nil
+		return nil, false, nil
 	}
+	truncated = resp.JSON200.NextCursor != nil && strings.TrimSpace(*resp.JSON200.NextCursor) != ""
 	all := make([]cliWireEvent, 0, len(*resp.JSON200.Items))
 	for _, item := range *resp.JSON200.Items {
 		wire, err := cityWireEventFromTyped(item)
 		if err != nil {
-			return nil, fmt.Errorf("decoding city event list item: %w", err)
+			return nil, false, fmt.Errorf("decoding city event list item: %w", err)
 		}
 		all = append(all, wire)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Seq < all[j].Seq })
-	return all, nil
+	return all, truncated, nil
 }
 
 func fetchCityHeadIndex(ctx context.Context, client *genclient.ClientWithResponses, cityName string) (string, error) {

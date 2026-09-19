@@ -75,7 +75,7 @@ func TestDoEventsCityDefaultUsesJSONLItems(t *testing.T) {
 	defer server.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := doEvents(eventsAPIScope{apiURL: server.URL, cityName: "mc-city"}, "", "", nil, &stdout, &stderr)
+	code := doEvents(eventsAPIScope{apiURL: server.URL, cityName: "mc-city"}, "", "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -109,7 +109,7 @@ func TestDoEventsSupervisorDefaultUsesTaggedJSONLItems(t *testing.T) {
 	defer server.Close()
 
 	var stdout, stderr bytes.Buffer
-	code := doEvents(eventsAPIScope{apiURL: server.URL}, "", "", nil, &stdout, &stderr)
+	code := doEvents(eventsAPIScope{apiURL: server.URL}, "", "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -222,7 +222,7 @@ func TestDoEventsFallsBackToLocalCityEventsWhenCityStopped(t *testing.T) {
 		apiURL:   server.URL,
 		cityName: "mc-city",
 		cityPath: cityDir,
-	}, events.SessionStopped, "", nil, &stdout, &stderr)
+	}, events.SessionStopped, "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -262,7 +262,7 @@ func TestDoEventsFallsBackToLocalCityEventsOnTypedStoppedCityNotFound(t *testing
 		apiURL:   server.URL,
 		cityName: "mc-city",
 		cityPath: cityDir,
-	}, events.SessionStopped, "", nil, &stdout, &stderr)
+	}, events.SessionStopped, "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -302,7 +302,7 @@ func TestDoEventsDoesNotFallbackToLocalCityEventsForGeneric404(t *testing.T) {
 		apiURL:   server.URL,
 		cityName: "mc-city",
 		cityPath: cityDir,
-	}, events.SessionStopped, "", nil, &stdout, &stderr)
+	}, events.SessionStopped, "", nil, 0, "", &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doEvents = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -341,7 +341,7 @@ func TestDoEventsDoesNotFallbackToLocalCityEventsForExplicitAPI(t *testing.T) {
 		cityName:    "mc-city",
 		cityPath:    cityDir,
 		explicitAPI: true,
-	}, events.SessionStopped, "", nil, &stdout, &stderr)
+	}, events.SessionStopped, "", nil, 0, "", &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("doEvents = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -381,7 +381,7 @@ func TestDoEventsFallsBackToLocalCityEventsForExplicitLocalSupervisorAPI(t *test
 		cityPath:           cityDir,
 		explicitAPI:        true,
 		localSupervisorAPI: true,
-	}, events.SessionStopped, "", nil, &stdout, &stderr)
+	}, events.SessionStopped, "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -416,7 +416,7 @@ func TestDoEventsFallsBackToLocalCityEventsForExplicitLocalSupervisorAPITranspor
 		cityPath:           cityDir,
 		explicitAPI:        true,
 		localSupervisorAPI: true,
-	}, events.SessionStopped, "", nil, &stdout, &stderr)
+	}, events.SessionStopped, "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -458,7 +458,7 @@ func TestDoEventsReadsCustomCityEventTypesThroughAPI(t *testing.T) {
 		apiURL:   server.URL,
 		cityName: "mc-city",
 		cityPath: cityDir,
-	}, "app.custom", "", nil, &stdout, &stderr)
+	}, "app.custom", "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -494,7 +494,7 @@ func TestDoEventsDoesNotReadLocalUntypedCityEventsForExplicitRemoteAPI(t *testin
 		cityName:    "mc-city",
 		cityPath:    cityDir,
 		explicitAPI: true,
-	}, "app.custom", "", nil, &stdout, &stderr)
+	}, "app.custom", "", nil, 0, "", &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -997,7 +997,7 @@ func TestParsePayloadMatch(t *testing.T) {
 
 func TestCmdEventsValidatesLocalFlagsBeforeAPIDiscovery(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	code := cmdEvents("", "", "notaduration", nil, &stdout, &stderr)
+	code := cmdEvents("", "", "notaduration", nil, 0, "", &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("cmdEvents invalid since = 0, want non-zero")
 	}
@@ -1364,7 +1364,7 @@ func TestFetchCityEventsSinglePageChronological(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
-	got, err := fetchCityEvents(context.Background(), client, "mc-city", "", "")
+	got, truncated, err := fetchCityEvents(context.Background(), client, "mc-city", "", "")
 	if err != nil {
 		t.Fatalf("fetchCityEvents: %v", err)
 	}
@@ -1375,5 +1375,190 @@ func TestFetchCityEventsSinglePageChronological(t *testing.T) {
 		if item.Seq != int64(i+4) {
 			t.Fatalf("event[%d].Seq = %d, want %d (chronological ascending)", i, item.Seq, i+4)
 		}
+	}
+	if !truncated {
+		t.Fatalf("truncated = false, want true: the response minted a next_cursor, so more history exists beyond this page")
+	}
+}
+
+// TestFetchCityEventsReportsNotTruncatedWhenPageIsComplete is the negative
+// case for the truncated signal: when the server's page has no next_cursor
+// (every matching event fit), fetchCityEvents must not claim more history
+// exists — ga-dzshu's fix adds this signal, it must not over-fire.
+func TestFetchCityEventsReportsNotTruncatedWhenPageIsComplete(t *testing.T) {
+	page := []cliWireEvent{
+		{Actor: "gc", Seq: 2, Type: "e.t", Ts: time.Unix(1700000020, 0).UTC()},
+		{Actor: "gc", Seq: 1, Type: "e.t", Ts: time.Unix(1700000010, 0).UTC()},
+	}
+	server := newEventsTestServer(t, testEventRoutes{
+		cityEvents: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-GC-Index", "2")
+			writeJSONResponse(t, w, cityEventsListResponse(t, page))
+		},
+	})
+	defer server.Close()
+
+	client, err := genclient.NewClientWithResponses(server.URL)
+	if err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	got, truncated, err := fetchCityEvents(context.Background(), client, "mc-city", "", "")
+	if err != nil {
+		t.Fatalf("fetchCityEvents: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d events, want 2", len(got))
+	}
+	if truncated {
+		t.Fatalf("truncated = true, want false: the response carried no next_cursor")
+	}
+}
+
+// TestDoEventsCityWarnsOnTruncatedPage pins ga-dzshu's actual fix: when the
+// city events page is truncated (next_cursor present), doEvents must warn on
+// stderr instead of silently returning a partial result with exit 0. Before
+// this fix, a --since/--type query capped at 500 produced no signal at all
+// (measured: a 24h bead.closed join concluded 13 of 14 mails never closed
+// when the on-disk log showed 12 of 14 closed).
+func TestDoEventsCityWarnsOnTruncatedPage(t *testing.T) {
+	items := []cliWireEvent{
+		{Actor: "gc", Seq: 2, Type: "e.t", Ts: time.Unix(1700000020, 0).UTC()},
+		{Actor: "gc", Seq: 1, Type: "e.t", Ts: time.Unix(1700000010, 0).UTC()},
+	}
+	server := newEventsTestServer(t, testEventRoutes{
+		cityEvents: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-GC-Index", "2")
+			body := cityEventsListResponse(t, items)
+			next := "v1:eyJrIjoic3EiLCJzIjoxfQ"
+			body.NextCursor = &next
+			writeJSONResponse(t, w, body)
+		},
+	})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := doEvents(eventsAPIScope{apiURL: server.URL, cityName: "mc-city"}, "", "", nil, 0, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doEvents = %d, want 0 (truncation is a warning, not a failure); stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "truncat") && !strings.Contains(stderr.String(), "more history") {
+		t.Fatalf("stderr = %q, want a truncation warning", stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d JSONL lines on stdout, want 2 (the capped page's items, unchanged)", len(lines))
+	}
+}
+
+// TestDoEventsCityNoWarningWhenPageComplete guards against over-firing the
+// new truncation warning: a normal, complete page must print nothing extra
+// on stderr.
+func TestDoEventsCityNoWarningWhenPageComplete(t *testing.T) {
+	items := []cliWireEvent{
+		{Actor: "gc", Seq: 1, Type: "e.t", Ts: time.Unix(1700000010, 0).UTC()},
+	}
+	server := newEventsTestServer(t, testEventRoutes{
+		cityEvents: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-GC-Index", "1")
+			writeJSONResponse(t, w, cityEventsListResponse(t, items))
+		},
+	})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := doEvents(eventsAPIScope{apiURL: server.URL, cityName: "mc-city"}, "", "", nil, 0, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() > 0 {
+		t.Fatalf("stderr = %q, want empty (page was complete, no next_cursor)", stderr.String())
+	}
+}
+
+// TestDoEventsCityAppliesAfterSeq pins the second ga-dzshu defect: --after
+// was parsed but never threaded into the plain-list path, so it silently had
+// no effect outside --follow/--watch. doEvents must now use it to resume
+// past a known seq via the existing filterCityEvents(afterSeq) parameter.
+func TestDoEventsCityAppliesAfterSeq(t *testing.T) {
+	items := []cliWireEvent{
+		{Actor: "gc", Seq: 1, Type: "e.t", Ts: time.Unix(1700000010, 0).UTC()},
+		{Actor: "gc", Seq: 2, Type: "e.t", Ts: time.Unix(1700000020, 0).UTC()},
+		{Actor: "gc", Seq: 3, Type: "e.t", Ts: time.Unix(1700000030, 0).UTC()},
+	}
+	server := newEventsTestServer(t, testEventRoutes{
+		cityEvents: func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-GC-Index", "3")
+			writeJSONResponse(t, w, cityEventsListResponse(t, items))
+		},
+	})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := doEvents(eventsAPIScope{apiURL: server.URL, cityName: "mc-city"}, "", "", nil, 1, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d JSONL lines, want 2 (seq 2 and 3, resumed after seq 1); output=%q", len(lines), stdout.String())
+	}
+	for _, line := range lines {
+		var item cliWireEvent
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			t.Fatalf("unmarshal line: %v; line=%q", err, line)
+		}
+		if item.Seq <= 1 {
+			t.Fatalf("event with Seq=%d leaked through --after 1", item.Seq)
+		}
+	}
+}
+
+// TestDoEventsSupervisorAppliesAfterCursor is the supervisor-scope sibling of
+// TestDoEventsCityAppliesAfterSeq: --after-cursor had the identical gap in
+// list mode, fixable with the pre-existing filterSupervisorEventsAfterCursor
+// helper that --watch already used.
+func TestDoEventsSupervisorAppliesAfterCursor(t *testing.T) {
+	items := []cliWireTaggedEvent{
+		{Actor: "human", City: "alpha", Seq: 3, Ts: time.Unix(1700000000, 0).UTC(), Type: "bead.created"},
+		{Actor: "human", City: "alpha", Seq: 4, Ts: time.Unix(1700000010, 0).UTC(), Type: "bead.created"},
+	}
+	server := newEventsTestServer(t, testEventRoutes{
+		supervisorEvents: func(w http.ResponseWriter, _ *http.Request) {
+			writeJSONResponse(t, w, supervisorEventsListResponse(t, items))
+		},
+	})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := doEvents(eventsAPIScope{apiURL: server.URL}, "", "", nil, 0, "alpha:3", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doEvents = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var got cliWireTaggedEvent
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &got); err != nil {
+		t.Fatalf("unmarshal stdout: %v; output=%s", err, stdout.String())
+	}
+	if got.Seq != 4 {
+		t.Fatalf("got seq=%d, want only seq=4 (resumed after alpha:3)", got.Seq)
+	}
+}
+
+// TestCmdEventsRejectsAfterInSupervisorScope pins the new scope guard added
+// to cmdEvents: --after only makes sense with a city in scope, exactly like
+// the pre-existing check on --follow/--watch (validateEventsCursor). Before
+// this fix cmdEvents never even received afterSeq, so no such guard existed.
+func TestCmdEventsRejectsAfterInSupervisorScope(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	server := newEventsTestServer(t, testEventRoutes{})
+	defer server.Close()
+
+	var stdout, stderr bytes.Buffer
+	code := cmdEvents(server.URL, "", "", nil, 42, "", &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("cmdEvents --after in supervisor scope = 0, want non-zero")
+	}
+	if !strings.Contains(stderr.String(), "--after") {
+		t.Fatalf("stderr = %q, want a message naming --after", stderr.String())
 	}
 }
