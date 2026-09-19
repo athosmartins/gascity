@@ -4,3 +4,15 @@ formula = "mol-digest-generate"
 trigger = "cooldown"
 interval = "24h"
 pool = "dog"
+# ga-ymq0x: this order is TOWN-WIDE by design (one digest covering every
+# rig in a single run — see mol-digest-generate's own per-rig data-collection
+# loop). Without an explicit scope, Order.ScopedName() defaults to rig-scoped
+# (internal/orders/order.go's ParseScope), so importing this pack at BOTH
+# city level ([imports.gastown]) and per-rig level ([rigs.imports.gastown] —
+# needed for witness/refinery/polecat resolution, gt-kfr7m) makes
+# orderdiscovery.ScanAll rediscover this same order once per importing rig,
+# each with its own independent 24h cooldown window (order-run:digest-
+# generate:rig:<name>) — causing 3-4x/day duplicate dispatch instead of once.
+# scope="city" makes IsCityScoped() true, which activates the dedup path
+# already built for exactly this situation (ScanAll's cityScopedSeen check).
+scope = "city"
