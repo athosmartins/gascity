@@ -82,6 +82,31 @@ func TestIsTestConfigPath_KnownGCTestPrefix(t *testing.T) {
 	}
 }
 
+// TestIsTestConfigPath_BeadsModuleTestPrefixes — ga-fqj42: the cmd/bd test
+// suite (vendored under third_party/beads, a separate Go module) creates its
+// own dolt sql-server test fixtures directly under os.TempDir(), using the
+// prefixes documented in third_party/beads/scripts/clean-test-tmp.sh. Those
+// prefixes were never added here, so a orphaned test server surviving a
+// SIGKILLed `go test -tags=integration ./cmd/bd/...` run reads as "config
+// not on test-config-path allowlist" and gets protected instead of reaped
+// (measured live: 25-minute orphan, pid held 785MB, gc dolt-cleanup --force
+// refused it). Mirrors TestIsTestConfigPath_IntegrationTempPrefixes's shape.
+func TestIsTestConfigPath_BeadsModuleTestPrefixes(t *testing.T) {
+	cases := []string{
+		"/data/tmp/beads-bd-tests-1234567/.beads/dolt-config.yaml",
+		"/data/tmp/beads-shared-server-bd-9876543/.beads/dolt-config.yaml",
+		"/data/tmp/bd-testbin-42/.beads/dolt-config.yaml",
+		"/data/tmp/bd-init-test-42/.beads/dolt-config.yaml",
+		"/data/tmp/bd-init-permissions-test-42/.beads/dolt-config.yaml",
+		"/data/tmp/bd-embedded-init-test-42/.beads/dolt-config.yaml",
+	}
+	for _, p := range cases {
+		if !isTestConfigPath(p, "/home/u", "/data/tmp") {
+			t.Errorf("isTestConfigPath(%q) = false, want true (beads module test prefix)", p)
+		}
+	}
+}
+
 func TestIsTestConfigPath_IntegrationTempPrefixes(t *testing.T) {
 	cases := []string{
 		"/tmp/gcit-123/cities/x/.gc/runtime/packs/dolt/dolt-config.yaml",

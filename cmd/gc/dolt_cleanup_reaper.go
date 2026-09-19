@@ -112,6 +112,20 @@ func testConfigPathPrefixes() []string {
 		"gc-rename-",
 		"gcit-",
 		"gc-int-env-",
+		// cmd/bd test roots (third_party/beads, a separate Go module vendored
+		// into this one — its own test suite, not cmd/gc's). Prefixes mirror
+		// third_party/beads/scripts/clean-test-tmp.sh's canonical pattern list
+		// verbatim so the two allowlists can't drift apart again. Before this,
+		// a `dolt sql-server` orphaned by a SIGKILLed `go test
+		// -tags=integration ./cmd/bd/...` run fell through every branch above
+		// to "not on test-config-path allowlist" and was protected instead of
+		// reaped (ga-fqj42: confirmed live, 25-minute orphan holding 785MB).
+		"beads-bd-tests-",
+		"beads-shared-server-bd-",
+		"bd-testbin-",
+		"bd-init-test-",
+		"bd-init-permissions-test-",
+		"bd-embedded-init-test-",
 	}
 }
 
