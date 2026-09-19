@@ -1600,11 +1600,19 @@ func overwritePreservingMode(t *testing.T, path string, content []byte) {
 }
 
 // TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits is the unit
-// guard for ga-8j89i part 1: a non-required pack file that materializeFS
-// leaves in place because it might be an operator edit must still be REPORTED
-// when it no longer matches the embedded bytes. Preserving it silently is what
-// let .gc/system/packs/dolt/commands/compact/run.sh run 6+ days behind the
-// binary while gc config show/gc reload ran repeatedly.
+// guard for ga-8j89i part 1, upgraded for ga-o99jf part 2: a non-required
+// pack file that materializeFS leaves in place because it might be an
+// operator edit must still be REPORTED when it no longer matches the embedded
+// bytes. Preserving it silently is what let
+// .gc/system/packs/dolt/commands/compact/run.sh run 6+ days behind the binary
+// while gc config show/gc reload ran repeatedly.
+//
+// Under ga-o99jf this scenario — a file with recorded materialize history
+// (from the first two calls below) that a THIRD party then overwrites —
+// lands in operatorEdited, not changed: the hash manifest built by those
+// first two calls proves the divergence is a genuine edit, not merely
+// unrecorded staleness. changed is now reserved for packs with no history at
+// all (see TestMaterializeFSCollectingDrift_NoManifestHistoryFallsBackToAmbiguousComparison).
 func TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits(t *testing.T) {
 	dst := t.TempDir()
 	embedded := fstest.MapFS{
@@ -1614,23 +1622,26 @@ func TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits(t *testing.T
 	}
 
 	// First materialize scaffolds everything: nothing is preserved, so nothing
-	// can have drifted.
+	// can have drifted. It also seeds the hash manifest for all three files.
 	first := packDriftReport{pack: "test"}
 	if _, err := materializeFSCollectingDrift(embedded, dst, true, &first); err != nil {
 		t.Fatalf("first materializeFSCollectingDrift: %v", err)
 	}
 	if first.hasFindings() {
-		t.Fatalf("fresh materialize reported drift: changed=%v unreadable=%v", first.changed, first.unreadable)
+		t.Fatalf("fresh materialize reported drift: %+v", first)
 	}
 
 	// Second materialize with untouched files: still no drift. This is the
-	// false-positive guard — every gc invocation would warn otherwise.
+	// false-positive guard — every gc invocation would warn otherwise. Under
+	// ga-o99jf this also proves the "up to date is a no-op" acceptance
+	// criterion at the report level (see TestMaterializeFSCollectingDrift_UpToDatePackIsNoOp
+	// for the on-disk/mtime version of the same proof).
 	second := packDriftReport{pack: "test"}
 	if _, err := materializeFSCollectingDrift(embedded, dst, true, &second); err != nil {
 		t.Fatalf("second materializeFSCollectingDrift: %v", err)
 	}
 	if second.hasFindings() {
-		t.Fatalf("clean materialize reported drift: changed=%v unreadable=%v", second.changed, second.unreadable)
+		t.Fatalf("clean materialize reported drift: %+v", second)
 	}
 
 	// Now the file on disk diverges from the binary. Same length as the
@@ -1641,8 +1652,11 @@ func TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits(t *testing.T
 	if _, err := materializeFSCollectingDrift(embedded, dst, true, &third); err != nil {
 		t.Fatalf("third materializeFSCollectingDrift: %v", err)
 	}
-	if len(third.changed) != 1 || third.changed[0] != "b.txt" {
-		t.Fatalf("changed = %v, want exactly [b.txt]", third.changed)
+	if len(third.operatorEdited) != 1 || third.operatorEdited[0] != "b.txt" {
+		t.Fatalf("operatorEdited = %v, want exactly [b.txt] (hash history should confirm this as a real edit)", third.operatorEdited)
+	}
+	if len(third.changed) != 0 {
+		t.Fatalf("changed = %v, want empty — this file has manifest history, it must not fall into the ambiguous bucket", third.changed)
 	}
 	if len(third.unreadable) != 0 {
 		t.Fatalf("unreadable = %v, want empty", third.unreadable)
@@ -1657,9 +1671,19 @@ func TestMaterializeFSCollectingDrift_ReportsPreservedOperatorEdits(t *testing.T
 		t.Fatalf("drift reporting overwrote the operator edit: got %q", got)
 	}
 
-	// nil report keeps the old behaviour and does no comparison work.
+	// nil report keeps the old behaviour (no operator-facing findings
+	// recorded) but the hash-manifest reconciliation still runs — ga-o99jf's
+	// rewrite decision is unconditional on the report, unlike ga-8j89i's pure
+	// side-channel comparison.
 	if _, err := materializeFSCollectingDrift(embedded, dst, true, nil); err != nil {
 		t.Fatalf("nil-report materializeFSCollectingDrift: %v", err)
+	}
+	got, err = os.ReadFile(filepath.Join(dst, "b.txt"))
+	if err != nil {
+		t.Fatalf("read b.txt after nil-report call: %v", err)
+	}
+	if string(got) != "EMBEDDED-B" {
+		t.Fatalf("nil-report call overwrote the operator edit: got %q", got)
 	}
 }
 
@@ -1692,17 +1716,30 @@ func TestMaterializeFSCollectingDrift_RequiredPackRepairsInsteadOfReporting(t *t
 	}
 }
 
-// TestRecordPreservedPackDrift_UnreadableFileIsUnknownNotClean is the
-// third-state guard. A file we cannot read must land in `unreadable`, never be
-// silently counted as matching — "could not compare" and "compares equal" must
-// not produce the same value.
-func TestRecordPreservedPackDrift_UnreadableFileIsUnknownNotClean(t *testing.T) {
+// TestReconcilePreservedPackFile_UnreadableFileIsUnknownNotClean is the
+// third-state guard, carried over from ga-8j89i's recordPreservedPackDrift
+// (renamed/replaced by ga-o99jf's reconcilePreservedPackFile). A file we
+// cannot read must land in `unreadable`, never be silently counted as
+// matching — "could not compare" and "compares equal" must not produce the
+// same value. This holds regardless of whether hash history exists, so it is
+// checked with haveKnownHash=false (the read happens before history is even
+// consulted).
+func TestReconcilePreservedPackFile_UnreadableFileIsUnknownNotClean(t *testing.T) {
 	dir := t.TempDir()
 	embedded := fstest.MapFS{"a.txt": {Data: []byte("embedded-a"), Mode: 0o644}}
 
 	report := packDriftReport{pack: "test"}
-	recordPreservedPackDrift(&report, embedded, "a.txt", filepath.Join(dir, "does-not-exist.txt"))
+	persistHash, refresh := reconcilePreservedPackFile(&report, embedded, "a.txt", filepath.Join(dir, "does-not-exist.txt"), "", false)
 
+	if persistHash != "" {
+		t.Fatalf("persistHash = %q, want empty for an unreadable file", persistHash)
+	}
+	if refresh {
+		t.Fatal("refresh = true for an unreadable file; must preserve (i.e. not attempt to overwrite) under doubt")
+	}
+	if len(report.operatorEdited) != 0 {
+		t.Fatalf("operatorEdited = %v, want empty", report.operatorEdited)
+	}
 	if len(report.changed) != 0 {
 		t.Fatalf("changed = %v, want empty", report.changed)
 	}
@@ -1719,12 +1756,367 @@ func TestRecordPreservedPackDrift_UnreadableFileIsUnknownNotClean(t *testing.T) 
 	}
 }
 
+// TestReconcilePreservedPackFile_NoManifestHistoryFallsBackToEmbeddedComparison
+// is the unit-level guard for the migration path: a pack materialized before
+// ga-o99jf shipped (or one whose manifest was lost) has no recorded hash for
+// a file. reconcilePreservedPackFile must then fall back to ga-8j89i's
+// original comparison against the CURRENT embedded bytes — and, critically,
+// must NOT adopt a mismatched on-disk file as a new trusted baseline, because
+// that would make an old, real operator edit look "stale" and get silently
+// overwritten on the very next materialize.
+func TestReconcilePreservedPackFile_NoManifestHistoryFallsBackToEmbeddedComparison(t *testing.T) {
+	dir := t.TempDir()
+	embedded := fstest.MapFS{"a.txt": {Data: []byte("embedded-a"), Mode: 0o644}}
+
+	t.Run("matches embedded: safe to backfill, no drift", func(t *testing.T) {
+		path := filepath.Join(dir, "match.txt")
+		if err := os.WriteFile(path, []byte("embedded-a"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		report := packDriftReport{pack: "test"}
+		persistHash, refresh := reconcilePreservedPackFile(&report, embedded, "a.txt", path, "", false)
+		if refresh {
+			t.Fatal("refresh = true; a file that already matches the embedded bytes should not need a write")
+		}
+		if persistHash != sha256Hex([]byte("embedded-a")) {
+			t.Fatalf("persistHash = %q, want the hash of the matching content (safe to backfill)", persistHash)
+		}
+		if report.hasFindings() {
+			t.Fatalf("reported drift for a file that already matches embedded content: %+v", report)
+		}
+	})
+
+	t.Run("differs from embedded with no history: ambiguous, preserved, not backfilled", func(t *testing.T) {
+		path := filepath.Join(dir, "mismatch.txt")
+		if err := os.WriteFile(path, []byte("some-old-operator-edit"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		report := packDriftReport{pack: "test"}
+		persistHash, refresh := reconcilePreservedPackFile(&report, embedded, "a.txt", path, "", false)
+		if refresh {
+			t.Fatal("refresh = true; an ambiguous no-history mismatch must never be auto-refreshed")
+		}
+		if persistHash != "" {
+			t.Fatalf("persistHash = %q, want empty — adopting mismatched on-disk content as a baseline "+
+				"would make a real operator edit look stale and get silently overwritten next time", persistHash)
+		}
+		if len(report.changed) != 1 || report.changed[0] != "a.txt" {
+			t.Fatalf("changed = %v, want exactly [a.txt]", report.changed)
+		}
+		if len(report.operatorEdited) != 0 {
+			t.Fatalf("operatorEdited = %v, want empty — there is no history to confirm this as an edit", report.operatorEdited)
+		}
+	})
+}
+
+// TestMaterializeFSCollectingDrift_StaleFileRematerializesAcrossBinarySwap is
+// acceptance criterion (a) from ga-o99jf, reproducing the bead's own repro
+// steps: v1 and v2 are two DISTINCT embedded filesystems — simulating two
+// different gc binaries, not just two different on-disk states — because
+// "trocar o binario pra V2 ... SEM gc init" means the EMBEDDED bytes changed.
+// A same-FS on-disk mutation (as the operator-edit tests in this file use)
+// does not reproduce that; it reproduces an edit, not a binary swap.
+func TestMaterializeFSCollectingDrift_StaleFileRematerializesAcrossBinarySwap(t *testing.T) {
+	dst := t.TempDir()
+	v1 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v1\n"), Mode: 0o755}}
+	v2 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v2\n"), Mode: 0o755}}
+
+	if _, err := materializeFSCollectingDrift(v1, dst, true, &packDriftReport{pack: "test"}); err != nil {
+		t.Fatalf("V1 materialize: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dst, "run.sh")); err != nil || string(got) != "#!/bin/sh\necho v1\n" {
+		t.Fatalf("after V1 materialize: content=%q err=%v, want v1 content", got, err)
+	}
+
+	// V2 materializes next; nobody touched run.sh in between.
+	report := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(v2, dst, true, &report); err != nil {
+		t.Fatalf("V2 materialize: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "run.sh"))
+	if err != nil {
+		t.Fatalf("read after V2: %v", err)
+	}
+	if string(got) != "#!/bin/sh\necho v2\n" {
+		t.Fatalf("after V2 materialize = %q, want v2 content — this is the exact bug ga-o99jf fixes: "+
+			"today the on-disk file does NOT change (RED per the bead's own repro); it must (GREEN)", got)
+	}
+	if report.hasFindings() {
+		t.Fatalf("silent self-heal reported drift instead of just fixing it: %+v", report)
+	}
+}
+
+// TestMaterializeFSCollectingDrift_OperatorEditSurvivesBinarySwapAndIsReported
+// is acceptance criterion (b), the bead's own mandatory sibling test: an
+// operator edit that differs from BOTH the OLD and the NEW embedded content
+// must never be silently overwritten by a binary swap — "sem isso o fix
+// troca um bug silencioso por perda de dado silenciosa."
+func TestMaterializeFSCollectingDrift_OperatorEditSurvivesBinarySwapAndIsReported(t *testing.T) {
+	dst := t.TempDir()
+	v1 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v1\n"), Mode: 0o755}}
+	v2 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v2\n"), Mode: 0o755}}
+
+	if _, err := materializeFSCollectingDrift(v1, dst, true, &packDriftReport{pack: "test"}); err != nil {
+		t.Fatalf("V1 materialize: %v", err)
+	}
+
+	// The operator edits the file — content differs from V1 and, as set up
+	// below, will also differ from V2.
+	const operatorContent = "#!/bin/sh\necho OPERATOR OVERRIDE -- do not touch\n"
+	overwritePreservingMode(t, filepath.Join(dst, "run.sh"), []byte(operatorContent))
+
+	// V2 materializes. The failure this guards against: a fix that cannot
+	// tell "stale" from "edited" would either (a) never refresh anything
+	// (ga-8j89i's stopgap — safe, but not durable) or, worse, (b) refresh
+	// everything unconditionally and destroy this edit. Only preserve+warn is
+	// correct here.
+	report := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(v2, dst, true, &report); err != nil {
+		t.Fatalf("V2 materialize: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "run.sh"))
+	if err != nil {
+		t.Fatalf("read after V2: %v", err)
+	}
+	if string(got) != operatorContent {
+		t.Fatalf("operator edit lost across binary swap: got %q, want %q", got, operatorContent)
+	}
+	if len(report.operatorEdited) != 1 || report.operatorEdited[0] != "run.sh" {
+		t.Fatalf("operatorEdited = %v, want exactly [run.sh] — the edit must be reported, not silently accepted", report.operatorEdited)
+	}
+
+	// A THIRD binary (yet another distinct embedded version) must still
+	// preserve the same edit: reconcilePreservedPackFile carries the OLD
+	// (v1) hash forward on a confirmed edit rather than adopting v2's, so
+	// the edit keeps being recognized as an edit on every subsequent swap —
+	// never just "stale relative to whatever the last binary was."
+	v3 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v3\n"), Mode: 0o755}}
+	report3 := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(v3, dst, true, &report3); err != nil {
+		t.Fatalf("V3 materialize: %v", err)
+	}
+	got, err = os.ReadFile(filepath.Join(dst, "run.sh"))
+	if err != nil {
+		t.Fatalf("read after V3: %v", err)
+	}
+	if string(got) != operatorContent {
+		t.Fatalf("operator edit lost on second binary swap: got %q, want %q", got, operatorContent)
+	}
+	if len(report3.operatorEdited) != 1 || report3.operatorEdited[0] != "run.sh" {
+		t.Fatalf("operatorEdited (v3) = %v, want exactly [run.sh]", report3.operatorEdited)
+	}
+}
+
+// TestMaterializeFSCollectingDrift_UpToDatePackIsNoOp is acceptance criterion
+// (c) from ga-o99jf: a pack already in sync with the binary must not be
+// rewritten on a repeat materialize — no mtime churn, no drift report.
+func TestMaterializeFSCollectingDrift_UpToDatePackIsNoOp(t *testing.T) {
+	dst := t.TempDir()
+	embedded := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v1\n"), Mode: 0o755}}
+
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &packDriftReport{pack: "test"}); err != nil {
+		t.Fatalf("first materialize: %v", err)
+	}
+	path := filepath.Join(dst, "run.sh")
+	past := time.Unix(123456789, 0)
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+
+	report := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &report); err != nil {
+		t.Fatalf("second materialize: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if !info.ModTime().Equal(past) {
+		t.Fatalf("up-to-date file was rewritten: modtime = %s, want %s", info.ModTime(), past)
+	}
+	if report.hasFindings() {
+		t.Fatalf("up-to-date pack reported drift: %+v", report)
+	}
+}
+
+// TestMaterializeFSCollectingDrift_NoManifestHistoryFallsBackToAmbiguousComparison
+// is the end-to-end migration-path guard: a pack materialized by a
+// pre-ga-o99jf binary has no hash manifest at all. The first ga-o99jf-era
+// materialize against it must behave EXACTLY like ga-8j89i always did —
+// compare on-disk against the current embedded bytes, preserve on mismatch,
+// and warn with the original hedged ("either a local edit or content left
+// over from an older binary") wording — never guess, and never treat the
+// mismatch as proof of anything.
+func TestMaterializeFSCollectingDrift_NoManifestHistoryFallsBackToAmbiguousComparison(t *testing.T) {
+	dst := t.TempDir()
+	v1 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v1\n"), Mode: 0o755}}
+
+	if _, err := materializeFSCollectingDrift(v1, dst, true, &packDriftReport{pack: "test"}); err != nil {
+		t.Fatalf("V1 materialize: %v", err)
+	}
+	// Simulate "this pack predates ga-o99jf": drop the manifest a real
+	// pre-ga-o99jf binary would never have written.
+	if err := os.Remove(filepath.Join(dst, packHashManifestFile)); err != nil {
+		t.Fatalf("remove manifest: %v", err)
+	}
+
+	// Something changed the file with no gc-recorded history of it (an old
+	// operator edit predating this feature, indistinguishable here from
+	// unrecorded staleness).
+	overwritePreservingMode(t, filepath.Join(dst, "run.sh"), []byte("#!/bin/sh\necho mystery content\n"))
+
+	v2 := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v2\n"), Mode: 0o755}}
+	report := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(v2, dst, true, &report); err != nil {
+		t.Fatalf("V2 materialize: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "run.sh"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "#!/bin/sh\necho mystery content\n" {
+		t.Fatalf("no-history mismatch was overwritten: got %q — this is the exact regression ga-8j89i's "+
+			"preserveOperatorEdits exists to prevent", got)
+	}
+	if len(report.changed) != 1 || report.changed[0] != "run.sh" {
+		t.Fatalf("changed = %v, want exactly [run.sh] (no history -> ambiguous bucket, not operatorEdited)", report.changed)
+	}
+	if len(report.operatorEdited) != 0 {
+		t.Fatalf("operatorEdited = %v, want empty — there is no manifest to confirm this as an edit", report.operatorEdited)
+	}
+
+	lines := builtinPackDriftWarningLines(dst, report)
+	found := false
+	for _, line := range lines {
+		if strings.Contains(line, "no materialize-history record") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warning lines = %q, want the hedged no-history wording", lines)
+	}
+}
+
+// TestMaterializeFSCollectingDrift_ManifestWriteFailureIsNonFatalAndWarned
+// proves a hash-manifest write failure never blocks materialization and
+// never risks data loss — it only degrades future drift detection back to
+// the fully conservative no-history comparison, and that degradation itself
+// is surfaced so an operator can notice and fix the underlying problem
+// (permissions, disk full, etc.).
+func TestMaterializeFSCollectingDrift_ManifestWriteFailureIsNonFatalAndWarned(t *testing.T) {
+	dst := t.TempDir()
+	embedded := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v1\n"), Mode: 0o755}}
+
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &packDriftReport{pack: "test"}); err != nil {
+		t.Fatalf("first materialize: %v", err)
+	}
+
+	// Replace the manifest FILE with a directory of the same name, so any
+	// attempt to write it as a regular file fails — a portable, sandbox-safe
+	// way to force a write failure without fighting real filesystem
+	// permissions. This also makes the manifest unreadable on the NEXT call,
+	// which is fine and deliberate here: run.sh is left UNCHANGED below, so
+	// the no-history fallback (readPackHashManifest returns empty for an
+	// unreadable manifest) still correctly finds on-disk == embedded and
+	// reports no drift on run.sh itself — the write failure is isolated to
+	// the manifest bookkeeping, proven independently of any refresh decision.
+	manifestPath := filepath.Join(dst, packHashManifestFile)
+	if err := os.Remove(manifestPath); err != nil {
+		t.Fatalf("remove manifest: %v", err)
+	}
+	if err := os.Mkdir(manifestPath, 0o755); err != nil {
+		t.Fatalf("mkdir over manifest path: %v", err)
+	}
+
+	report := packDriftReport{pack: "test"}
+	if _, err := materializeFSCollectingDrift(embedded, dst, true, &report); err != nil {
+		t.Fatalf("materialize must not fail just because the manifest write failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dst, "run.sh"))
+	if err != nil {
+		t.Fatalf("read run.sh: %v", err)
+	}
+	if string(got) != "#!/bin/sh\necho v1\n" {
+		t.Fatalf("run.sh = %q, want unchanged v1 content — a manifest write failure must never touch pack content", got)
+	}
+	if report.manifestWriteErr == nil {
+		t.Fatal("manifestWriteErr = nil, want a recorded error for the failed manifest write")
+	}
+	if !report.hasFindings() {
+		t.Fatal("hasFindings() = false with a manifestWriteErr set; a degraded manifest must not read as a clean pass")
+	}
+	lines := builtinPackDriftWarningLines(dst, report)
+	found := false
+	for _, line := range lines {
+		if strings.Contains(line, "could not update the hash manifest") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warning lines = %q, want a hash-manifest-write-failure warning", lines)
+	}
+}
+
+// TestPruneStaleGeneratedPackFiles_PreservesPackHashManifest guards the prune
+// exemption ga-o99jf adds: the hash manifest is runtime bookkeeping produced
+// by materializeFSCollectingDrift, never part of the embedded pack content
+// (never in `desired`), so without an explicit exemption
+// pruneStaleGeneratedPackFiles would delete the very manifest the last
+// materialize just wrote.
+func TestPruneStaleGeneratedPackFiles_PreservesPackHashManifest(t *testing.T) {
+	dst := t.TempDir()
+	embedded := fstest.MapFS{"run.sh": {Data: []byte("#!/bin/sh\necho v1\n"), Mode: 0o755}}
+
+	desired, err := materializeFSCollectingDrift(embedded, dst, true, &packDriftReport{pack: "test"})
+	if err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+	manifestPath := filepath.Join(dst, packHashManifestFile)
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("manifest missing after materialize: %v", err)
+	}
+	// An in-flight atomic temp sibling, as WriteFileIfContentOrModeChangedAtomic
+	// would leave behind if a concurrent writer were interrupted mid-rename.
+	tempManifest := manifestPath + ".tmp.foreign-writer"
+	if err := os.WriteFile(tempManifest, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write temp manifest sibling: %v", err)
+	}
+
+	if err := pruneStaleGeneratedPackFiles(dst, desired); err != nil {
+		t.Fatalf("pruneStaleGeneratedPackFiles: %v", err)
+	}
+
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("pack hash manifest was pruned: %v", err)
+	}
+	if _, err := os.Stat(tempManifest); err != nil {
+		t.Fatalf("manifest atomic temp sibling was pruned: %v", err)
+	}
+}
+
 // TestMaterializeBuiltinPacksWarnsWhenNonRequiredPackDriftsFromBinary is the
 // end-to-end guard for ga-8j89i: after a binary upgrade the materialized dolt
 // pack keeps running its old content, and the only thing that can tell the
 // operator is this warning. Four sessions (3 dogs + the Mayor) burned full
 // investigations on ga-qu0hi chasing "the patch does not apply" when the real
 // cause was "the file on disk was never updated".
+//
+// Under ga-o99jf, directly overwriting the file (below, via
+// overwritePreservingMode) after a real MaterializeBuiltinPacks call is a
+// CONFIRMED edit — that first call seeded the hash manifest — so this now
+// exercises the operatorEdited path rather than ga-8j89i's original
+// undifferentiated "changed" bucket. The assertions below still hold
+// unchanged because the operatorEdited warning deliberately keeps the same
+// "differs from the copy embedded in this gc binary" lead-in; what actually
+// matters end-to-end here — pack named, file named, edit never silently
+// dropped — is unaffected by which bucket it lands in. The genuinely
+// ambiguous no-history case this test's original framing gestured at now has
+// its own dedicated coverage:
+// TestMaterializeFSCollectingDrift_NoManifestHistoryFallsBackToAmbiguousComparison.
 func TestMaterializeBuiltinPacksWarnsWhenNonRequiredPackDriftsFromBinary(t *testing.T) {
 	t.Setenv("GC_BEADS", "")
 	dir := t.TempDir()

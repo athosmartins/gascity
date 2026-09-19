@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -51,12 +54,23 @@ type builtinPackFile struct {
 // atomic rename so readers never observe a truncated file. Executable scripts
 // get 0755; everything else 0644.
 //
-// Operator edits are preserved only for non-required packs: a regular,
-// correct-mode file in a non-required pack is left untouched even when its
-// content differs from the embedded bytes (see gastownhall/gascity#2429).
 // Required packs (core, maintenance, and the provider-dependent bd/dolt) are
 // always refreshed and validated, so a stale or corrupt required pack on disk
 // is repaired rather than silently accepted.
+//
+// Non-required packs distinguish "stale" from "operator-edited" by CONTENT
+// HASH, never by mtime (ga-o99jf; mtime is destroyed by checkout/cp/rsync and
+// cannot tell an edit made before a binary swap from one made after). Each
+// non-required pack keeps a sidecar hash manifest (packHashManifestFile)
+// recording the SHA-256 of every file the LAST successful materialize wrote.
+// On the next materialize, a preserved file is re-materialized from the new
+// embedded bytes when its on-disk hash still matches that record (nobody
+// touched it — genuinely stale, not an edit) and left alone — with a warning —
+// when it does not (see materializeFSCollectingDrift for the full 3-way
+// comparison, including the pre-ga-o99jf migration path with no manifest at
+// all). This replaces ga-8j89i's warning-only stopgap: that patch could only
+// ever say "this differs from the binary," never say which of the two causes
+// it was, so it never touched disk. This one can, safely, in the common case.
 // Idempotent: safe to call on every gc start and gc init.
 func MaterializeBuiltinPacks(cityPath string) error {
 	required := requiredBuiltinPackSet(cityPath)
@@ -263,57 +277,194 @@ func emitBuiltinPackRefreshWarning(w io.Writer, err error) {
 	fmt.Fprintf(w, "warning: %v\n", err) //nolint:errcheck // best-effort warning emission
 }
 
+// packHashManifestFile is the per-pack sidecar (ga-o99jf) recording, for every
+// file a non-required pack's materialize has WRITTEN to disk, the SHA-256 of
+// the bytes it wrote. It lives inside the pack's own materialized directory,
+// sibling to pack.toml — so it travels with the `mv <pack> <pack>.bak` reset
+// ga-8j89i's warning already recommends, and pruneStaleGeneratedPackFiles has
+// to know to exempt it (it is bookkeeping, not embedded pack content).
+//
+// This hash — "what did gc itself last write here" — is the whole mechanism:
+// comparing the CURRENT on-disk bytes against it (not against mtime, and not
+// only against the CURRENT embedded bytes) is what tells "nobody has touched
+// this since gc wrote it" (stale, safe to refresh even though the embedded
+// bytes have since changed) apart from "something else wrote it since" (an
+// edit, must be preserved) — see reconcilePreservedPackFile.
+const packHashManifestFile = ".gc-pack-hashes.json"
+
+// sha256Hex returns the hex-encoded SHA-256 digest of data.
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// readPackHashManifest reads dstDir's hash manifest. An absent or corrupt
+// manifest — including every pack materialized before ga-o99jf shipped, which
+// never wrote one — returns an empty map, so every file in dstDir is treated
+// as having no recorded history. That is deliberately the most conservative
+// branch of reconcilePreservedPackFile: preserve, and warn only if the file
+// actually looks different from what the binary would write.
+func readPackHashManifest(dstDir string) map[string]string {
+	data, err := os.ReadFile(filepath.Join(dstDir, packHashManifestFile))
+	if err != nil {
+		return map[string]string{}
+	}
+	var manifest map[string]string
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return map[string]string{}
+	}
+	if manifest == nil {
+		return map[string]string{}
+	}
+	return manifest
+}
+
+// writePackHashManifest atomically writes dstDir's hash manifest. encoding/json
+// sorts map keys, so byte-identical content across repeated calls is
+// guaranteed and WriteFileIfContentOrModeChangedAtomic correctly no-ops —
+// required for MaterializeBuiltinPacks to stay idempotent.
+//
+// A write failure here is non-fatal by design (callers route it through
+// packDriftReport.manifestWriteErr as a warning, not an error): losing this
+// bookkeeping only widens the next materialize's "no recorded history" branch
+// back to fully conservative preserve-and-warn. It never risks overwriting an
+// operator's file — the reconciliation that actually touches disk always runs
+// before this write, never depends on it having already succeeded.
+func writePackHashManifest(dstDir string, manifest map[string]string) error {
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return fmt.Errorf("marshaling pack hash manifest: %w", err)
+	}
+	return fsys.WriteFileIfContentOrModeChangedAtomic(fsys.OSFS{}, filepath.Join(dstDir, packHashManifestFile), data, 0o644)
+}
+
 // maxReportedDriftedPackFiles bounds how many paths a single drift warning
 // names. A pack can hold dozens of files; the operator needs enough to
 // recognize what drifted, not a wall of text.
 const maxReportedDriftedPackFiles = 5
 
-// packDriftReport records, for one builtin pack, the files the
-// preserve-operator-edits branch left in place that do not match the bytes
-// embedded in the running gc binary.
+// packDriftReport records, for one builtin pack, how the preserve-operator-
+// edits branch disposed of each file it left in place. The buckets answer
+// different questions and must not collapse into each other:
 //
-// changed and unreadable are deliberately separate: a file we could not read
-// is drift *unknown*, not drift *absent*. Collapsing the two would make a
-// permission error look identical to a clean pack, which is the failure the
-// warning exists to prevent.
+//   - operatorEdited: the hash manifest PROVES this file no longer matches
+//     what gc itself last wrote here (ga-o99jf). Confirmed, not guessed —
+//     the warning can say so with confidence, and gc never overwrites it.
+//   - changed: no manifest entry exists for this file (a pack materialized
+//     before ga-o99jf shipped, or a lost/corrupt manifest) AND it differs
+//     from the CURRENT embedded bytes. Provenance is genuinely unknown: it
+//     might be a long-standing operator edit or unrecorded staleness, and
+//     gc cannot tell which without the operator's help (ga-8j89i's original,
+//     necessarily hedged case).
+//   - unreadable: an I/O error prevented the comparison. Drift *unknown*,
+//     never conflated with drift *absent* — a permission error must not
+//     read as a clean pack.
 type packDriftReport struct {
-	pack       string
-	changed    []string
-	unreadable []string
+	pack             string
+	operatorEdited   []string
+	changed          []string
+	unreadable       []string
+	manifestWriteErr error
 }
 
 func (r *packDriftReport) hasFindings() bool {
-	return r != nil && (len(r.changed) > 0 || len(r.unreadable) > 0)
+	return r != nil && (len(r.operatorEdited) > 0 || len(r.changed) > 0 || len(r.unreadable) > 0 || r.manifestWriteErr != nil)
 }
 
-// recordPreservedPackDrift compares one preserved on-disk file against its
-// embedded counterpart and records the outcome. It is a no-op when report is
-// nil, so callers that do not want the extra reads pay nothing.
+// reconcilePreservedPackFile is the ga-o99jf 3-way comparison. It decides,
+// for one non-required-pack file that materializeFSCollectingDrift is about
+// to preserve, whether it is actually safe to refresh instead — and records
+// the outcome in report (when non-nil; passing nil skips all bookkeeping, for
+// callers that want the old preserve-unconditionally behavior).
 //
-// The comparison reads both sides in full rather than trusting size or mtime:
-// mtime cannot distinguish "operator edited" from "left over from an older
-// binary" and is destroyed by checkout/cp/rsync, and a size-only check would
-// miss same-length edits. Required packs already pay the same full read via
-// WriteFileIfContentOrModeChangedAtomic, so this keeps one comparison
-// semantic in the codebase instead of two.
-func recordPreservedPackDrift(report *packDriftReport, embedded fs.FS, relPath, dstPath string) {
-	if report == nil {
-		return
-	}
+// knownHash/haveKnownHash come from the pack's hash manifest: the SHA-256 this
+// same pack's materialize last WROTE to relPath, i.e. the hash of whatever the
+// binary embedded at the time of the PREVIOUS materialize (not necessarily the
+// currently-running binary). Comparing the CURRENT on-disk bytes against that
+// — never against mtime, which cannot tell "edited before the swap" from
+// "edited after" and is destroyed by checkout/cp/rsync — is what makes the
+// three-way split possible:
+//
+//	have history, on-disk == knownHash   -> nobody touched it since gc wrote
+//	                                         it; stale, safe to refresh even
+//	                                         though the embedded bytes have
+//	                                         since changed. No drift to
+//	                                         report: this is the silent
+//	                                         self-heal.
+//	have history, on-disk != knownHash   -> something rewrote the file after
+//	                                         gc did; a CONFIRMED edit. Must be
+//	                                         preserved. Recorded in
+//	                                         operatorEdited, and the manifest
+//	                                         entry is carried forward
+//	                                         unchanged — the file was not
+//	                                         rewritten, so what gc last wrote
+//	                                         there has not changed.
+//	no history recorded                  -> pre-ga-o99jf pack, or a lost
+//	                                         manifest. Falls back to comparing
+//	                                         on-disk against the CURRENT
+//	                                         embedded bytes (ga-8j89i's
+//	                                         original comparison): equal means
+//	                                         nothing to warn about, and the
+//	                                         hash is safe to backfill (true
+//	                                         regardless of provenance, since
+//	                                         it is not adopting anything —
+//	                                         on-disk already IS what gc would
+//	                                         write); different means
+//	                                         provenance is genuinely ambiguous
+//	                                         and must be preserved WITHOUT
+//	                                         ever being adopted as a new
+//	                                         trusted baseline. Backfilling
+//	                                         from the mismatched on-disk bytes
+//	                                         here would make an old operator
+//	                                         edit look "stale" and get
+//	                                         silently overwritten on the very
+//	                                         next materialize — recorded in
+//	                                         changed instead, and left out of
+//	                                         the manifest so it keeps warning
+//	                                         until the operator resolves it
+//	                                         (ga-8j89i's `mv ... .bak` reset).
+//
+// Returns the hash to persist for relPath in the pack's hash manifest ("" when
+// nothing should be recorded: an unreadable file, a confirmed edit that
+// carries its old hash forward via the caller, or a still-ambiguous
+// no-history mismatch) and whether the caller should fall through and refresh
+// the file from the embedded bytes.
+func reconcilePreservedPackFile(report *packDriftReport, embedded fs.FS, relPath, dstPath string, knownHash string, haveKnownHash bool) (persistHash string, refresh bool) {
 	rel := filepath.ToSlash(relPath)
+	onDisk, err := os.ReadFile(dstPath)
+	if err != nil {
+		if report != nil {
+			report.unreadable = append(report.unreadable, fmt.Sprintf("%s (%v)", rel, err))
+		}
+		return "", false
+	}
+
+	if haveKnownHash {
+		if sha256Hex(onDisk) == knownHash {
+			return "", true // stale, not edited: caller refreshes from the new embedded bytes.
+		}
+		if report != nil {
+			report.operatorEdited = append(report.operatorEdited, rel)
+		}
+		return knownHash, false
+	}
+
+	// No recorded history: fall back to ga-8j89i's original comparison
+	// against the CURRENT embedded bytes.
 	want, err := fs.ReadFile(embedded, relPath)
 	if err != nil {
-		report.unreadable = append(report.unreadable, fmt.Sprintf("%s (embedded: %v)", rel, err))
-		return
+		if report != nil {
+			report.unreadable = append(report.unreadable, fmt.Sprintf("%s (embedded: %v)", rel, err))
+		}
+		return "", false
 	}
-	got, err := os.ReadFile(dstPath)
-	if err != nil {
-		report.unreadable = append(report.unreadable, fmt.Sprintf("%s (%v)", rel, err))
-		return
+	if bytes.Equal(onDisk, want) {
+		return sha256Hex(onDisk), false // matches what gc would write anyway: safe to backfill.
 	}
-	if !bytes.Equal(got, want) {
+	if report != nil {
 		report.changed = append(report.changed, rel)
 	}
+	return "", false
 }
 
 // builtinPackDriftWarningWriter resolves the destination for pack drift
@@ -329,11 +480,14 @@ var builtinPackDriftWarningWriter = func() io.Writer {
 // builtinPackRefreshCache.
 var builtinPackDriftWarningCache sync.Map
 
-// emitBuiltinPackDriftWarnings tells the operator that a materialized pack no
-// longer matches the binary. Non-required packs are never re-materialized once
-// written (see materializeFS), so after a binary upgrade the on-disk copy can
-// keep running the old content indefinitely — silently. This warning is the
-// only signal that the file being executed is not the file that shipped.
+// emitBuiltinPackDriftWarnings tells the operator when a materialized pack
+// file could NOT be safely reconciled automatically — i.e. what survives
+// after materializeFSCollectingDrift's 3-way hash comparison (ga-o99jf) has
+// already silently re-materialized every file it could prove was merely
+// stale. What remains here is either a CONFIRMED edit (operatorEdited) or a
+// pre-ga-o99jf file with no recorded history to disambiguate (changed) — both
+// genuinely need the operator, which is why this warning still exists at all
+// instead of ga-8j89i's warn-on-any-drift now being fully retired.
 //
 // It writes nothing to disk and changes no materialize decision.
 func emitBuiltinPackDriftWarnings(cityPath string, reports []packDriftReport) {
@@ -360,17 +514,27 @@ func emitBuiltinPackDriftWarnings(cityPath string, reports []packDriftReport) {
 // builtinPackDriftSignature collapses a drift set into a comparable string so
 // repeated materializes stay quiet while the state is unchanged, and a *new*
 // drift (or a repaired one) is reported again rather than suppressed forever.
+// All four packDriftReport dimensions participate — omitting any one would
+// let a change confined to that dimension alone (e.g. a second file joining
+// operatorEdited while changed/unreadable stay empty) produce the same
+// signature as before it happened, silently swallowing a real, new warning.
 func builtinPackDriftSignature(reports []packDriftReport) string {
 	var parts []string
 	for _, report := range reports {
 		if !report.hasFindings() {
 			continue
 		}
+		operatorEdited := append([]string(nil), report.operatorEdited...)
 		changed := append([]string(nil), report.changed...)
 		unreadable := append([]string(nil), report.unreadable...)
+		sort.Strings(operatorEdited)
 		sort.Strings(changed)
 		sort.Strings(unreadable)
-		parts = append(parts, report.pack+"|"+strings.Join(changed, ",")+"|"+strings.Join(unreadable, ","))
+		manifestErr := ""
+		if report.manifestWriteErr != nil {
+			manifestErr = report.manifestWriteErr.Error()
+		}
+		parts = append(parts, report.pack+"|"+strings.Join(operatorEdited, ",")+"|"+strings.Join(changed, ",")+"|"+strings.Join(unreadable, ",")+"|"+manifestErr)
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ";")
@@ -379,11 +543,23 @@ func builtinPackDriftSignature(reports []packDriftReport) string {
 func builtinPackDriftWarningLines(cityPath string, report packDriftReport) []string {
 	packDir := filepath.Join(cityPath, citylayout.SystemPacksRoot, report.pack)
 	var lines []string
+	if len(report.operatorEdited) > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"warning: builtin pack %q on disk differs from the copy embedded in this gc binary (%s), "+
+				"and gc's own hash record confirms this is a local edit, not stale content — "+
+				"your edit is preserved. To adopt the embedded copy instead: mv %q %q && gc config show --validate",
+			report.pack,
+			summarizeDriftedPackFiles(report.operatorEdited),
+			packDir,
+			packDir+".bak",
+		))
+	}
 	if len(report.changed) > 0 {
 		lines = append(lines, fmt.Sprintf(
-			"warning: builtin pack %q on disk differs from the copy embedded in this gc binary (%s). "+
-				"Non-required packs are never re-materialized, so the on-disk version is what runs — "+
-				"either a local edit or content left over from an older binary. "+
+			"warning: builtin pack %q on disk differs from the copy embedded in this gc binary (%s), "+
+				"and gc has no materialize-history record for it (pre-dates this gc version, or the "+
+				"record was lost) — this is either a local edit or content left over from an older "+
+				"binary, and gc cannot safely tell which. Preserving it. "+
 				"To adopt the embedded copy: mv %q %q && gc config show --validate",
 			report.pack,
 			summarizeDriftedPackFiles(report.changed),
@@ -397,6 +573,13 @@ func builtinPackDriftWarningLines(cityPath string, report packDriftReport) []str
 				"drift is unknown, not absent.",
 			report.pack,
 			summarizeDriftedPackFiles(report.unreadable),
+		))
+	}
+	if report.manifestWriteErr != nil {
+		lines = append(lines, fmt.Sprintf(
+			"warning: could not update the hash manifest for builtin pack %q (%v); "+
+				"future drift detection for this pack may fall back to the less precise no-history comparison.",
+			report.pack, report.manifestWriteErr,
 		))
 	}
 	return lines
@@ -516,17 +699,23 @@ func peekEventsProvider(tomlPath string) string {
 // materializeFS walks an embed.FS, writes all files to dstDir, and returns the
 // relative file paths that belong in the generated directory.
 //
-// When preserveOperatorEdits is true, existing regular files with the correct
-// mode are preserved verbatim — content is NOT overwritten even when it differs
-// from the embedded bytes. This protects operator-authored edits to non-required
-// pack files (formula TOMLs, command scripts, etc.) from being silently reverted
-// on every gc subcommand invocation (see gastownhall/gascity#2429). Operators
-// who want to pick up a fresh embedded version after a binary upgrade must delete
-// the on-disk file first.
+// When preserveOperatorEdits is true, a preserved candidate (an existing
+// regular file with the correct mode) is reconciled against the pack's hash
+// manifest by reconcilePreservedPackFile (ga-o99jf) instead of being kept
+// unconditionally: content proven stale (matches what gc itself last wrote)
+// is refreshed silently, and only a confirmed edit — or, for a pack with no
+// recorded history, content that looks different with no way to tell why —
+// is left in place. This protects genuine operator-authored edits to
+// non-required pack files (formula TOMLs, command scripts, etc.) from being
+// silently reverted, without also letting merely-stale content survive every
+// future binary upgrade forever (see gastownhall/gascity#2429 for the
+// original protection, and ga-8j89i/ga-o99jf for why mtime cannot drive this
+// decision and content hashing must).
 //
-// When preserveOperatorEdits is false (required packs), the preservation skip is
-// disabled: every file is refreshed and validated against the embedded bytes, so
-// a stale or corrupt required pack is repaired rather than silently accepted.
+// When preserveOperatorEdits is false (required packs), the preservation skip
+// is disabled and the hash manifest is not consulted: every file is refreshed
+// and validated against the embedded bytes, so a stale or corrupt required
+// pack is repaired rather than silently accepted.
 //
 // The remaining repair semantics are independent of the flag: missing files are
 // written (initial scaffolding), wrong-mode files are rewritten (e.g., script
@@ -537,12 +726,21 @@ func materializeFS(embedded fs.FS, dstDir string, preserveOperatorEdits bool) (m
 }
 
 // materializeFSCollectingDrift is materializeFS plus drift reporting. When
-// drift is non-nil, every file the preserve-operator-edits branch leaves in
-// place is compared against the embedded bytes and recorded there, so callers
-// can tell the operator that what runs on disk is not what the binary ships.
-// Passing nil disables the comparison entirely (no extra reads).
+// preserveOperatorEdits is true, it also reads and rewrites the pack's hash
+// manifest (packHashManifestFile) so the reconciliation above has the history
+// it needs — this part is unconditional on drift, since ga-o99jf, unlike
+// ga-8j89i's pure reporting, changes what actually gets WRITTEN to disk, not
+// just what gets reported. Passing drift as nil only disables the optional
+// operator-facing report; it never disables the manifest-driven decision.
 func materializeFSCollectingDrift(embedded fs.FS, dstDir string, preserveOperatorEdits bool, drift *packDriftReport) (map[string]struct{}, error) {
 	desired := make(map[string]struct{})
+
+	var knownHashes map[string]string
+	if preserveOperatorEdits {
+		knownHashes = readPackHashManifest(dstDir)
+	}
+	pendingHashes := make(map[string]string)
+
 	err := fs.WalkDir(embedded, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -553,24 +751,33 @@ func materializeFSCollectingDrift(embedded fs.FS, dstDir string, preserveOperato
 		if d.IsDir() {
 			return os.MkdirAll(dst, 0o755)
 		}
-		desired[filepath.ToSlash(path)] = struct{}{}
+		rel := filepath.ToSlash(path)
+		desired[rel] = struct{}{}
 
 		perm := builtinpacks.MaterializedFileMode(path)
 
-		// Preserve operator-authored content for non-required packs. Skip the
-		// embedded write only when the existing on-disk entry is a regular file
-		// with the correct mode — that's a file the operator might have edited.
-		// Non-regular files (symlinks) and wrong-mode files still get repaired
-		// below, matching the prior contract. Mode comparison uses
-		// fsys.ComparableMode (perm + setuid/setgid/sticky) so it agrees with
-		// the WriteFileIfContentOrModeChangedAtomic repair path below. Required
-		// packs (preserveOperatorEdits == false) skip this branch entirely so
-		// stale content is always refreshed.
+		// Preserve operator-authored content for non-required packs. A
+		// preserve CANDIDATE is an existing regular file with the correct
+		// mode — that's a file the operator might have edited. Non-regular
+		// files (symlinks) and wrong-mode files always fall through to the
+		// repair path below, matching the prior contract. Mode comparison
+		// uses fsys.ComparableMode (perm + setuid/setgid/sticky) so it agrees
+		// with the WriteFileIfContentOrModeChangedAtomic repair path.
+		// Required packs (preserveOperatorEdits == false) skip this branch
+		// entirely so stale content is always refreshed.
 		if preserveOperatorEdits {
 			if info, statErr := os.Lstat(dst); statErr == nil {
 				if info.Mode().IsRegular() && fsys.ComparableMode(info.Mode()) == fsys.ComparableMode(perm) {
-					recordPreservedPackDrift(drift, embedded, path, dst)
-					return nil
+					knownHash, haveKnownHash := knownHashes[rel]
+					persistHash, refresh := reconcilePreservedPackFile(drift, embedded, path, dst, knownHash, haveKnownHash)
+					if persistHash != "" {
+						pendingHashes[rel] = persistHash
+					}
+					if !refresh {
+						return nil
+					}
+					// Proven stale, not edited: fall through to the same
+					// refresh path a missing or wrong-mode file takes.
 				}
 			} else if !os.IsNotExist(statErr) {
 				return fmt.Errorf("stat %s: %w", dst, statErr)
@@ -586,10 +793,22 @@ func materializeFSCollectingDrift(embedded fs.FS, dstDir string, preserveOperato
 			return err
 		}
 
-		return fsys.WriteFileIfContentOrModeChangedAtomic(fsys.OSFS{}, dst, data, perm)
+		if err := fsys.WriteFileIfContentOrModeChangedAtomic(fsys.OSFS{}, dst, data, perm); err != nil {
+			return err
+		}
+		if preserveOperatorEdits {
+			pendingHashes[rel] = sha256Hex(data)
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	if preserveOperatorEdits {
+		if writeErr := writePackHashManifest(dstDir, pendingHashes); writeErr != nil && drift != nil {
+			drift.manifestWriteErr = writeErr
+		}
 	}
 	return desired, nil
 }
@@ -694,6 +913,14 @@ func pruneStaleGeneratedPackFiles(dstDir string, desired map[string]struct{}) er
 			_, ok := desired[path]
 			return ok
 		}) {
+			return nil
+		}
+		// Preserve the pack hash manifest and its atomic-write temp siblings
+		// (ga-o99jf): they are runtime bookkeeping materializeFSCollectingDrift
+		// produces, not embedded pack content, so they are never part of
+		// desired — without this exemption the very next materialize would
+		// prune the manifest it just wrote.
+		if rel == packHashManifestFile || strings.HasPrefix(rel, packHashManifestFile+".tmp.") {
 			return nil
 		}
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
