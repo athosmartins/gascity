@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -221,6 +222,63 @@ func TestSessionHasOpenAssignedWorkUsesOnlyReachableStore(t *testing.T) {
 	}
 	if !has {
 		t.Fatal("rig-store assigned work should count for a rig-scoped session")
+	}
+}
+
+// TestSessionHasOpenAssignedWorkRoutesDirlessWorkDirAgentToItsRigStore pins
+// the gt-69j2v fix: a dir-less pool-template agent (wa-worker, ps-worker —
+// agents/<name>/agent.toml with no `dir` field, only `work_dir` inside the
+// rig) still does its real bd work in its own rig's store. Before this fix,
+// sessionHasOpenAssignedWorkForReachableStore resolved such a session's store
+// via assignedWorkStoreRefForAgent -> configuredRigName, which returns "" for
+// a dir-less agent (city-scoped, by design — see
+// TestConfiguredRigNameDirLessAgentWithRigWorkDirStaysCityScoped in
+// internal/workdir) and so checked ONLY the city store. A session with real,
+// open work sitting in its rig's store was reported as having no assigned
+// work, so the config-drift-drain deferral at session_reconciler.go
+// ("Skipping config-drift drain ... live assigned work found") never
+// triggered for it, and an editorial change anywhere under $CITY/scripts
+// could drain the session mid-task (gt-69j2v: wa-x0ppe lost committed-but-
+// unpushed work this way twice on 2026-09-11).
+func TestSessionHasOpenAssignedWorkRoutesDirlessWorkDirAgentToItsRigStore(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "whatsapp_automation")
+	if err := os.MkdirAll(filepath.Join(rigPath, "crew", "worker"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "whatsapp_automation", Path: rigPath}},
+		Agents: []config.Agent{{
+			Name:    "wa-worker",
+			WorkDir: filepath.Join(rigPath, "crew", "worker"),
+		}},
+	}
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	session := beads.Bead{
+		ID:     "session-1",
+		Type:   sessionBeadType,
+		Status: "open",
+		Metadata: map[string]string{
+			"template":     "wa-worker",
+			"session_name": "wa-worker-1",
+		},
+	}
+	if _, err := rigStore.Create(beads.Bead{
+		ID:       "wa-x0ppe",
+		Type:     "task",
+		Status:   "in_progress",
+		Assignee: session.ID,
+	}); err != nil {
+		t.Fatalf("Create rig work: %v", err)
+	}
+
+	has, err := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, cityStore, map[string]beads.Store{"whatsapp_automation": rigStore}, session)
+	if err != nil {
+		t.Fatalf("sessionHasOpenAssignedWorkForReachableStore: %v", err)
+	}
+	if !has {
+		t.Fatal("a dir-less agent's WorkDir-resolved rig-store assigned work must count, or config-drift drain will kill a session mid-task (gt-69j2v)")
 	}
 }
 

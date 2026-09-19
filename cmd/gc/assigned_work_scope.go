@@ -6,6 +6,7 @@ import (
 	"github.com/gastownhall/gascity/internal/agentutil"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
 func assignedWorkStoreRefForAgent(cityPath string, cfg *config.City, agentCfg *config.Agent) string {
@@ -13,6 +14,26 @@ func assignedWorkStoreRefForAgent(cityPath string, cfg *config.City, agentCfg *c
 		return ""
 	}
 	return configuredRigName(cityPath, agentCfg, cfg.Rigs)
+}
+
+// assignedWorkRoutingStoreRefForAgent resolves the store a concrete SESSION's
+// real, live assigned work lives in. It differs from assignedWorkStoreRefForAgent
+// (which intentionally treats a dir-less agent as city-scoped for template
+// resolution / pool-demand / desired-state — a work_dir fallback added there
+// caused an 88x create/drain loop city-wide, incident ga-f7k65a, see
+// workdirutil.ConfiguredRigName): a dir-less POOL-TEMPLATE agent (wa-worker,
+// ps-worker — agents/<name>/agent.toml with no `dir`, only `work_dir` inside
+// the rig) still claims and works beads in its own rig's store. Callers that
+// need to find where a concrete session's own live work actually is — config-
+// drift drain deferral, gate-reviewer verdict correlation, stranded-work
+// collection, pool-session-name store indexing — must resolve through this,
+// not assignedWorkStoreRefForAgent, or a dir-less session with real open work
+// in its rig's store reads as having none (gt-69j2v).
+func assignedWorkRoutingStoreRefForAgent(cityPath string, cfg *config.City, agentCfg *config.Agent) string {
+	if cfg == nil || agentCfg == nil {
+		return ""
+	}
+	return workdirutil.RoutingRigName(cityPath, *agentCfg, cfg.Rigs)
 }
 
 // agentIsCrossStoreEligible reports whether an agent may discover and serve work
