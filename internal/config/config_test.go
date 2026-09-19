@@ -3587,6 +3587,38 @@ esac
 	}
 }
 
+// TestEffectivePoolDemandQueryEphemeralTierFiltersUnassignedServerSide is the
+// regression test for ga-4ibmk6: legacyEphemeralPoolDemandShell's `bd query`
+// fallback scanned the WHOLE ephemeral+open table (208 rows measured live in
+// the HQ city, only 26 unassigned) and left the assignee=="" filter entirely
+// to client-side jq — the one pool-demand tier that didn't already push its
+// assignee filter server-side the way the other two tiers do via `bd ready
+// --unassigned`. `bd query` supports `assignee=none` directly (confirmed via
+// `bd query --help`), so pushing it into the query string is a strict
+// narrowing of the server-side result set: legacyEphemeralReadyFilterJQ still
+// re-applies the identical `select((.assignee // "") == "")` check afterward,
+// unchanged, so this cannot change output — only how much gets
+// scanned/transferred/parsed to produce it. Fails on prior HEAD (query string
+// lacked "AND assignee=none").
+func TestEffectivePoolDemandQueryEphemeralTierFiltersUnassignedServerSide(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	const wantClause = "ephemeral=true AND status=open AND assignee=none"
+
+	got := a.EffectivePoolDemandQuery()
+	if !strings.Contains(got, wantClause) {
+		t.Errorf("EffectivePoolDemandQuery() missing server-side assignee=none filter on the ephemeral fallback tier: %q", got)
+	}
+
+	// EffectiveWorkQuery (a worker's own claim probe) shares
+	// legacyEphemeralPoolDemandShell with the reconciler's count-form query
+	// (see TestPoolDemandAndWorkQueryAgreeOnRoutedSemantics) and must carry
+	// the same fix.
+	gotWQ := a.EffectiveWorkQuery()
+	if !strings.Contains(gotWQ, wantClause) {
+		t.Errorf("EffectiveWorkQuery() missing server-side assignee=none filter on the ephemeral fallback tier: %q", gotWQ)
+	}
+}
+
 func TestValidateAgentsCustomQueries(t *testing.T) {
 	// Both set: OK
 	agents := []Agent{{

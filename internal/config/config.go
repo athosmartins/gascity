@@ -3560,6 +3560,31 @@ func bdQueryEphemeralStatusQuietShell(status string) string {
 	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
 }
 
+// bdQueryEphemeralUnassignedOpenShell is bdQueryEphemeralStatusShell("open")
+// narrowed with "AND assignee=none" pushed into the bd query itself, instead
+// of leaving the whole ephemeral+open table to be filtered client-side by
+// legacyEphemeralReadyFilterJQ's `select((.assignee // "") == "")` (which it
+// still applies, unchanged, as a defense-in-depth check — this is a strict
+// narrowing of the server-side result set, not a behavior change).
+//
+// ga-4ibmk6: the OTHER two pool-demand tiers (bdReadyPoolDemandShell,
+// bdReadyPoolDemandMigrationShell) already pass `bd ready`'s --unassigned
+// flag; this was the one tier still doing a full unfiltered `bd query`
+// scan (measured live: 208 ephemeral+open rows, only 26 unassigned) because
+// `bd query` has no --unassigned shortcut — the filter has to go in the
+// query string itself. Scoped to this one call site (not a change to
+// bdQueryEphemeralStatusShell) because that shared helper's other callers
+// (ephemeralAssignedInProgressProbeScript, ephemeralAssignedReadyProbeScript,
+// and the two EffectiveAssigned*Query call sites) filter assignee against a
+// SPECIFIC agent id, not "none" — adding assignee=none there would be wrong.
+func bdQueryEphemeralUnassignedOpenShell() string {
+	return `bd query --json ` + shellquote.Quote("ephemeral=true AND status=open AND assignee=none") + ` --limit=0`
+}
+
+func bdQueryEphemeralUnassignedOpenQuietShell() string {
+	return bdQueryEphemeralUnassignedOpenShell() + ` 2>/dev/null`
+}
+
 func legacyEphemeralReadyFilterJQ(selector string, limit int) string {
 	filter := `[.[] | ` + selector +
 		` | select(((.issue_type // .type // "") != "epic"))` +
@@ -3582,9 +3607,9 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 			` | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow")))`,
 		limit,
 	)
-	query := bdQueryEphemeralStatusShell("open")
+	query := bdQueryEphemeralUnassignedOpenShell()
 	if quiet {
-		query = bdQueryEphemeralStatusQuietShell("open")
+		query = bdQueryEphemeralUnassignedOpenQuietShell()
 	}
 	jqStderr := ""
 	if quiet {
