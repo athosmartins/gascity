@@ -1191,6 +1191,10 @@ func runPreparedStartCandidate(
 	case errors.Is(err, runtime.ErrSessionInitializing):
 		outcome = "session_initializing"
 		err = nil
+	case errors.Is(err, runtime.ErrLivenessUnknown):
+		outcome = "state_uncertain"
+		err = nil
+		rollbackPending = false
 	case startCtxErr == context.DeadlineExceeded:
 		outcome = "deadline_exceeded"
 		if err == nil {
@@ -1206,6 +1210,17 @@ func runPreparedStartCandidate(
 	case errors.Is(err, runtime.ErrSessionExists):
 		obs, runningErr := workerObserveSessionTargetWithRuntimeHintsWithConfig(cityPath, store, sp, cfg, item.candidate.name(), item.cfg.ProcessNames)
 		switch {
+		case sessionLivenessUncertain(sp):
+			// The provider itself just told us a session by this name
+			// exists; the only question is whether it is ours. That
+			// question can't be answered right now — the liveness read
+			// that would confirm it is inconclusive, not negative. Treating
+			// runningErr/obs's false as confirmed here is what let a
+			// pending-create rollback close the bead out from under this
+			// exact live session (ga-ebbr2t). Back off instead.
+			outcome = "state_uncertain"
+			err = nil
+			rollbackPending = false
 		case runningErr != nil || !runtimeObservationLive(obs):
 			outcome = "provider_error"
 		case rollbackPending && !rateLimitScreen && runningSessionMatchesPendingCreate(item.candidate.session, item.candidate.name(), sp):
@@ -1424,7 +1439,7 @@ func commitAsyncStartResultWithContext(
 		logLifecycleOutcome(stderr, "start", wave, name, template, "context_canceled", refreshed.started, time.Now(), ctx.Err(), refreshed.phases)
 		return false
 	}
-	if sp != nil && refreshed.err == nil && refreshed.outcome != "session_initializing" {
+	if sp != nil && refreshed.err == nil && refreshed.outcome != "session_initializing" && refreshed.outcome != "state_uncertain" {
 		_ = clearReconcilerDrainAckMetadata(sp, refreshed.prepared.candidate.name())
 	}
 	return commitStartResultTraced(refreshed, store, clk, rec, wave, stdout, stderr, trace)
@@ -1602,6 +1617,16 @@ func startPreparedStartCandidate(
 			}
 			return false, fmt.Errorf("session %q died during startup", name)
 		}
+		// running is false, but that reading is only trustworthy when the
+		// provider actually completed a fetch. A provider whose most recent
+		// liveness read failed outright (ga-ebbr2t: a Darwin process-snapshot
+		// `ps` call killed under load) reports the same false here as a
+		// confirmed-absent session — attempting a fresh start on that basis
+		// races tmux's own, uncached view of a session that is still alive,
+		// which is what actually destroyed it. Back off instead of guessing.
+		if sessionLivenessUncertain(sp) {
+			return false, fmt.Errorf("%w: session %q", runtime.ErrLivenessUnknown, name)
+		}
 	}
 	if store == nil || item.candidate.session == nil || strings.TrimSpace(item.candidate.session.ID) == "" {
 		handle, err := runtimeWorkerHandleWithConfig(
@@ -1636,6 +1661,22 @@ func observeRuntimeProviderLiveness(sp runtime.Provider, name string, processNam
 	}
 	obs := runtime.ObserveLiveness(sp, name, processNames)
 	return obs.Running, obs.Alive
+}
+
+// sessionLivenessUncertain reports whether sp's most recent liveness read was
+// itself inconclusive (e.g. a transient process-snapshot failure with no
+// prior known-good observation), as opposed to a confirmed "not running"
+// result. Providers that cannot report this signal are always treated as
+// certain (false), preserving existing behavior for every provider but tmux.
+func sessionLivenessUncertain(sp runtime.Provider) bool {
+	if sp == nil {
+		return false
+	}
+	observer, ok := sp.(interface{ LivenessUncertain() bool })
+	if !ok {
+		return false
+	}
+	return observer.LivenessUncertain()
 }
 
 func commitStartResult(
@@ -1676,9 +1717,12 @@ func commitStartResultTraced(
 	session := result.prepared.candidate.session
 	name := result.prepared.candidate.name()
 	tp := result.prepared.candidate.tp
-	// Session still starting up — back off silently without recording failure.
-	// The reconciler will retry on the next patrol tick.
-	if result.outcome == "session_initializing" {
+	// Session still starting up, or its liveness couldn't be determined this
+	// tick (ga-ebbr2t) — back off silently without recording failure or
+	// rolling back a pending create. The reconciler will retry on the next
+	// patrol tick, by which point the provider has likely recovered a real
+	// reading.
+	if result.outcome == "session_initializing" || result.outcome == "state_uncertain" {
 		clearPendingStartInFlightLease(session, store, stderr)
 		logLifecycleOutcome(stderr, "start", wave, name, tp.TemplateName, result.outcome, result.started, result.finished, nil, result.phases)
 		return false
@@ -2406,7 +2450,7 @@ func executePlannedStartsTraced(
 					wakeCount++
 					continue
 				}
-				if result.err == nil && result.outcome != "session_initializing" {
+				if result.err == nil && result.outcome != "session_initializing" && result.outcome != "state_uncertain" {
 					_ = clearReconcilerDrainAckMetadata(sp, result.prepared.candidate.name())
 				}
 				if commitStartResultTraced(result, store, clk, rec, wave, stdout, stderr, trace) {

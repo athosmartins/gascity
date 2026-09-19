@@ -5317,6 +5317,187 @@ func fakeRuntimeCallCount(fake *runtime.Fake, method string) int {
 	return count
 }
 
+// uncertainLivenessProvider simulates a provider whose liveness cache has
+// never completed a successful fetch and whose most recent fetch attempt
+// failed (ga-ebbr2t: a Darwin process-snapshot `ps` call killed under load).
+// IsRunning and ProcessAlive both correctly report false/false in this state
+// — there is no cached data to say otherwise, and production's StateCache
+// backs both signals with the same blanked snapshot, so a real fetch failure
+// takes them down together, not one at a time. That false must not be
+// trusted as confirmed absence: LivenessUncertain reports the read as
+// inconclusive.
+type uncertainLivenessProvider struct {
+	*runtime.Fake
+}
+
+func (p *uncertainLivenessProvider) IsRunning(name string) bool {
+	_ = p.Fake.IsRunning(name)
+	return false
+}
+
+func (p *uncertainLivenessProvider) ProcessAlive(name string, processNames []string) bool {
+	_ = p.Fake.ProcessAlive(name, processNames)
+	return false
+}
+
+func (p *uncertainLivenessProvider) LivenessUncertain() bool {
+	return true
+}
+
+// onceThenUncertainLivenessProvider always reports IsRunning/ProcessAlive as
+// false/false (see uncertainLivenessProvider), but reports a certain
+// (non-uncertain) LivenessUncertain read on its first call and an uncertain
+// one on every call after that — simulating a liveness cache that still
+// looked merely stale-but-trustworthy at the pre-start check but fails
+// outright by the time the ErrSessionExists recovery path re-checks it,
+// moments later in the same reconciler tick.
+type onceThenUncertainLivenessProvider struct {
+	*runtime.Fake
+	calls int
+}
+
+func (p *onceThenUncertainLivenessProvider) IsRunning(name string) bool {
+	_ = p.Fake.IsRunning(name)
+	return false
+}
+
+func (p *onceThenUncertainLivenessProvider) ProcessAlive(name string, processNames []string) bool {
+	_ = p.Fake.ProcessAlive(name, processNames)
+	return false
+}
+
+func (p *onceThenUncertainLivenessProvider) LivenessUncertain() bool {
+	p.calls++
+	return p.calls > 1
+}
+
+// TestExecutePreparedStartWave_UncertainLivenessBacksOffWithoutRollbackOrKill
+// reproduces ga-ebbr2t: a pending-create session whose live runtime is
+// genuinely alive (tmux itself would refuse a second Start with "already
+// exists"), but whose provider liveness read is inconclusive rather than a
+// confirmed "not running" — e.g. a process-snapshot subprocess killed under
+// load, with no prior known-good observation to fall back on. On the
+// pre-fix code, the inconclusive false is trusted as confirmed absence: a
+// fresh start is attempted, collides, and the resulting error rolls back
+// (closes) the pending-create bead. The fix must instead back off silently
+// and leave the live session alone.
+func TestExecutePreparedStartWave_UncertainLivenessBacksOffWithoutRollbackOrKill(t *testing.T) {
+	sp := &uncertainLivenessProvider{Fake: runtime.NewFake()}
+	if err := sp.Start(context.Background(), "test-agent", runtime.Config{ProcessNames: []string{"claude"}}); err != nil {
+		t.Fatalf("Start existing session: %v", err)
+	}
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-104",
+				Metadata: map[string]string{
+					"session_name":         "test-agent",
+					"template":             "worker",
+					"pending_create_claim": "true",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{
+			Command:      "claude",
+			ProcessNames: []string{"claude"},
+		},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		nil,
+		10*time.Second,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err != nil {
+		t.Fatalf("uncertain liveness should back off without recording a failure, got: %v", r.err)
+	}
+	if r.outcome != "state_uncertain" {
+		t.Fatalf("outcome = %q, want state_uncertain", r.outcome)
+	}
+	if r.rollbackPending {
+		t.Fatal("rollbackPending = true, want false: an uncertain read must never roll back a pending create")
+	}
+	if got := fakeRuntimeCallCount(sp.Fake, "Start"); got != 1 {
+		t.Fatalf("Start calls = %d, want 1 (setup only): uncertain liveness must not attempt a fresh start", got)
+	}
+	if got := fakeRuntimeCallCount(sp.Fake, "Stop"); got != 0 {
+		t.Fatalf("Stop calls = %d, want 0: uncertain liveness must never kill a possibly-live runtime", got)
+	}
+}
+
+// TestExecutePreparedStartWave_ErrSessionExistsRecoveryBacksOffWhenLivenessTurnsUncertain
+// covers the defense-in-depth backstop: even when a fresh start IS attempted
+// and collides with a live session (ErrSessionExists), the recovery check
+// must not treat an inconclusive re-read as grounds to roll back and close
+// the bead.
+func TestExecutePreparedStartWave_ErrSessionExistsRecoveryBacksOffWhenLivenessTurnsUncertain(t *testing.T) {
+	sp := &onceThenUncertainLivenessProvider{Fake: runtime.NewFake()}
+	if err := sp.Start(context.Background(), "test-agent", runtime.Config{ProcessNames: []string{"claude"}}); err != nil {
+		t.Fatalf("Start existing session: %v", err)
+	}
+	item := preparedStart{
+		candidate: startCandidate{
+			session: &beads.Bead{
+				ID: "gc-105",
+				Metadata: map[string]string{
+					"session_name":         "test-agent",
+					"template":             "worker",
+					"pending_create_claim": "true",
+				},
+			},
+			tp: TemplateParams{
+				Command:      "claude",
+				SessionName:  "test-agent",
+				TemplateName: "worker",
+			},
+		},
+		cfg: runtime.Config{
+			Command:      "claude",
+			ProcessNames: []string{"claude"},
+		},
+	}
+
+	results := executePreparedStartWave(
+		context.Background(),
+		[]preparedStart{item},
+		sp,
+		nil,
+		10*time.Second,
+	)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if r.err != nil {
+		t.Fatalf("ErrSessionExists recovery should back off without recording a failure once liveness turns uncertain, got: %v", r.err)
+	}
+	if r.outcome != "state_uncertain" {
+		t.Fatalf("outcome = %q, want state_uncertain", r.outcome)
+	}
+	if r.rollbackPending {
+		t.Fatal("rollbackPending = true, want false: an inconclusive collision recovery must never roll back a pending create")
+	}
+	if got := fakeRuntimeCallCount(sp.Fake, "Start"); got != 2 {
+		t.Fatalf("Start calls = %d, want setup plus one fresh-start attempt", got)
+	}
+	if got := fakeRuntimeCallCount(sp.Fake, "Stop"); got != 0 {
+		t.Fatalf("Stop calls = %d, want 0: an inconclusive collision recovery must never kill the runtime", got)
+	}
+}
+
 func TestExecutePreparedStartWave_StaleSessionKeyDetected(t *testing.T) {
 	skipSlowCmdGCTest(t, "waits through stale session-key detection; run make test-cmd-gc-process for full coverage")
 	sp := &dieAfterStartProvider{Fake: runtime.NewFake()}

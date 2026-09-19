@@ -99,6 +99,26 @@ func (c *StateCache) IsRunning(name string) bool {
 	return ok && session.Running
 }
 
+// Uncertain reports whether the cache currently has no trustworthy session
+// data because it has never completed a successful fetch and the most
+// recent attempt failed. This is the "read error" third state that
+// IsRunning/ProcessAlive cannot express: they collapse it to false, which is
+// the same value a genuinely absent session produces.
+//
+// For a session with prior known-good data, that collapse is safe: fetchedAt
+// is preserved on failure, so currentState keeps serving the last-known-good
+// snapshot for up to staleTTL before reporting false. But a session that has
+// never completed a successful fetch — e.g. one still in the "creating"
+// state, whose very first liveness check races a transient fetch failure —
+// gets none of that grace: fetchedAt.IsZero() sends currentState straight to
+// the empty-snapshot branch on the first failed attempt. Callers deciding
+// whether to treat "not running" as confirmed must check this first.
+func (c *StateCache) Uncertain() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.fetchedAt.IsZero() && c.lastError != nil
+}
+
 // ProcessAlive reports whether the named session has a process matching one of
 // processNames according to the cached runtime snapshot. An empty processNames
 // slice preserves Provider.ProcessAlive's "no check possible" behavior.

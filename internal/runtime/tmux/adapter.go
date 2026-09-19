@@ -269,6 +269,15 @@ func (p *Provider) IsRunning(name string) bool {
 	return p.cache.IsRunning(name)
 }
 
+// LivenessUncertain reports whether the provider's session-state cache has
+// no trustworthy data because it has never completed a successful fetch and
+// the most recent attempt failed. See StateCache.Uncertain: callers must
+// check this before treating IsRunning/ProcessAlive's false as a confirmed
+// "not running" for a session with no prior known-good observation.
+func (p *Provider) LivenessUncertain() bool {
+	return p.cache.Uncertain()
+}
+
 // IsDeadRuntimeSession reports whether a visible tmux session is a
 // remain-on-exit corpse with no live panes.
 func (p *Provider) IsDeadRuntimeSession(name string) (bool, error) {

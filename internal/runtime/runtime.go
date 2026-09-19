@@ -28,6 +28,13 @@ var ErrSessionExists = errors.New("session already exists")
 // Callers should back off and retry rather than treating it as a failure.
 var ErrSessionInitializing = errors.New("session is initializing")
 
+// ErrLivenessUnknown reports that a provider could not determine whether a
+// session is running — e.g. a transient process-snapshot read failure with
+// no prior known-good observation — as distinct from a confirmed "not
+// running" result. Callers should back off and retry on the next tick rather
+// than treating this as proof the session is absent.
+var ErrLivenessUnknown = errors.New("session liveness could not be determined")
+
 // ErrInteractionUnsupported reports that a provider does not implement the
 // structured pending/respond interaction capability for the requested session.
 var ErrInteractionUnsupported = errors.New("session interaction is unsupported")
