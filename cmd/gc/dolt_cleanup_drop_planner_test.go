@@ -117,38 +117,6 @@ func TestPlanDoltDrops_DefaultPrefixesIncludeGuardAndFederationTests(t *testing.
 	}
 }
 
-func TestPlanDoltDrops_DefaultPrefixesIncludeFixDepKeysTests(t *testing.T) {
-	// ga-165vq: third_party/beads/cmd/bd/doctor/fix/dep_keys_test.go
-	// (TestDependencyKeys_RekeysAndRemovesLeftovers) creates a database named
-	// "fixdepkeys_" + 12 random hex chars directly against whatever Dolt
-	// server BEADS_DOLT_PORT resolves to — production, in this city. The
-	// prefix must be recognized as stale so gc dolt-cleanup actually drops
-	// these instead of treating them as unknown/production forever (they
-	// never age out on their own: nothing else ever writes to them, so their
-	// backup-freshness only ever gets older).
-	all := []string{
-		"hq",
-		"gascity",
-		"fixdepkeys_0d16f874c5d7",
-		"testdb_old",
-	}
-	protected := []string{"hq", "gascity"}
-
-	plan := planDoltDrops(all, defaultStaleDatabasePrefixes, protected)
-
-	wantDrop := []string{"fixdepkeys_0d16f874c5d7", "testdb_old"}
-	if !equalStringSlice(plan.ToDrop, wantDrop) {
-		t.Errorf("ToDrop = %v, want %v", plan.ToDrop, wantDrop)
-	}
-	wantProtected := []string{"hq", "gascity"}
-	if !equalStringSlice(plan.Protected, wantProtected) {
-		t.Errorf("Protected = %v, want %v", plan.Protected, wantProtected)
-	}
-	if len(plan.Skipped) != 0 {
-		t.Errorf("Skipped = %v, want empty", plan.Skipped)
-	}
-}
-
 func TestPlanDoltDrops_SkipsInvalidDropIdentifiers(t *testing.T) {
 	all := []string{
 		"testdb_valid_1",

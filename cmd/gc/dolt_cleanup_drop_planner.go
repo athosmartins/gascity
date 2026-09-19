@@ -17,13 +17,8 @@ import "strings"
 //   - beads_vr*: orchestrator mail/router_test.go random prefixes
 //   - beads_t[0-9a-f]*: protocol test random prefixes (t + 8 hex chars)
 //   - beads_test_bench_*: benchmark test fixture databases
-//   - fixdepkeys_*: doctor/fix dep-keys test random prefixes (ga-165vq —
-//     third_party/beads/cmd/bd/doctor/fix/dep_keys_test.go creates these
-//     directly against whatever Dolt server BEADS_DOLT_PORT resolves to,
-//     production in this city; they never age out on their own because
-//     nothing else ever writes to them)
 var defaultStaleDatabasePrefixes = []string{
-	"testdb_", "test_guard_", "test_federation_", "doctest_", "doctortest_", "beads_pt", "beads_vr", "beads_t", "beads_test_bench_", "fixdepkeys_",
+	"testdb_", "test_guard_", "test_federation_", "doctest_", "doctortest_", "beads_pt", "beads_vr", "beads_t", "beads_test_bench_",
 }
 
 // systemDatabaseNames are the Dolt/MySQL system databases that SHOW
