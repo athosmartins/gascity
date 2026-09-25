@@ -3359,15 +3359,49 @@ func bdReadyPoolDemandExcludeLabelArgs() string {
 // whitespace delimiter so a title that merely mentions "epic" mid-sentence
 // (e.g. a bug report about this exact gap) is never over-matched.
 // assignedTierRefusalAndHoldJQStages returns the jq `select(...)` pipeline
-// stages for the two veto classes that answer "did a PRIOR incarnation of
-// THIS EXACT assignee already decide against this bead" — pool:refused:*
-// (an explicit worker refusal) and pilot:held/pilot:held-until:* (a live
-// Pilot hold). Shared verbatim between poolDemandLabelFilterJQ (Tier 3:
+// stages for the veto classes that answer "did a PRIOR incarnation of THIS
+// EXACT assignee already decide against this bead, or did the Pilot itself
+// withhold dispatch on it" — pool:refused:* (an explicit worker refusal),
+// pilot:held/pilot:held-until:* (a live, possibly-expiring Pilot hold), and
+// pilot:no-auto-dispatch (a standing, non-expiring Pilot no-dispatch
+// directive). Shared verbatim between poolDemandLabelFilterJQ (Tier 3:
 // should ANYONE ever be offered this bead as NEW work) and
 // assignedTierExclusionFilterJQ (Tier 1/2: is this bead already MINE)
-// because both questions legitimately want the same answer for these two
-// families — see each caller's own doc-comment for why the other veto
+// because all three families legitimately want the same answer for both
+// questions — see each caller's own doc-comment for why the other veto
 // families below do NOT belong in both.
+//
+// ga-ljoz23: pilot:no-auto-dispatch joins this shared function (not just
+// poolDemandLabelFilterJQ's own veto list below) because it answers the same
+// "did the Pilot withhold dispatch" question as pilot:held, not the
+// self-park question (blocked-reason:*/next-action:*/waiting-on:*) that
+// assignedTierExclusionFilterJQ's own doc-comment deliberately keeps OUT of
+// the assigned tiers. park_labels.py's own PILOT_HELD_LABELS grouping
+// ("Pilot deliberately withheld dispatch — a standing hold or an explicit
+// no-dispatch directive") already treats pilot:held and pilot:no-auto-
+// dispatch as one family; this mirrors that. The self-park family is set by
+// a LIVE session pausing ITS OWN still-owned work (ga-hiz5d's scenario, must
+// keep surfacing); pilot:no-auto-dispatch is set by an operator reserving a
+// bead against pool churn (CLAUDE.md "REGRA Nº 3": paired with naming a
+// specific assignee) — and once a bead already has an assignee, the label's
+// only remaining operative effect is exactly this resume check: Tier 3's own
+// --unassigned requirement makes its dispatch-blocking half structurally
+// unreachable for an assigned bead, so leaving it unhandled here didn't just
+// narrowly miss a corner case, it left the label's entire practical effect
+// on an assigned bead unimplemented. Measured: ga-vjlwso (assigned to the
+// reusable pool alias gastown.dog-1, carrying pilot:no-auto-dispatch while
+// waiting on a Mayor-scheduled execution window, not on the pool) was
+// "resumed" by 8 freshly-spawned dog sessions in ~4.5h — each found no real
+// work, heartbeat-and-exited — with resume intervals SHRINKING
+// (14/12/11/9min) as pool turnover increased: pure token/wall-time waste
+// tracking pool churn, not bead need.
+//
+// Deliberately kept as its OWN trailing select(), not folded into the
+// pilot:held label set above: pilot:held-until:* carries an expiry
+// (max < $now_ts), and pilot:no-auto-dispatch has no expiry of its own —
+// merging the two label sets would let an unrelated, already-expired
+// pilot:held-until:* on the same bead accidentally "expire" the unrelated
+// no-auto-dispatch veto too.
 //
 // Emits pipeline stages only (not a complete filter) — the caller supplies
 // the enclosing `[ .[] ... ]` wrapper.
@@ -3375,7 +3409,8 @@ func assignedTierRefusalAndHoldJQStages() string {
 	return `| select(((.labels // []) | map(select(startswith("pool:refused"))) | length) == 0) ` +
 		`| select((((.labels // []) | map(select(. == "pilot:held" or startswith("pilot:held-until:"))) | length) == 0) ` +
 		`or (((.labels // []) | map(select(startswith("pilot:held-until:")) | ltrimstr("pilot:held-until:") | tonumber)) ` +
-		`| if length > 0 then (max < $now_ts) else false end)) `
+		`| if length > 0 then (max < $now_ts) else false end)) ` +
+		`| select(((.labels // []) | map(select(. == "pilot:no-auto-dispatch")) | length) == 0) `
 }
 
 func poolDemandLabelFilterJQ() string {
@@ -3457,6 +3492,13 @@ func poolDemandLabelFilterJQ() string {
 // same scrutiny. Ownership (assignee + status) is the only thing that
 // should ever answer "is this mine" — never a label whose entire purpose is
 // steering whether a DIFFERENT, future claimant may pick the bead up.
+//
+// ga-ljoz23: pilot:no-auto-dispatch is the one exception to that last
+// sentence, and it is an exception rather than a contradiction — see
+// assignedTierRefusalAndHoldJQStages's doc-comment for why it answers "did
+// the Pilot withhold dispatch" (the SAME family as pilot:held, already
+// shared here) rather than "should a different future claimant see this"
+// (the family this function deliberately excludes).
 func assignedTierExclusionFilterJQ() string {
 	return `jq -c --argjson now_ts "$(date +%s)" ` + shellquote.Quote(
 		`[ .[] `+assignedTierRefusalAndHoldJQStages()+`]`)
