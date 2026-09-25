@@ -3445,7 +3445,20 @@ func poolDemandLabelFilterJQ() string {
 			// NOT reuse it for an "is this already MINE" check (Tier 1/2); see
 			// assignedTierExclusionFilterJQ's doc-comment for why that conflation
 			// is a live double-dispatch bug, not just an over-match.
-			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto"))) | length) == 0) ]`)
+			// ga-473mkh: next-action:* is the 6th veto class. Like ga-42mlf's
+			// text-veto gap, this probe disagreed with pilot-dispatcher.sh's
+			// _filter_label_vetoes, which already vetoes next-action:* UNLESS it
+			// carries refino's routing-not-blocking suffix. next-action: is
+			// OVERLOADED: the original convention (blocked on Athos/a
+			// dependency — bare next-action:mayor, next-action:athos+oracle) is
+			// a real veto; refino's newer next-action:<crew>-constroi/
+			// -reconstroi/-corrige-gate/-corrige means the OPPOSITE ("ready,
+			// <crew> builds it" — ga-f7bek). Confirmed live: ga-boftko carried
+			// bare next-action:mayor since bead creation and still reappeared as
+			// fresh Step-1c pool demand (reported by gastown.dog-2, 2026-09-16).
+			// Mirrors _filter_label_vetoes's test() character-for-character so
+			// the two cannot silently re-diverge.
+			`| select(((.labels // []) | map(select(startswith("blocked:") or startswith("blocked-reason:") or startswith("gate:needs-human") or startswith("pilot:refused-reason:") or startswith("pilot:text-veto") or (test("^next-action:") and (test("(constroi|corrige-gate|corrige)$") | not)))) | length) == 0) ]`)
 }
 
 // assignedTierExclusionFilterJQ is the "is this already mine" filter for the

@@ -2364,6 +2364,48 @@ func TestPoolDemandLabelFilterJQExcludesTextVeto(t *testing.T) {
 	}
 }
 
+// TestPoolDemandLabelFilterJQExcludesNextActionParkUnlessBuildVerb (ga-473mkh)
+// closes the 6th veto class: next-action:* is OVERLOADED with two opposite
+// meanings, documented verbatim in pilot-dispatcher.sh's _filter_label_vetoes
+// gate (d) comment — the source of truth this predicate mirrors. The original
+// convention (bare next-action:mayor, next-action:athos+oracle) means
+// "blocked on Athos/a dependency" and must veto; refino's newer
+// next-action:<crew>-constroi/-reconstroi/-corrige-gate/-corrige convention
+// means the OPPOSITE — "ready, <crew> is who builds it" (ga-f7bek) — and must
+// survive. Confirmed live: ga-boftko carried bare next-action:mayor since
+// creation and still reappeared as fresh Step-1c pool demand (gastown.dog-2,
+// 2026-09-16), because poolDemandLabelFilterJQ had no next-action handling at
+// all — not even the exact-match bare form, since bd's --exclude-label cannot
+// express "this prefix except when it ends in X" (the same reason every other
+// family in this function lives here and not in
+// bdReadyPoolDemandExcludeLabelArgs).
+func TestPoolDemandLabelFilterJQExcludesNextActionParkUnlessBuildVerb(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; poolDemandLabelFilterJQ is a jq pipeline")
+	}
+
+	input := `[{"id":"bare-mayor","labels":["next-action:mayor"]},{"id":"athos-plus-oracle","labels":["next-action:athos+oracle"]},{"id":"athos-decide","labels":["next-action:athos-decide"]},{"id":"crew-constroi-survives","labels":["next-action:wa-crew-constroi"]},{"id":"crew-reconstroi-survives","labels":["next-action:wa-crew-reconstroi"]},{"id":"crew-corrige-gate-survives","labels":["next-action:wa-crew-corrige-gate"]},{"id":"crew-corrige-survives","labels":["next-action:wa-crew-corrige"]},{"id":"lookalike-survives","labels":["story:next-action-mentioned"]},{"id":"clean-survives","labels":["area:infra","lane:small"]}]`
+
+	shellCmd := "printf '%s' '" + input + "' | " + poolDemandLabelFilterJQ()
+	cmd := exec.Command("sh", "-c", shellCmd)
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run poolDemandLabelFilterJQ: %v", err)
+	}
+
+	got := strings.TrimSpace(string(out))
+	for _, wantAbsent := range []string{`"bare-mayor"`, `"athos-plus-oracle"`, `"athos-decide"`} {
+		if strings.Contains(got, wantAbsent) {
+			t.Errorf("poolDemandLabelFilterJQ() output = %s, must not contain parked id %s", got, wantAbsent)
+		}
+	}
+	for _, wantPresent := range []string{`"crew-constroi-survives"`, `"crew-reconstroi-survives"`, `"crew-corrige-gate-survives"`, `"crew-corrige-survives"`, `"lookalike-survives"`, `"clean-survives"`} {
+		if !strings.Contains(got, wantPresent) {
+			t.Errorf("poolDemandLabelFilterJQ() output = %s, missing non-parked id %s (over-matched)", got, wantPresent)
+		}
+	}
+}
+
 func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t *testing.T) {
 	a := Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}
 	got := a.EffectiveAssignedReadyQuery()
