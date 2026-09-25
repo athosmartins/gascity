@@ -22,6 +22,16 @@ When you file a bead, default to immediately dispatching it to a polecat:
 ```bash
 gc bd create "Fix the auth timeout bug" -t task --json   # file it
 TARGET_RIG="${GC_RIG:-}"  # set to the target rig, or leave empty in an HQ-only city
+# ga-68cijh: a rig that runs its OWN dedicated worker pool (e.g. a rig with a
+# named pool agent like "wa-worker" instead of the generic polecat role) must
+# route there directly, NOT through the generic pattern below. The plain
+# "$TARGET_RIG/{{ .BindingPrefix }}polecat" pattern still resolves (gc sling
+# accepts it — a pack-qualified generic role is importable by any rig) but if
+# nothing is ever spawned to listen on that exact identity for this rig, the
+# bead sits routed-but-dead until a watchdog notices (observed live: two
+# beads landed on gc.routed_to=<rig>/gastown.polecat, a route no session in
+# that rig ever claims). Check your city's rig config / dispatcher for any
+# rig->pool override before using the generic default.
 POLECAT_TARGET="${TARGET_RIG:+$TARGET_RIG/}{{ .BindingPrefix }}polecat"
 gc sling "$POLECAT_TARGET" <bead-id>                     # dispatch to polecat pool (sets gc.routed_to metadata for controller scale_check)
 ```
@@ -222,7 +232,7 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 
 | Want to... | Correct command | Common mistake |
 |------------|----------------|----------------|
-| Dispatch work to polecat | `gc sling <rig>/{{ .BindingPrefix }}polecat <bead>` | ~~gc bd update --label=pool:...~~ (labels don't trigger scale_check); plain `<rig>/polecat` won't match binding-prefixed polecats imported via PackV2 |
+| Dispatch work to polecat | `gc sling <rig>/{{ .BindingPrefix }}polecat <bead>` — first check whether the rig has its own dedicated pool (see "Prefer dispatching to polecats" above) | ~~gc bd update --label=pool:...~~ (labels don't trigger scale_check); plain `<rig>/polecat` won't match binding-prefixed polecats imported via PackV2; on a rig with its own dedicated pool, this generic pattern resolves but routes to nothing (ga-68cijh) |
 | Drain stuck polecat | `{{ cmd }} runtime drain <name>` | ~~gc polecat kill~~ (not a command) |
 | Pause rig (daemon won't restart) | `{{ cmd }} rig suspend <rig>` | ~~gc rig stop~~ (daemon will restart it) |
 | Re-enable suspended rig | `{{ cmd }} rig resume <rig>` | |
