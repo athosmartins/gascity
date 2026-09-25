@@ -31,6 +31,43 @@ import (
 // without risking time arithmetic overflow.
 const indefiniteHoldDuration = 100 * 365 * 24 * time.Hour
 
+// suspendConfirmMaxWait bounds how long the managed path of `gc session
+// suspend` polls for the reconciler to actually stop the runtime before it
+// gives up and reports the stop as still in progress rather than done. The
+// reconciler may legitimately take longer than this (e.g. it defers to
+// protect in-flight assigned work, or simply hasn't ticked yet) -- this bound
+// controls only how long the CLI call blocks, never how long the underlying
+// drain itself is allowed to run. See ga-me6wsb: before this wait existed,
+// the CLI declared "suspended" the instant it wrote hold metadata, which was
+// true of the ledger but not of the runtime -- tmux pane, agent process, and
+// any MCP children it had spawned kept running, often for the full life of
+// the session, with nothing telling the caller that had happened.
+const suspendConfirmMaxWait = 8 * time.Second
+
+// suspendConfirmPollInterval is how often cmdSessionSuspend re-checks runtime
+// liveness while waiting up to suspendConfirmMaxWait.
+const suspendConfirmPollInterval = 300 * time.Millisecond
+
+// waitForSessionRuntimeStop polls the session's runtime liveness until it
+// observes the process stopped or maxWait elapses, whichever comes first. It
+// reports whether the stop was confirmed within the bound. A liveness
+// observation error is treated the same as "still running" (fail closed --
+// see ga-me6wsb: staying silent about an unconfirmed stop is a smaller
+// mistake than declaring one that may not have happened).
+func waitForSessionRuntimeStop(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, sessionID string, maxWait, pollInterval time.Duration, clk clock.Clock, sleep func(time.Duration)) bool {
+	deadline := clk.Now().Add(maxWait)
+	for {
+		running, err := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, sessionID)
+		if err == nil && !running {
+			return true
+		}
+		if !clk.Now().Before(deadline) {
+			return false
+		}
+		sleep(pollInterval)
+	}
+}
+
 func newSessionCmd(stdout, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "session",
@@ -1549,9 +1586,14 @@ func newSessionSuspendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOutput bool
 	cmd := &cobra.Command{
 		Use:   "suspend <session-id-or-alias>",
-		Short: "Suspend a session (save state, free resources)",
+		Short: "Suspend a session (stop its runtime, free resources)",
 		Long: `Suspend an active session by stopping its runtime process.
 The session bead persists and can be resumed later.
+
+Waits briefly to confirm the runtime actually stopped. If it hasn't within
+that window, the stop is still in progress (the reconciler owns it and may
+be protecting in-flight work) -- check "gc session list", or force an
+immediate stop with "gc session kill".
 
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
@@ -1570,8 +1612,11 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 // cmdSessionSuspend is the CLI entry point for "gc session suspend".
 //
 // Phase 2: sets held_until metadata on the session bead and pokes the
-// controller. The reconciler handles the actual process stop. Falls back
-// to direct suspend via the session manager if the controller isn't running.
+// controller. The reconciler owns the actual process stop; this command
+// waits up to suspendConfirmMaxWait for it to happen and reports honestly
+// (ga-me6wsb) if it hasn't yet, rather than declaring success on the ledger
+// write alone. Falls back to direct suspend via the session manager (a
+// synchronous, self-contained stop) if the controller isn't running.
 func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
 	store, code := openCityStore(stderr, "gc session suspend")
@@ -1589,6 +1634,11 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+
+	// Constructed unconditionally (matching cmdSessionKill) so the managed
+	// path below can also use it to confirm the runtime actually stopped,
+	// not just the direct-suspend fallback further down.
+	sp := newSessionProvider()
 
 	// Try reconciler-first path: set held_until metadata, poke controller.
 	// Only use this path when the city is managed by a standalone controller
@@ -1608,25 +1658,38 @@ func cmdSessionSuspend(args []string, stdout, stderr io.Writer, jsonOutput ...bo
 			}
 			// Poke again to trigger immediate reconciler tick.
 			_ = pokeController(cityPath)
+
+			// The ledger write above is not the stop -- the reconciler is. Wait
+			// briefly for it to actually happen before telling the caller it
+			// did (ga-me6wsb: "free resources" was false the instant this
+			// returned; the runtime routinely outlived the CLI call entirely).
+			stopped := waitForSessionRuntimeStop(cityPath, store, sp, cfg, sessionID, suspendConfirmMaxWait, suspendConfirmPollInterval, clock.Real{}, time.Sleep)
+
 			if asJSON {
 				if err := writeSessionActionJSON(stdout, sessionActionResult{
-					Action:    "suspend",
-					SessionID: sessionID,
-					Mode:      "managed",
-					State:     "suspended",
+					Action:         "suspend",
+					SessionID:      sessionID,
+					Mode:           "managed",
+					State:          "suspended",
+					RuntimeStopped: &stopped,
 				}); err != nil {
 					fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 					return 1
 				}
 				return 0
 			}
-			fmt.Fprintf(stdout, "Session %s suspended. Resume with: gc session wake %s\n", sessionID, sessionID) //nolint:errcheck // best-effort stdout
+			if stopped {
+				fmt.Fprintf(stdout, "Session %s suspended (runtime stopped). Resume with: gc session wake %s\n", sessionID, sessionID) //nolint:errcheck // best-effort stdout
+			} else {
+				fmt.Fprintf(stdout, "Session %s suspend requested; runtime still stopping (reconciler-driven, may protect in-flight work). Check: gc session list. Force immediately: gc session kill %s\n", sessionID, sessionID) //nolint:errcheck // best-effort stdout
+			}
 			return 0
 		}
 	}
 
 	// Fallback: controller not running — direct suspend via worker handle.
-	sp := newSessionProvider()
+	// sp was already constructed above; handle.Stop blocks until the runtime
+	// is actually stopped, so this path needs no confirmation wait of its own.
 	handle, err := workerHandleForSessionWithConfig(cityPath, store, sp, cfg, sessionID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session suspend: %v\n", err) //nolint:errcheck // best-effort stderr
