@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
@@ -910,6 +911,165 @@ func TestWatchConfigDirs_CityRootIgnoresRuntimeTraceWrites(t *testing.T) {
 	}
 	if !dirty.Load() {
 		t.Fatalf("dirty flag not set after legacy city-root trace write; stderr=%q", stderr.String())
+	}
+}
+
+// TestWatchConfigDirs_CityRootIgnoresDoltBackupWrites guards ga-jg1sg8: the
+// gc binary leaked thousands of read fds under <city>/.dolt-backup because
+// nothing excluded that directory from the city-root config watch, so every
+// backup sync/rotation cycle piled more watches onto it. Mirrors
+// TestWatchConfigDirs_CityRootIgnoresRuntimeTraceWrites for the same reason:
+// .dolt-backup is high-churn Dolt backup data, never config, and must not
+// drive reloads or accumulate watches.
+func TestWatchConfigDirs_CityRootIgnoresDoltBackupWrites(t *testing.T) {
+	old := debounceDelay
+	debounceDelay = 5 * time.Millisecond
+	t.Cleanup(func() { debounceDelay = old })
+
+	dir := t.TempDir()
+	backupDBDir := filepath.Join(dir, ".dolt-backup", "hq")
+	if err := os.MkdirAll(backupDBDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll .dolt-backup/hq: %v", err)
+	}
+	backupFile := filepath.Join(backupDBDir, "manifest")
+	if err := os.WriteFile(backupFile, []byte("first\n"), 0o644); err != nil {
+		t.Fatalf("seed backup file: %v", err)
+	}
+	unrelatedFile := filepath.Join(dir, "dolt-backup-notice.txt")
+
+	if !shouldIgnoreConfigWatchEvent(filepath.Join(dir, ".dolt-backup")) {
+		t.Fatalf("shouldIgnoreConfigWatchEvent(%q) = false, want true", filepath.Join(dir, ".dolt-backup"))
+	}
+	if !shouldIgnoreConfigWatchEvent(backupFile) {
+		t.Fatalf("shouldIgnoreConfigWatchEvent(%q) = false, want true", backupFile)
+	}
+	if shouldIgnoreConfigWatchEvent(unrelatedFile) {
+		t.Fatalf("shouldIgnoreConfigWatchEvent(%q) = true, want false", unrelatedFile)
+	}
+
+	var dirty atomic.Bool
+	pokeCh := make(chan struct{}, 1)
+	var stderr bytes.Buffer
+	cleanup := watchConfigTargets([]config.WatchTarget{{Path: dir, DiscoverConventions: true}}, &dirty, pokeCh, &stderr)
+	defer cleanup()
+
+	select {
+	case <-pokeCh:
+	default:
+	}
+	dirty.Store(false)
+
+	// Simulate a backup rotation cycle: sync writes, then an atomic-ish
+	// rename swap (new -> current, current -> old), the pattern the
+	// production backup-status script uses.
+	if err := os.WriteFile(backupFile, []byte("second\n"), 0o644); err != nil {
+		t.Fatalf("rewrite backup file: %v", err)
+	}
+	newDir := filepath.Join(dir, ".dolt-backup", "hq.new")
+	if err := os.MkdirAll(newDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll hq.new: %v", err)
+	}
+	oldDir := filepath.Join(dir, ".dolt-backup", "hq.old")
+	if err := os.Rename(backupDBDir, oldDir); err != nil {
+		t.Fatalf("rotate hq -> hq.old: %v", err)
+	}
+	if err := os.Rename(newDir, backupDBDir); err != nil {
+		t.Fatalf("rotate hq.new -> hq: %v", err)
+	}
+
+	select {
+	case <-pokeCh:
+		t.Fatalf("unexpected watcher poke after .dolt-backup rotation; stderr=%q", stderr.String())
+	case <-time.After(250 * time.Millisecond):
+	}
+	if dirty.Load() {
+		t.Fatalf("dirty flag set after .dolt-backup rotation; stderr=%q", stderr.String())
+	}
+
+	// A real, config-relevant city-root write must still be detected.
+	dirty.Store(false)
+	if err := os.WriteFile(unrelatedFile, []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write unrelated city-root file: %v", err)
+	}
+	select {
+	case <-pokeCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for watcher poke after unrelated city-root write; stderr=%q", stderr.String())
+	}
+	if !dirty.Load() {
+		t.Fatalf("dirty flag not set after unrelated city-root write; stderr=%q", stderr.String())
+	}
+}
+
+// TestConfigWatchRegistrar_DoesNotWatchDoltBackupChildren directly asserts
+// ga-jg1sg8's fix: adding the city root must not leave fsnotify holding a
+// watch (and thus an open read fd) on .dolt-backup or its contents. On
+// kqueue backends (macOS/BSD — production), Watcher.Add() on a directory
+// auto-watches every direct child to emulate inotify's create/remove
+// events (fsnotify's watchDirectoryFiles), regardless of whether that
+// child is itself excluded by shouldIgnoreConfigWatchEvent — that's the
+// leak: every backup sync/rotation cycle left another such fd behind, and
+// fsnotify has no "already watched" dedupe across generations of the
+// directory's own listing changing. removeIgnoredChildren undoes exactly
+// that side effect.
+//
+// This checks fsnotify's own watch registry via Remove()'s return value
+// (ErrNonExistentWatch means "never watched", nil means "was watched, and
+// just got un-watched") rather than counting real process fds: a fd-number
+// proxy (the lowest-free-slot number handed back by opening a fresh file)
+// turned out too noisy to assert on reliably in this binary — cmd/gc pulls
+// in Dolt, Kubernetes clients, AWS SDK, and OpenTelemetry, all of which
+// have their own eager init() goroutines and connection pools opening and
+// closing fds in the background, unrelated to this watcher. Remove()'s
+// return value has no such noise: it reads fsnotify's internal
+// byPath map directly. fsnotify.Watcher.WatchList() cannot be used for
+// this either — it only reports paths the CALLER explicitly passed to
+// Add(), not the kqueue backend's auto-watched shallow children
+// (verified empirically: WatchList() stayed empty of .dolt-backup even on
+// the unfixed code, because that auto-watch is invisible to it).
+func TestConfigWatchRegistrar_DoesNotWatchDoltBackupChildren(t *testing.T) {
+	dir := t.TempDir()
+	for _, rel := range []string{
+		filepath.Join(".dolt-backup", "hq", "manifest"),
+		filepath.Join(".dolt-backup", "gastown", "manifest"),
+		filepath.Join("agents", "batista-lx", "agent.toml"),
+	} {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll %s: %v", filepath.Dir(full), err)
+		}
+		if err := os.WriteFile(full, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", full, err)
+		}
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatalf("fsnotify.NewWatcher: %v", err)
+	}
+	defer watcher.Close()
+
+	var stderr bytes.Buffer
+	registrar := newConfigWatchRegistrar(watcher, &stderr)
+	done := make(chan struct{})
+	defer close(done)
+
+	// Matches how the real city root is registered:
+	// WatchTarget{Recursive: false, DiscoverConventions: true}.
+	if !registrar.addPath(dir, false, done) {
+		t.Fatalf("addPath(%q) = false; stderr=%q", dir, stderr.String())
+	}
+
+	doltBackupDir := filepath.Join(dir, ".dolt-backup")
+	if err := watcher.Remove(doltBackupDir); !errors.Is(err, fsnotify.ErrNonExistentWatch) {
+		t.Fatalf("watcher.Remove(%q) = %v, want ErrNonExistentWatch (i.e. it should never have been auto-watched); stderr=%q", doltBackupDir, err, stderr.String())
+	}
+
+	// Sanity check the assertion isn't vacuous: a legitimate, non-excluded
+	// child of the city root (agents/) must still be watched.
+	agentsDir := filepath.Join(dir, "agents")
+	if err := watcher.Remove(agentsDir); err != nil {
+		t.Fatalf("watcher.Remove(%q) = %v, want nil (agents/ is not excluded and should have been auto-watched); stderr=%q", agentsDir, err, stderr.String())
 	}
 }
 
