@@ -29,6 +29,17 @@ bead's rig prefix. The rig's `default_sling_target` in city.toml determines
 where work goes. Example: bead `hw-42` → rig `hello-world` → target
 `hello-world/polecat`.
 
+**Rigs with a dedicated pool:** `<rig>/polecat` is the generic default
+target, not a universal one. A rig that runs its own named pool (e.g.
+`wa-worker`, `ps-worker`) instead of the generic polecat role must be
+routed there directly — the plain `<rig>/polecat` pattern still *resolves*
+(`gc sling` accepts it; a pack-qualified generic role is importable by any
+rig) but if nothing is spawned to listen on that exact identity for this
+rig, the bead sits routed-but-dead until a watchdog notices. Before reusing
+the generic pattern from an example below, check `gc session list` (or `gc
+agent list`) for the rig's actual pool, or the rig's `default_sling_target`
+in city.toml if one is set (ga-68cijh, ga-rq9sqe).
+
 **Rig-scoped beads:** `gc sling` automatically resolves the rig directory
 for rig-scoped bead IDs (e.g. `hw-abc`) and runs `bd update` from there,
 so the rig's `.beads` database is found without manual intervention.
@@ -46,6 +57,10 @@ gc sling frontend/polecat fe-xxx            # Works — bead is in the right db
 
 If the bead is in the wrong database (e.g. `gc-xxx` in HQ but targeting
 a frontend agent), sling's cross-rig guard will block the route.
+
+`frontend/polecat` above assumes `frontend` uses the generic polecat role.
+Confirm with `gc session list` before reusing this pattern on a rig that
+runs its own dedicated pool (see "Rigs with a dedicated pool" above).
 
 ## Direct dispatch (bead to session config)
 
@@ -137,6 +152,12 @@ and mail. Best run from a crew worker in the target rig.
 ```
 gc sling <coordinator-agent> -f mol-idea-to-plan --var problem="..." --var review_target=<rig>/polecat
 ```
+
+`review_target` must be the rig's real work-review target —
+`<rig>/polecat` only if that rig uses the generic polecat role. On a rig
+with its own dedicated pool, check `gc session list` (or the rig's
+`default_sling_target`) first; the generic pattern resolves but routes to
+nothing if unclaimed (see "Rigs with a dedicated pool" above).
 
 **mol-review-leg** — Helper formula used by `mol-idea-to-plan` review tasks.
 Persists the full report to bead notes, mails the coordinator, closes the bead,
