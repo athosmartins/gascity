@@ -13,7 +13,13 @@ Your role is determined by the GC_AGENT environment variable and injected by
 ### Dolt Server
 
 Dolt is the data plane for beads (issues, mail, work history). It runs as a
-single server on port 3307 serving all databases. **It is fragile.**
+single server serving all databases. **It is fragile.**
+
+⚠️ **Never hardcode or trust a written-down port number for Dolt (not 3307,
+not any other number) — it is per-city and this exact line used to say 3307,
+which is wrong.** Derive the live port from the running process
+(`gc dolt status`/`gc dolt health`, or the process's own `--config` /
+`dolt-config.yaml`), never from memory or a doc.
 
 If you detect Dolt trouble (commands hang/timeout, "connection refused",
 "database not found", query latency > 5s, unexpected empty results):
@@ -73,15 +79,16 @@ gc mail send mayor -s "Dolt: <describe symptom>" -m "<paste evidence>"
 
 **Do NOT just `gc dolt stop && gc dolt start` without steps 1-4.**
 
-**Last resort, only with explicit human consent:** SIGQUIT to the Dolt
-PID writes a goroutine dump to `dolt.log` AND exits the server (Dolt's
-Go runtime treats SIGQUIT as a fatal default). Use only when steps 1-4
-above were insufficient AND the operator has approved a Dolt restart:
-
-```bash
-# WARNING: this terminates the Dolt server. Restart will follow.
-# kill -QUIT $(cat {{ .CityRoot }}/.gc/runtime/packs/dolt/dolt.pid)
-```
+🚨 **NEVER `kill -QUIT` the Dolt PID — verified DANGEROUS, not a safe last
+resort.** This section used to offer it as a consent-gated last resort; that
+was wrong and cost a real, if brief, citywide Dolt outage: sent to a live,
+fully-reachable `dolt sql-server` (confirmed healthy via `gc dolt health`
+immediately beforehand), the process vanished on the spot rather than
+dumping-and-continuing. Go's default SIGQUIT handling is dump-then-terminate,
+and Dolt does not install its own handler, so "consent" does not make this
+safe — it only makes the outage authorized. If steps 1-4 above weren't
+enough, escalate with the evidence (step 5) and let a human/Mayor decide the
+next step; do not send any signal to the Dolt process yourself.
 
 Orphan databases (testdb_*, beads_t*, beads_pt*) accumulate on the production
 server and degrade performance. Use `gc dolt cleanup` to remove them safely.
