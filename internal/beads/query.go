@@ -113,6 +113,21 @@ type ListQuery struct {
 	// implementations ignore it. Use it only for lifecycle gates that must
 	// observe external mutations immediately.
 	Live bool
+	// Selective declares that the caller expects a metadata lookup to match
+	// only a handful of live beads (an identity lookup such as "the open
+	// session whose session_name is X"). It is a hint, never a contract: a
+	// Selective query that matches many beads still returns all of them.
+	// NativeDoltStore honors it for a status-filtered, label-free metadata
+	// lookup by running it as a bounded probe of SelectiveProbeLimit rows
+	// first, which lets the backing beads search scan only ids and hydrate the
+	// few survivors instead of streaming every column of every row the
+	// metadata predicate visits; the result is identical either way. Every
+	// other store ignores the hint (one that applies a limit before its
+	// client-side filters could not honor it exactly), and so does
+	// NativeDoltStore for a query that includes closed rows, which can match a
+	// long history.
+	Selective bool
+
 	Sort SortOrder
 	// TierMode selects the storage tier(s) to read from. Zero value
 	// (TierIssues) preserves the legacy single-tier behavior.

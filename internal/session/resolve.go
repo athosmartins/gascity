@@ -127,9 +127,14 @@ func listSessionBeadsByMetadata(store beads.Store, key, value string, allowClose
 	if key == "" || value == "" {
 		return nil, nil
 	}
+	// An exact-value lookup matches a handful of beads at most: mark it
+	// Selective so NativeDoltStore can read a status-filtered one as a bounded
+	// probe (ga-1g2if1). The hint is inert when closed rows are included; the
+	// result is identical either way.
 	raw, err := store.List(beads.ListQuery{
 		Metadata:      map[string]string{key: value},
 		IncludeClosed: allowClosed,
+		Selective:     true,
 	})
 	if err != nil {
 		return nil, err
