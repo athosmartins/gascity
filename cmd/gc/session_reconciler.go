@@ -2877,7 +2877,7 @@ func firstOpenAssignedWorkBeadInStoreByIdentifiers(store beads.Store, identifier
 				return beads.Bead{}, false, err
 			}
 			for _, item := range items {
-				if sessionpkg.IsSessionBeadOrRepairable(item) {
+				if !countsAsAssignedWork(item) {
 					continue
 				}
 				return item, true, nil
@@ -3042,7 +3042,7 @@ func collectSessionAssignedWork(cityPath string, cfg *config.City, store beads.S
 					return err
 				}
 				for _, item := range items {
-					if sessionpkg.IsSessionBeadOrRepairable(item) {
+					if !countsAsAssignedWork(item) {
 						continue
 					}
 					if _, dup := seen[item.ID]; dup {
@@ -3223,7 +3223,7 @@ func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status strin
 
 func hasNonSessionAssignedWork(items []beads.Bead) bool {
 	for _, item := range items {
-		if sessionpkg.IsSessionBeadOrRepairable(item) {
+		if !countsAsAssignedWork(item) {
 			continue
 		}
 		return true

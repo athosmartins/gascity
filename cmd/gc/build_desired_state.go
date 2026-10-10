@@ -1839,11 +1839,13 @@ func appendWorkUnique(dst *[]beads.Bead, stores *[]beads.Store, storeRefs *[]str
 	// Invariant: dst, stores, and storeRefs are kept index-aligned by this
 	// shared growth path and the shared seen guard.
 	// Session beads are not actionable work — filter them at the source
-	// so all consumers see only real tasks. Message beads are NOT filtered
-	// here because they represent mail that should wake/materialize sessions;
-	// idle nudge filters messages locally since mail nudging is handled
-	// separately by the mail system.
-	if b.Type == sessionBeadType {
+	// so all consumers see only real tasks. UNREAD message beads are NOT
+	// filtered here because they represent mail that should wake/materialize
+	// sessions; idle nudge filters messages locally since mail nudging is
+	// handled separately by the mail system. Mail the recipient has already
+	// READ is filtered: it stays status=open until archived and must not keep
+	// a session awake (ga-h9xpwb).
+	if b.Type == sessionBeadType || isReadMailBead(b) {
 		return
 	}
 	if _, ok := seen[b.ID]; ok {

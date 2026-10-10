@@ -883,6 +883,22 @@ func (p *Provider) messageCandidatesAll(routes []string) ([]beads.Bead, error) {
 	return out, nil
 }
 
+// IsRead reports whether the recipient has read the mail bead b. The
+// mail.read metadata is authoritative when it holds "true" or "false";
+// otherwise the legacy "read" label decides. A bead that carries neither is
+// NOT read: unknown never counts as read. This is the one definition — the
+// inbox (beadToMessage) and the reconciler's assigned-work checks in cmd/gc
+// (a read-but-unarchived message is not work, ga-h9xpwb) both use it.
+func IsRead(b beads.Bead) bool {
+	switch b.Metadata["mail.read"] {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return hasLabel(b.Labels, "read")
+}
+
 // beadToMessage converts a bead to a mail.Message.
 func beadToMessage(b beads.Bead) mail.Message {
 	from := b.From
@@ -893,13 +909,7 @@ func beadToMessage(b beads.Bead) mail.Message {
 	if display := strings.TrimSpace(b.Metadata[toDisplayMetadataKey]); display != "" {
 		to = display
 	}
-	read := hasLabel(b.Labels, "read")
-	switch b.Metadata["mail.read"] {
-	case "true":
-		read = true
-	case "false":
-		read = false
-	}
+	read := IsRead(b)
 	return mail.Message{
 		ID:        b.ID,
 		From:      from,
