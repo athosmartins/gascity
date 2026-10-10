@@ -2846,6 +2846,239 @@ esac
 	}
 }
 
+// TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveSlingWrapper is the
+// ga-voj3cw regression. The Pilot hands a story to the dog pool through a
+// wrapper bead ("build story <id>") and stamps the story with
+// metadata["pilot.sling_bead"]=<wrapper>. The dog that claims the WRAPPER
+// does not claim the story, so the story stays open+unassigned+routed for the
+// whole build, and the routed-pool probe kept offering it to every other dog
+// that polled: three claim+release cycles in ten minutes on 2026-10-09, and
+// two dogs one rebase away from working the same branch. Same shape as
+// ga-i5bu7 (a live molecule step), different pointer. The live story must be
+// excluded and the untouched survivor behind it (the NEWER one, so a missing
+// filter shows as the wrong head) must still be served.
+func TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveSlingWrapper(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit"*)
+    printf '[{"id":"story-slung","priority":2,"created_at":"2026-10-09T15:00:00Z","metadata":{"pilot.sling_bead":"wrap-live"}},{"id":"story-plain","priority":2,"created_at":"2026-10-09T16:00:00Z","metadata":{}}]'
+    ;;
+  *"list --id wrap-live --status in_progress --json"*)
+    printf '[{"id":"wrap-live","status":"in_progress"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if strings.Contains(out, "story-slung") {
+		t.Fatalf("EffectiveWorkQuery() re-offered a story whose sling wrapper is in_progress: %q", out)
+	}
+	if !strings.Contains(out, "story-plain") {
+		t.Fatalf("EffectiveWorkQuery() dropped the untouched survivor behind the slung story: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueKeepsStoryWithDeadSlingWrapper proves the
+// wrapper filter is narrow. A wrapper that is closed (the builder finished or
+// the janitor closed the leak) or unknown makes `bd list --id <w> --status
+// in_progress` answer [] (exit 0, checked live against the real bd), and the
+// story must be offered again: a dead wrapper is the story's way back to the
+// pool, and hiding it would strand the work with nobody told.
+func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithDeadSlingWrapper(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit"*)
+    printf '[{"id":"story-dead-wrapper","priority":2,"created_at":"2026-10-09T15:00:00Z","metadata":{"pilot.sling_bead":"wrap-closed"}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "story-dead-wrapper") {
+		t.Fatalf("EffectiveWorkQuery() hid a story whose sling wrapper is no longer in_progress: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueKeepsStoryWhenSlingWrapperLookupFails pins
+// the fail-open direction, the same one ga-i5bu7 chose for the molecule check:
+// this stage refines a candidate set that was already fetched, and a wasted
+// claim cycle is far cheaper than a healthy story hidden from the pool. A bd
+// that errors, or answers with something that is not a JSON array (bd prints
+// {"error":...} on stdout for some subcommands), must not hide anything.
+func TestEffectiveWorkQueryRoutedQueueKeepsStoryWhenSlingWrapperLookupFails(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	for name, reply := range map[string]string{
+		"error object on stdout": `printf '{"error":"boom"}'; exit 0`,
+		"non-zero exit":          `printf 'database is locked' >&2; exit 1`,
+		"empty stdout":           `exit 0`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := runEffectiveWorkQuery(t, a, map[string]string{
+				"GC_SESSION_ORIGIN": "ephemeral",
+			}, `#!/bin/sh
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit"*)
+    printf '[{"id":"story-slung","priority":2,"created_at":"2026-10-09T15:00:00Z","metadata":{"pilot.sling_bead":"wrap-live"}}]'
+    ;;
+  *"list --id"*)
+    `+reply+`
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+			if !strings.Contains(out, "story-slung") {
+				t.Fatalf("EffectiveWorkQuery() hid a story because the wrapper lookup failed (%s): %q", name, out)
+			}
+		})
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueKeepsSelfReferentialSlingStory: a rig-native
+// bead is its own task hook (pilot.sling_bead == its own id, ga-mfeip). It is
+// open and ready, so it can never be "its own live wrapper", and the stage must
+// not even consult bd about it. The fake bd claims EVERY id is in_progress, so
+// a stage that did look the id up would hide the story.
+func TestEffectiveWorkQueryRoutedQueueKeepsSelfReferentialSlingStory(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit"*)
+    printf '[{"id":"story-self","priority":2,"created_at":"2026-10-09T15:00:00Z","metadata":{"pilot.sling_bead":"story-self"}}]'
+    ;;
+  *"list --id"*)
+    printf '[{"id":"story-self","status":"in_progress"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "story-self") {
+		t.Fatalf("EffectiveWorkQuery() hid a self-referential sling story: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueLooksUpSlingWrappersInOneBdCall: the probe
+// runs on a machine that is already saturated, so the wrapper check must not
+// cost one bd spawn per candidate. Three slung stories share ONE
+// `bd list --id a,b,c`; the live ones (oldest and newest) are dropped and the
+// middle one, whose wrapper is dead, is the only survivor. It is the NEWEST by
+// created_at, so a filter that failed to drop the live ones would show as a
+// different head.
+func TestEffectiveWorkQueryRoutedQueueLooksUpSlingWrappersInOneBdCall(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	log := filepath.Join(t.TempDir(), "bd.log")
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+		"BD_LOG":            log,
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit"*)
+    printf '[{"id":"s1","priority":2,"created_at":"2026-10-09T10:00:00Z","metadata":{"pilot.sling_bead":"w1"}},{"id":"s3","priority":2,"created_at":"2026-10-09T12:00:00Z","metadata":{"pilot.sling_bead":"w3"}},{"id":"s2","priority":2,"created_at":"2026-10-09T18:00:00Z","metadata":{"pilot.sling_bead":"w2"}}]'
+    ;;
+  *"list --id"*)
+    printf '%s\n' "$*" >> "$BD_LOG"
+    printf '[{"id":"w1","status":"in_progress"},{"id":"w3","status":"in_progress"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if got := strings.TrimSpace(out); !strings.Contains(got, `"id":"s2"`) || strings.Contains(got, `"id":"s1"`) || strings.Contains(got, `"id":"s3"`) {
+		t.Fatalf("EffectiveWorkQuery() = %q, want only s2 (the story whose wrapper is dead)", out)
+	}
+	data, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatalf("read bd log: %v (the wrapper lookup never ran)", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("wrapper lookup spawned bd %d times, want exactly 1: %q", len(lines), lines)
+	}
+	for _, id := range []string{"w1", "w2", "w3"} {
+		if !strings.Contains(lines[0], id) {
+			t.Fatalf("wrapper lookup %q does not ask about %s", lines[0], id)
+		}
+	}
+}
+
+// TestEffectiveWorkQueryRoutedQueueMoleculeAndSlingChecksAreIndependent: the
+// two liveness pointers are checked side by side, and neither resurrects what
+// the other drops. A story with a live molecule step and a DEAD wrapper is
+// hidden (molecule), one with a closed molecule and a LIVE wrapper is hidden
+// (wrapper), and one with both dead is served.
+func TestEffectiveWorkQueryRoutedQueueMoleculeAndSlingChecksAreIndependent(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_ORIGIN": "ephemeral",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit"*)
+    printf '[{"id":"mol-live-wrap-dead","priority":2,"created_at":"2026-10-09T10:00:00Z","metadata":{"molecule_id":"mol-live","pilot.sling_bead":"wrap-dead"}},{"id":"mol-dead-wrap-live","priority":2,"created_at":"2026-10-09T11:00:00Z","metadata":{"molecule_id":"mol-dead","pilot.sling_bead":"wrap-live"}},{"id":"both-dead","priority":2,"created_at":"2026-10-09T12:00:00Z","metadata":{"molecule_id":"mol-dead","pilot.sling_bead":"wrap-dead"}}]'
+    ;;
+  *"list --parent mol-live --status in_progress --json --limit 1"*)
+    printf '[{"id":"step-live","status":"in_progress"}]'
+    ;;
+  *"list --id"*)
+    printf '[{"id":"wrap-live","status":"in_progress"}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "both-dead") || strings.Contains(out, "mol-live-wrap-dead") || strings.Contains(out, "mol-dead-wrap-live") {
+		t.Fatalf("EffectiveWorkQuery() = %q, want only both-dead", out)
+	}
+}
+
+// TestEffectivePoolDemandQueryDoesNotCountStoryWithLiveSlingWrapper: the
+// scale-check count form must agree with the probe (they share one predicate
+// by design, see bdReadyPoolDemandShell). A story the probe will not offer is
+// not demand: counting it makes the reconciler keep a pool slot alive for work
+// nobody can claim.
+func TestEffectivePoolDemandQueryDoesNotCountStoryWithLiveSlingWrapper(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; count-form exercises a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runShellWithFakeBd(t, a.EffectivePoolDemandQuery(), nil, `#!/bin/sh
+set -eu
+case "$*" in
+  *"list --id wrap-live --status in_progress --json"*)
+    printf '[{"id":"wrap-live","status":"in_progress"}]'
+    ;;
+  *"--metadata-field gc.routed_to=hello-world/worker"*)
+    printf '[{"id":"story-slung","metadata":{"pilot.sling_bead":"wrap-live"}},{"id":"story-plain","metadata":{}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if strings.TrimSpace(out) != "1" {
+		t.Fatalf("EffectivePoolDemandQuery() count = %q, want 1 (the story with a live sling wrapper is not demand)", strings.TrimSpace(out))
+	}
+}
+
 // TestMoleculeLiveStepFilterShellNeverUsesCaseInPipedWhile pins down a real,
 // non-obvious parser constraint discovered while writing this filter: a
 // `case` statement nested inside a `while read` loop that is itself inside a

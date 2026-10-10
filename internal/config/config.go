@@ -3520,7 +3520,9 @@ func assignedTierExclusionFilterJQ() string {
 // moleculeLiveStepFilterShell returns a shell pipeline stage that reads a bd
 // JSON candidate array on stdin and drops any candidate whose graph.v2
 // molecule run already has a live (status=in_progress) step bead — i.e. a
-// different worker is already executing this story's molecule right now.
+// different worker is already executing this story's molecule right now —
+// or whose sling wrapper (metadata["pilot.sling_bead"]) is itself
+// in_progress (ga-voj3cw, below).
 //
 // ga-i5bu7: during a mol-do-work run the STORY bead stays open+unassigned for
 // the run's whole duration (only the STEP bead carries in_progress state), so
@@ -3572,9 +3574,52 @@ func assignedTierExclusionFilterJQ() string {
 // TestEffectiveScaleCheckUsesReadyOnly regression test asserts the generated
 // script never contains "2>/dev/null" at all — see bdReadyPoolDemandShell's
 // doc-comment on why the two callers must share one predicate).
+//
+// ga-voj3cw: the same stage also drops a story whose SLING WRAPPER is live.
+// The Pilot hands a story to the pool through a wrapper bead made with
+// `gc sling` ("build story <id>") and then stamps the story with
+// metadata["pilot.sling_bead"] = <wrapper id> (`gc sling` has no metadata flag,
+// so the stamp is the Pilot's, written after the wrapper exists; both stories
+// of the 2026-10-09 incident carried it). A wrapper nobody stamped on the story
+// is invisible here. The worker that claims the WRAPPER never claims the story,
+// so the story stays open+unassigned+routed for the whole build and every
+// other worker's probe re-offered it: three claim+release cycles in ten
+// minutes on 2026-10-09, and two dogs one rebase away from the same branch.
+// Same shape as the molecule case above, a different pointer; it lives in this
+// function so the probe and the count form keep ONE predicate.
+//
+// A wrapper is live iff `bd list --id <wrapper> --status in_progress` is a
+// non-empty array. That is the same contract as the molecule lookup: [] (exit
+// 0) for a closed or unknown id, so a dead wrapper, the story's way back to the
+// pool, leaves the story offered. Fail-open on everything else, for the reason
+// given above: a failing bd, an {"error":...} object on stdout or empty output
+// yields no live ids, so nothing is hidden.
+//
+// Known limit: a wrapper that stays in_progress under a DEAD session keeps
+// hiding its story until the wrapper leaves in_progress (the Pilot closes a
+// stale wrapper when it re-dispatches the story, ga-cnvy1; `bd reclaim` reverts
+// a lapsed lease). This stage does not try to tell that apart from a live
+// builder. The lease cannot do it: a live builder's lease lapses unless it runs
+// `bd heartbeat`, and builders do not reliably do so (observed on ga-voj3cw
+// itself, lease expired mid-work). Session liveness is a read the probe cannot
+// afford on every poll.
+//
+// Every candidate's wrapper id goes in ONE `bd list --id a,b,c` call, not one
+// call per candidate: the count form runs with --limit 0 on a machine that is
+// already saturated, and a stale pilot.sling_bead (the stamp survives the
+// wrapper closing) is common. A candidate whose pilot.sling_bead is its own id
+// (a rig-native bead is its own task hook, ga-mfeip) is never looked up: it is
+// open and ready, so it cannot be its own live wrapper.
+//
+// The molecule loop keeps its two-column @tsv on purpose. Tab is IFS
+// whitespace, so a third column with an empty middle field would shift the
+// last value left; the wrapper ids are resolved before the loop instead.
 func moleculeLiveStepFilterShell() string {
 	return `{ ` +
 		`cands=$(cat); ` +
+		`sids=$(printf "%s" "$cands" | jq -r ` + shellquote.Quote(`[.[] | ((.metadata["pilot.sling_bead"] // "") | tostring) as $s | select($s != "" and $s != .id) | $s] | unique | join(",")`) + `); ` +
+		`live_sids=""; ` +
+		`if [ -n "$sids" ]; then live_sids=$(bd list --id "$sids" --status in_progress --json --limit 0 | jq -r ` + shellquote.Quote(`if type == "array" then (.[] | objects | .id // empty) else empty end`) + `); fi; ` +
 		`keep_ids=$(printf "%s" "$cands" | jq -r ` + shellquote.Quote(`.[] | [.id, (.metadata["molecule_id"] // "")] | @tsv`) + ` | while IFS="$(printf '\t')" read -r cid mid; do ` +
 		`[ -z "$cid" ] && continue; ` +
 		`if [ -z "$mid" ]; then printf "%s\n" "$cid"; continue; fi; ` +
@@ -3583,7 +3628,7 @@ func moleculeLiveStepFilterShell() string {
 		`elif [ "${live#\[}" != "$live" ] && [ "${live%\]}" != "$live" ]; then :; ` +
 		`else printf "%s\n" "$cid"; fi; ` +
 		`done); ` +
-		`printf "%s" "$cands" | jq -c --arg ids "$keep_ids" ` + shellquote.Quote(`($ids | split("\n") | map(select(length > 0))) as $keep | [.[] | select(.id as $i | $keep | index($i) != null)]`) + `; ` +
+		`printf "%s" "$cands" | jq -c --arg ids "$keep_ids" --arg live "$live_sids" ` + shellquote.Quote(`($ids | split("\n") | map(select(length > 0))) as $keep | ($live | split("\n") | map(select(length > 0))) as $lv | [.[] | select(.id as $i | $keep | index($i) != null) | select(((.metadata["pilot.sling_bead"] // "") | tostring) as $s | ($s == "" or $s == .id or ($lv | index($s)) == null))]`) + `; ` +
 		`}`
 }
 
