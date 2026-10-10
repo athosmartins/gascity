@@ -73,6 +73,7 @@ func TestBuiltinProvidersClaude(t *testing.T) {
 func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
 	p := BuiltinProviders()["claude"]
 	var model OptionChoice
+	var sonnet OptionChoice
 	var oldOpus OptionChoice
 	for _, opt := range p.OptionsSchema {
 		if opt.Key != "model" {
@@ -82,13 +83,27 @@ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
 			switch choice.Value {
 			case "opus":
 				model = choice
+			case "sonnet":
+				sonnet = choice
 			case "opus-4-7":
 				oldOpus = choice
 			}
 		}
 	}
-	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-4-8"}) {
-		t.Fatalf("opus FlagArgs = %v, want Opus 4.8", model.FlagArgs)
+	// "opus" and "sonnet" are the tier choices an agent gets from
+	// option_defaults.model; they must land on the 5.5 models, not on
+	// whatever the table last pinned (ga-3dhb91).
+	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-5-5"}) {
+		t.Fatalf("opus FlagArgs = %v, want Opus 5.5", model.FlagArgs)
+	}
+	if !reflect.DeepEqual(model.FlagAliases, [][]string{{"-m", "claude-opus-5-5"}}) {
+		t.Fatalf("opus FlagAliases = %v, want -m Opus 5.5", model.FlagAliases)
+	}
+	if !reflect.DeepEqual(sonnet.FlagArgs, []string{"--model", "claude-sonnet-5-5"}) {
+		t.Fatalf("sonnet FlagArgs = %v, want Sonnet 5.5", sonnet.FlagArgs)
+	}
+	if !reflect.DeepEqual(sonnet.FlagAliases, [][]string{{"-m", "claude-sonnet-5-5"}}) {
+		t.Fatalf("sonnet FlagAliases = %v, want -m Sonnet 5.5", sonnet.FlagAliases)
 	}
 	if !reflect.DeepEqual(oldOpus.FlagArgs, []string{"--model", "claude-opus-4-7"}) {
 		t.Fatalf("opus-4-7 FlagArgs = %v, want Opus 4.7 preserved", oldOpus.FlagArgs)

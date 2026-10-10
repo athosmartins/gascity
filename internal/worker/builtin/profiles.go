@@ -152,9 +152,9 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				Type:  "select",
 				Choices: []BuiltinOptionChoice{
 					{Value: "", Label: "Default"},
-					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
+					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-5-5"}, FlagAliases: [][]string{{"-m", "claude-opus-5-5"}}},
 					{Value: "opus-4-7", Label: "Opus 4.7", FlagArgs: []string{"--model", "claude-opus-4-7"}, FlagAliases: [][]string{{"-m", "claude-opus-4-7"}}},
-					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
+					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-5-5"}, FlagAliases: [][]string{{"-m", "claude-sonnet-5-5"}}},
 					{Value: "haiku", Label: "Haiku", FlagArgs: []string{"--model", "claude-haiku-4-5-20251001"}, FlagAliases: [][]string{{"-m", "claude-haiku-4-5-20251001"}}},
 				},
 			},

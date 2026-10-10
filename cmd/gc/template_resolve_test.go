@@ -29,12 +29,12 @@ func TestT3BridgeStartupEnvelopeModel_UsesCurrentProviderDefaults(t *testing.T) 
 		{
 			name: "codex-mini",
 			tp:   TemplateParams{Env: map[string]string{"GC_PROVIDER": "codex-mini"}},
-			want: "claude-opus-4-6",
+			want: "claude-opus-5-5",
 		},
 		{
 			name: "claude",
 			tp:   TemplateParams{Env: map[string]string{"GC_PROVIDER": "claude"}},
-			want: "claude-opus-4-6",
+			want: "claude-opus-5-5",
 		},
 	}
 
