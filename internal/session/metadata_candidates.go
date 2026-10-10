@@ -10,16 +10,26 @@ import (
 // metadata filter. Each filter must contain exactly one key/value pair; empty
 // filters are ignored. Results are deduplicated by bead ID in query order.
 func ExactMetadataSessionCandidates(store beads.Store, includeClosed bool, filters ...map[string]string) ([]beads.Bead, error) {
-	return exactMetadataSessionCandidates(store, includeClosed, "", filters...)
+	return exactMetadataSessionCandidates(store, includeClosed, "", false, filters...)
 }
 
 // ExactMetadataSessionCandidatesWithStatus returns session beads matching any
 // exact metadata filter and the requested bead status.
 func ExactMetadataSessionCandidatesWithStatus(store beads.Store, status string, filters ...map[string]string) ([]beads.Bead, error) {
-	return exactMetadataSessionCandidates(store, false, strings.TrimSpace(status), filters...)
+	return exactMetadataSessionCandidates(store, false, strings.TrimSpace(status), false, filters...)
 }
 
-func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, status string, filters ...map[string]string) ([]beads.Bead, error) {
+// liveExactMetadataSessionCandidates is ExactMetadataSessionCandidates read
+// live: it bypasses any cache in front of the store, so a bead another process
+// created a moment ago is visible. The identity-availability checks need that:
+// a query that includes closed rows always reaches the backing store, so
+// dropping closed rows from one of them must not also drop its freshness
+// (ga-1g2if1).
+func liveExactMetadataSessionCandidates(store beads.Store, includeClosed bool, filters ...map[string]string) ([]beads.Bead, error) {
+	return exactMetadataSessionCandidates(store, includeClosed, "", true, filters...)
+}
+
+func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, status string, live bool, filters ...map[string]string) ([]beads.Bead, error) {
 	if store == nil {
 		return nil, nil
 	}
@@ -43,8 +53,14 @@ func exactMetadataSessionCandidates(store beads.Store, includeClosed bool, statu
 			continue
 		}
 		seenQueries[queryKey] = true
+		// An exact-value lookup matches a handful of beads at most: mark it
+		// Selective so NativeDoltStore can read a status-filtered one as a
+		// bounded probe (ga-1g2if1). The hint is inert when closed rows are
+		// included; the result is identical either way.
 		query := beads.ListQuery{
-			Metadata: map[string]string{key: value},
+			Metadata:  map[string]string{key: value},
+			Selective: true,
+			Live:      live,
 		}
 		if status != "" {
 			query.Status = status

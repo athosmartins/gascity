@@ -419,13 +419,7 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 	if name == "" {
 		return nil
 	}
-	all, err := ExactMetadataSessionCandidates(store, true,
-		map[string]string{"session_name": name},
-		map[string]string{"alias": name},
-		map[string]string{"agent_name": name},
-		map[string]string{"template": name},
-		map[string]string{"common_name": name},
-	)
+	all, err := sessionNameHolderCandidates(store, name)
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
@@ -484,6 +478,49 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 		}
 	}
 	return nil
+}
+
+// sessionNameHolderCandidates returns the session beads that may hold name as
+// session_name, alias, agent_name, template or common_name: session_name
+// matches first, then the rest, each bead once.
+//
+// Closed rows are read for the session_name key only. An explicit session name
+// is a permanent identity, so a closed session_name holder keeps the name
+// reserved; for every other key the availability loop skips a closed bead, so
+// reading closed rows for them only added four more full scans of every closed
+// wisp row per check (ga-1g2if1: seconds each on hq.wisps, several times a
+// tick while a configured name stays blocked). Those four are read live and
+// status-filtered: a lookup that includes closed rows always reaches the
+// backing store, so a plain (cache-served) open-only read would be staler than
+// the check used to be, and the live status-filtered read is cheap.
+func sessionNameHolderCandidates(store beads.Store, name string) ([]beads.Bead, error) {
+	held, err := ExactMetadataSessionCandidates(store, true,
+		map[string]string{"session_name": name},
+	)
+	if err != nil {
+		return nil, err
+	}
+	live, err := liveExactMetadataSessionCandidates(store, false,
+		map[string]string{"alias": name},
+		map[string]string{"agent_name": name},
+		map[string]string{"template": name},
+		map[string]string{"common_name": name},
+	)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(held))
+	out := make([]beads.Bead, 0, len(held)+len(live))
+	for _, b := range held {
+		seen[b.ID] = true
+		out = append(out, b)
+	}
+	for _, b := range live {
+		if !seen[b.ID] {
+			out = append(out, b)
+		}
+	}
+	return out, nil
 }
 
 func failedCreateIdentityReleased(b beads.Bead) bool {
@@ -622,7 +659,11 @@ func isConfiguredNamedSessionRuntimeName(cfg *config.City, name, owner string) b
 // ensureSessionNameAvailableForSelf so the legacy-bypass path cannot
 // suppress rejections from live alias or identifier collisions.
 func noLiveSessionNameCollisions(store beads.Store, name, selfID, selfOwner string) bool {
-	all, err := ExactMetadataSessionCandidates(store, true,
+	// Live beads only: every closed row is skipped below, so asking the store
+	// for closed rows would only add five full scans of them (ga-1g2if1). Read
+	// live so a bead another process created a moment ago still counts, as it
+	// did when this asked for closed rows.
+	all, err := liveExactMetadataSessionCandidates(store, false,
 		map[string]string{"session_name": name},
 		map[string]string{"alias": name},
 		map[string]string{"agent_name": name},

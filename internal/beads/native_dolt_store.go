@@ -569,7 +569,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	filter := nativeIssueFilterFromListQuery(query)
 	ctx, cancel := nativeDoltOperationContext(context.TODO())
 	defer cancel()
-	issues, err := storage.SearchIssues(ctx, "", filter)
+	issues, err := nativeSearchIssues(ctx, storage, query, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -582,6 +582,49 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		beads = append(beads, bead)
 	}
 	return ApplyListQuery(beads, query), nil
+}
+
+// nativeSearchIssues runs the upstream search for List. A Selective metadata
+// lookup that reaches upstream without a limit is read as a bounded probe of
+// SelectiveProbeLimit rows first: any bounded query makes the vendored beads
+// search scan only `id` and batch-fetch the survivors by primary key ("Pattern
+// B", issueops.searchTableInTxT) instead of streaming every column of every
+// row the metadata predicate visits. On hq.wisps that took a status-filtered
+// session lookup from 0.4-0.75 s to 0.05-0.08 s (ga-1g2if1).
+//
+// The probe is exact because it is judged on the UPSTREAM row count, before
+// any client-side filtering in ApplyListQuery: fewer rows than the limit means
+// upstream had no more, so the page is the complete candidate set (and a page
+// that a predicate applied only client-side would later thin out cannot be
+// mistaken for a complete one); a full page may be cut short, so the query is
+// repeated unbounded. A caller-supplied limit already reaches upstream and is
+// left alone.
+//
+// Only queries that are selective by nature are probed: a status-filtered,
+// label-free metadata lookup. A query that includes closed rows can match a
+// long history (a recycled named session leaves one closed bead per restart),
+// where a full probe page would double the cost of an unbounded JSON scan that
+// the narrow projection barely shortens, and a label-driven search is not
+// bounded here at all.
+func nativeSearchIssues(ctx context.Context, storage beadslib.Storage, query ListQuery, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+	if !nativeSelectiveProbeApplies(query, filter) {
+		return storage.SearchIssues(ctx, "", filter)
+	}
+	probe := filter
+	probe.Limit = SelectiveProbeLimit
+	issues, err := storage.SearchIssues(ctx, "", probe)
+	if err != nil || len(issues) < SelectiveProbeLimit {
+		return issues, err
+	}
+	return storage.SearchIssues(ctx, "", filter)
+}
+
+func nativeSelectiveProbeApplies(query ListQuery, filter beadslib.IssueFilter) bool {
+	return query.Selective &&
+		filter.Limit == 0 &&
+		len(query.Metadata) > 0 &&
+		query.Label == "" &&
+		!query.IncludesClosed()
 }
 
 // ListOpen returns non-closed beads by default, or beads with the given status.
