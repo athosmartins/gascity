@@ -18,6 +18,10 @@ type sessionActionResult struct {
 	WaitNudgesWithdrawn int    `json:"wait_nudges_withdrawn,omitempty"`
 	Pinned              *bool  `json:"pinned,omitempty"`
 	MaterializedNamed   bool   `json:"materialized_named,omitempty"`
+	// RuntimeStopped reports whether "gc session suspend" confirmed the
+	// runtime process actually stopped before returning. nil for actions
+	// that don't make this distinction. See ga-me6wsb.
+	RuntimeStopped *bool `json:"runtime_stopped,omitempty"`
 }
 
 func sessionJSONRequested(values []bool) bool {
