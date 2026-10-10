@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1224,7 +1225,9 @@ func poolDemandBeadInFlight(b beads.Bead) bool {
 // lifecycle transition. Folding this broader "don't count as demand" set
 // into it would expose these veto labels to being stripped by that code path.
 //
-// Keep in sync with bdReadyPoolDemandExcludeLabelArgs (internal/config/config.go).
+// Kept in sync with bdReadyPoolDemandExcludeLabelArgs (internal/config/config.go)
+// by TestPoolDemandVetoMirrorsWorkerProbe, which reads the dog's rendered work
+// query and fails when the probe vetoes something this predicate does not.
 var poolDemandVetoLabels = []string{
 	"story:needs-human",
 	"needs-human",
@@ -1262,14 +1265,30 @@ var poolDemandVetoLabels = []string{
 // own timed-expiry logic and is implemented separately in
 // poolDemandBeadVetoed below (not a plain prefix veto).
 //
-// Keep in sync with poolDemandLabelFilterJQ (internal/config/config.go).
+// pilot:text-veto:<slug> is the prefix this list was missing (ga-wtzrho): the
+// Pilot stamps it on a bead it vetoed by TEXT content, the dog probe refuses
+// it (ga-42mlf), and without it here the bead counted as demand forever — one
+// such bead (ga-a9zz5y, open since 2026-09-20) was the only bead counted on 715
+// supervisor ticks replayed from 09/25-09/26.
+//
+// Kept in sync with poolDemandLabelFilterJQ (internal/config/config.go) by
+// TestPoolDemandVetoMirrorsWorkerProbe, which reads the dog's rendered work
+// query and fails when the probe vetoes a prefix this list does not have.
 var poolDemandVetoLabelPrefixes = []string{
 	"pool:refused",
 	"pilot:refused-reason:",
+	"pilot:text-veto",
 	"blocked:",
 	"blocked-reason:",
 	"gate:needs-human",
 }
+
+// poolDemandEpicTitleRE mirrors the probe's title heuristic (ga-7ha7g), the jq
+// test("^(EPIC|ÉPICO)[:\\s]"; "i") in poolDemandLabelFilterJQ: anchored at the
+// start with a colon/whitespace delimiter, so a title that merely mentions
+// "epic" is never matched. RE2's \s is ASCII-only, jq's may match more; a
+// Unicode space right after "EPIC" is not a case this city produces.
+var poolDemandEpicTitleRE = regexp.MustCompile(`(?i)^(?:EPIC|ÉPICO)[:\s]`)
 
 // poolDemandBeadVetoed reports whether a bead carries a deliberate park/veto
 // signal that must exclude it from default scale_check demand counting, even
@@ -1278,6 +1297,14 @@ var poolDemandVetoLabelPrefixes = []string{
 // (internal/config/config.go) — the predicate every pool worker's own
 // self-serve probe already applies — so defaultScaleCheckCounts stops
 // treating beads no worker would ever claim as live demand (ga-kojez).
+//
+// Beyond labels it also mirrors the probe's two non-label refusals (ga-wtzrho):
+// issue_type epic (the probe passes --exclude-type=epic, and readyExcludeTypes
+// does not list epic) and EPIC:/ÉPICO: titles.
+//
+// NOT mirrored: moleculeLiveStepFilterShell, which drops a bead whose molecule
+// already has an in-progress step. That needs a store query per bead, which a
+// pure predicate cannot make; a bead in that state is still counted here.
 //
 // held-until handling mirrors poolDemandLabelFilterJQ's ga-jfz9t1 fix
 // exactly: pilot:held-until:<epoch> labels ACCUMULATE (nothing prunes old
@@ -1289,6 +1316,9 @@ var poolDemandVetoLabelPrefixes = []string{
 // the unrelated sticky pilot:held-count:<slug>:<n> escalation counter, which
 // must never veto on its own (ga-jfz9t1).
 func poolDemandBeadVetoed(b beads.Bead, now time.Time) bool {
+	if b.Type == "epic" || poolDemandEpicTitleRE.MatchString(b.Title) {
+		return true
+	}
 	for _, label := range poolDemandVetoLabels {
 		if hasBeadLabel(b.Labels, label) {
 			return true
