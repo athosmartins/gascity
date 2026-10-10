@@ -2071,6 +2071,57 @@ esac
 	}
 }
 
+// TestEffectiveAssignedInProgressQuerySkipsNoAutoDispatchBead (ga-ljoz23):
+// the bug's own acceptance bar, same empirical shape as
+// TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead — a bead carrying
+// pilot:no-auto-dispatch must not resurface via Step 1a just because it
+// still carries the SAME assignee (a reusable pool alias, not a specific
+// live session). Reproduces ga-vjlwso: assigned to gastown.dog-1, carrying
+// pilot:no-auto-dispatch while parked awaiting a Mayor-scheduled execution
+// window — "resumed" by 8 freshly-spawned dog sessions in ~4.5h before this
+// fix, each finding nothing to do.
+func TestEffectiveAssignedInProgressQuerySkipsNoAutoDispatchBead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedInProgressQuery()
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_ID": "worker-bead",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
+  "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[]` {
+		t.Fatalf("EffectiveAssignedInProgressQuery() output = %q, want [] (pilot:no-auto-dispatch bead must not be re-offered as resumable work — ga-vjlwso babysitting churn)", out)
+	}
+}
+
+// TestEffectiveAssignedReadyQuerySkipsNoAutoDispatchBead (ga-ljoz23) is the
+// Step 1b sibling of TestEffectiveAssignedInProgressQuerySkipsNoAutoDispatchBead
+// — the same bead shape reached via `bd ready` instead of `bd list
+// --status in_progress` (a bead can transiently sit in either tier depending
+// on reclaim timing), so both entry points must agree.
+func TestEffectiveAssignedReadyQuerySkipsNoAutoDispatchBead(t *testing.T) {
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	got := a.EffectiveAssignedReadyQuery()
+
+	out := runShellWithFakeBd(t, got, map[string]string{
+		"GC_SESSION_ID": "worker-bead",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
+  *) printf '[]' ;;
+esac
+`)
+	if strings.TrimSpace(out) != `[]` {
+		t.Fatalf("EffectiveAssignedReadyQuery() output = %q, want [] (pilot:no-auto-dispatch bead must not be re-offered as resumable work — ga-vjlwso babysitting churn)", out)
+	}
+}
+
 func TestEffectiveAssignedReadyQueryCustomPreservesOverride(t *testing.T) {
 	const custom = "custom work query"
 	a := Agent{Name: "worker", WorkQuery: custom}
