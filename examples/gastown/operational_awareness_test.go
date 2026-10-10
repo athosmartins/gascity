@@ -96,3 +96,45 @@ func TestOperationalAwarenessFragmentNonFatalDiagnostic(t *testing.T) {
 		}
 	})
 }
+
+// TestOperationalAwarenessFragmentNoHardcodedDoltPort is the regression
+// fence for the stale-port class of bug (found live 2026-09-24: this
+// fragment hardcoded "port 3307", which is wrong for the city it was
+// actually rendered into — the real port is per-city and must be derived
+// from the running process, not written down). The fragment ships into
+// every gastown agent's prompt, so a hardcoded wrong port isn't cosmetic:
+// an agent following it verbatim targets a port nothing is listening on.
+//
+// The check can't be a plain substring-absence test for "3307": the
+// corrective text legitimately needs to mention that digit string once,
+// to warn readers away from it ("not 3307 ... this exact line used to say
+// 3307, which is wrong"). So this asserts against the specific stale
+// CLAIM ("single server on port 3307") rather than the digits, and
+// separately asserts the corrective derive-from-live-process guidance is
+// present as an active claim.
+func TestOperationalAwarenessFragmentNoHardcodedDoltPort(t *testing.T) {
+	path := filepath.Join(exampleDir(), operationalAwarenessFragment)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", operationalAwarenessFragment, err)
+	}
+	body := string(data)
+
+	t.Run("no_stale_port_claim", func(t *testing.T) {
+		if strings.Contains(body, "single server on port 3307") {
+			t.Errorf("%s still claims Dolt runs on a fixed port 3307. "+
+				"The port is per-city and must never be hardcoded — derive it "+
+				"from the running process instead (gc dolt status/health).",
+				operationalAwarenessFragment)
+		}
+	})
+
+	t.Run("documents_derive_from_live_process", func(t *testing.T) {
+		if !strings.Contains(body, "Derive the live port from the running process") {
+			t.Errorf("%s does not instruct deriving the Dolt port from the "+
+				"live process; without this active guidance, readers fall back "+
+				"to whatever port number they last saw written down.",
+				operationalAwarenessFragment)
+		}
+	})
+}
