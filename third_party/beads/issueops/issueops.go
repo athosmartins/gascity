@@ -195,7 +195,8 @@ type CreateRequest struct {
 	// ParentID creates a typed DepParentChild edge. It must not duplicate an
 	// explicit edge in Dependencies.
 	ParentID string
-	// InheritLabelsFromParent copies the parent's labels at creation.
+	// InheritLabelsFromParent copies the parent's labels at creation, except
+	// its gate/pilot/lifecycle state (types.IsInheritableLabel).
 	InheritLabelsFromParent bool
 	// Dependencies is the authoritative set of explicit edges created with the
 	// issue. Duplicate source-target pairs are rejected. A different type for an
