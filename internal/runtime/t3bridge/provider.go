@@ -1596,6 +1596,10 @@ func deriveProjectTitle(name, workspaceRoot string, envelope StartupEnvelope) st
 
 const defaultCodexModel = "gpt-5.4"
 
+// defaultClaudeModel is what a claude thread lands on when nothing chose a
+// model. The two fallbacks below share it so they cannot drift apart.
+const defaultClaudeModel = "claude-sonnet-5-5"
+
 func resolveProviderModel(cfg runtime.Config, envelope StartupEnvelope) (string, string) {
 	provider := normalizeT3Provider(cfg.Env["GC_PROVIDER"])
 	model := strings.TrimSpace(cfg.Env["GC_MODEL"])
@@ -1618,7 +1622,7 @@ func resolveProviderModel(cfg runtime.Config, envelope StartupEnvelope) (string,
 		if provider == "codex" {
 			model = defaultCodexModel
 		} else {
-			model = "claude-sonnet-4-6"
+			model = defaultClaudeModel
 		}
 	}
 	return provider, model
@@ -1665,7 +1669,7 @@ func resolveBindingProviderModel(binding threadBinding, env map[string]string) (
 		if provider == "codex" {
 			model = defaultCodexModel
 		} else {
-			model = "claude-sonnet-4-6"
+			model = defaultClaudeModel
 		}
 	}
 	return provider, model

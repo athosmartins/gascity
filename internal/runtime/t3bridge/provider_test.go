@@ -87,6 +87,36 @@ func TestResolveProviderModel_DefaultsCodexToGPT54WhenModelMissing(t *testing.T)
 	}
 }
 
+// The claude fallback is asserted as a literal on purpose: it is the model an
+// agent silently lands on when nothing chose one, so a change to it must be a
+// deliberate edit to this test too (ga-3dhb91: it sat on claude-sonnet-4-6).
+func TestResolveProviderModel_DefaultsClaudeToSonnet55WhenModelMissing(t *testing.T) {
+	cfg := runtime.Config{
+		Command: "claude --dangerously-skip-permissions",
+	}
+
+	provider, model := resolveProviderModel(cfg, StartupEnvelope{})
+	if provider != "claudeAgent" {
+		t.Fatalf("provider = %q, want claudeAgent", provider)
+	}
+	if model != "claude-sonnet-5-5" {
+		t.Fatalf("model = %q, want claude-sonnet-5-5", model)
+	}
+}
+
+func TestResolveBindingProviderModel_DefaultsClaudeToSonnet55WhenModelMissing(t *testing.T) {
+	provider, model := resolveBindingProviderModel(threadBinding{
+		Provider: "claudeAgent",
+		Model:    "",
+	}, nil)
+	if provider != "claudeAgent" {
+		t.Fatalf("provider = %q, want claudeAgent", provider)
+	}
+	if model != "claude-sonnet-5-5" {
+		t.Fatalf("model = %q, want claude-sonnet-5-5", model)
+	}
+}
+
 func TestDecodeIssuedBearerSessionToken(t *testing.T) {
 	token, err := decodeIssuedBearerSessionToken([]byte(`{"sessionId":"session-1","token":"test-bearer","role":"owner"}`))
 	if err != nil {

@@ -124,5 +124,5 @@ func t3BridgeStartupEnvelopeModel(provider string, tp TemplateParams) string {
 	if provider == "codex" {
 		return "gpt-5-codex"
 	}
-	return "claude-opus-4-6"
+	return "claude-opus-5-5"
 }
