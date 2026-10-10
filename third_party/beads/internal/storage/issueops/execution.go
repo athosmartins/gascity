@@ -64,7 +64,9 @@ func ExecuteCreate(ctx context.Context, tx *sql.Tx, request publicops.CreateRequ
 		if err != nil {
 			return publicops.CreateResult{}, nil, err
 		}
-		issue.Labels = append(issue.Labels, labels...)
+		// Classification only: the parent's gate/pilot/lifecycle state is not
+		// the child's (types.IsInheritableLabel).
+		issue.Labels = append(issue.Labels, types.FilterInheritableLabels(labels)...)
 	}
 	childCounterChanged := false
 	if issue.ID == "" && attempt.ParentID != "" {

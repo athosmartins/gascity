@@ -770,7 +770,13 @@ func mergeCreateLabels(labels, inheritedLabels []string) []string {
 		seen[label] = struct{}{}
 		merged = append(merged, label)
 	}
+	// Only classification is inherited; the parent's gate/pilot/lifecycle state
+	// stays with the parent (types.IsInheritableLabel). Labels the caller named
+	// explicitly are merged above and never filtered.
 	for _, label := range inheritedLabels {
+		if !types.IsInheritableLabel(label) {
+			continue
+		}
 		if _, ok := seen[label]; ok {
 			continue
 		}

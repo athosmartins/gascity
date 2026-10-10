@@ -1002,7 +1002,9 @@ func (u *issueUseCaseImpl) create(ctx context.Context, params CreateIssueParams,
 			for _, l := range params.Labels {
 				existing[l] = true
 			}
-			for _, l := range parentLabels {
+			// Classification only: the parent's gate/pilot/lifecycle state is
+			// not the child's (types.IsInheritableLabel).
+			for _, l := range types.FilterInheritableLabels(parentLabels) {
 				if !existing[l] {
 					result.InheritedLabels = append(result.InheritedLabels, l)
 				}
