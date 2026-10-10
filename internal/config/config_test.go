@@ -1725,13 +1725,13 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit 0`) {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 target argument: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.run_target=$target" --metadata-field "gc.kind=workflow" --unassigned --exclude-type=epic --json --sort oldest --limit 0`) {
 		t.Errorf("EffectiveWorkQuery() missing run_target migration fallback: %q", got)
 	}
 	for _, want := range []string{`.metadata`, `.[0:1]`} {
@@ -1747,10 +1747,10 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "story:needs-human" --exclude-label "needs-human" --exclude-label "ctx:thin" --exclude-label "story:needs-approval" --exclude-label "story:epic" --exclude-label "needs:engine-window" --exclude-label "pilot:no-auto-dispatch" --exclude-label "story:blocked" --exclude-label "delivery:partial" --exclude-label "scope:needs-review" --exclude-label "exec:manual" --exclude-label "needs-human-decision" --exclude-label "auto-refino:refining" --exclude-label "auto-refino:escalated" --exclude-label "refino:info-gap" --exclude-label "refino:policy-gap" --exclude-label "story:unrefined" --exclude-label "story:refinement-in-progress" --exclude-label "story:refino-review" --exclude-label "story:refino-escalado" --exclude-label "story:needs-device" --exclude-label "on-device" --exclude-label "phone-proxy" --exclude-label "gate:queued" --exclude-label "gate:reviewing" --json --sort oldest --limit 0`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit 0`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral assigned probe: %q", got)
 	}
 }
@@ -1841,7 +1841,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Fatalf("EffectiveAssignedReadyQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit=20`) {
+	if !strings.Contains(got, `bd ready --assignee="$id" --json --limit 0`) {
 		t.Fatalf("EffectiveAssignedReadyQuery() missing assigned-ready tier: %q", got)
 	}
 	// ga-ox2yw: the assigned-ready ("Step 1b") tier must apply the same
@@ -1861,7 +1861,7 @@ func TestEffectiveAssignedReadyQueryDefault(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=worker-session --json --limit=20") printf '[{"id":"assigned-ready"}]' ;;
+  "ready --assignee=worker-session --json --limit 0") printf '[{"id":"assigned-ready"}]' ;;
   *) printf '[]' ;;
 esac
 `)
@@ -1886,7 +1886,7 @@ func TestEffectiveAssignedReadyQuerySkipsPoolRefusedBead(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-mww6n","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+  "ready --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-mww6n","labels":["pool:refused:engine-rebuild-required"]}]' ;;
   *) printf '[]' ;;
 esac
 `)
@@ -1938,7 +1938,7 @@ func TestEffectiveAssignedReadyQuerySurfacesParkedOwnBead(t *testing.T) {
 			bdScript := fmt.Sprintf(`#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"own-parked-bead","title":"%s","labels":%s}]' ;;
+  "ready --assignee=worker-bead --json --limit 0") printf '[{"id":"own-parked-bead","title":"%s","labels":%s}]' ;;
   *) printf '[]' ;;
 esac
 `, title, tc.labels)
@@ -1955,7 +1955,7 @@ esac
 func TestEffectiveAssignedReadyQueryForBeadsBD105Compatibility(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	got := a.EffectiveAssignedReadyQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit 0`) {
 		t.Fatalf("EffectiveAssignedReadyQueryForBeads(bd-1.0.5) missing include-ephemeral assigned-ready tier: %q", got)
 	}
 }
@@ -1965,7 +1965,7 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	got := a.EffectiveAssignedInProgressQuery()
 	for _, want := range []string{
 		`"$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"`,
-		`bd list --status in_progress --assignee="$id" --json --limit=20`,
+		`bd list --status in_progress --assignee="$id" --json --limit 0`,
 		`ephemeral=true AND status=in_progress`,
 		// ga-ael6v: the assigned-in-progress ("crash recovery") tier must apply
 		// the same pool:refused:*/held filter as the routed-pool tier
@@ -1990,7 +1990,7 @@ func TestEffectiveAssignedInProgressQueryDefault(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"assigned-in-progress","ephemeral":true}]' ;;
   *) printf '[]' ;;
 esac
 `)
@@ -2016,7 +2016,7 @@ func TestEffectiveAssignedInProgressQuerySkipsPoolRefusedBead(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-9ae7o","labels":["pool:refused:engine-rebuild-required"]}]' ;;
   "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
   *) printf '[]' ;;
 esac
@@ -2056,7 +2056,7 @@ func TestEffectiveAssignedInProgressQuerySurfacesParkedOwnBead(t *testing.T) {
 			bdScript := fmt.Sprintf(`#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"own-parked-bead","labels":%s}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"own-parked-bead","labels":%s}]' ;;
   "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
   *) printf '[]' ;;
 esac
@@ -2089,7 +2089,7 @@ func TestEffectiveAssignedInProgressQuerySkipsNoAutoDispatchBead(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "list --status in_progress --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
+  "list --status in_progress --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
   "query --json ephemeral=true AND status=in_progress --limit=0") printf '[]' ;;
   *) printf '[]' ;;
 esac
@@ -2113,7 +2113,7 @@ func TestEffectiveAssignedReadyQuerySkipsNoAutoDispatchBead(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=worker-bead --json --limit=20") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
+  "ready --assignee=worker-bead --json --limit 0") printf '[{"id":"ga-vjlwso","labels":["pilot:no-auto-dispatch"]}]' ;;
   *) printf '[]' ;;
 esac
 `)
@@ -2428,12 +2428,12 @@ func TestEffectiveAssignedReadyQueryControlDispatcherClaimsLegacyAssignedWork(t 
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --assignee=gascity--control-dispatcher --json --limit=20"|\
-  "ready --assignee=gascity/control-dispatcher --json --limit=20")
+  "ready --assignee=gascity--control-dispatcher --json --limit 0"|\
+  "ready --assignee=gascity/control-dispatcher --json --limit 0")
     printf '[]'
     ;;
-  "ready --assignee=gascity--workflow-control --json --limit=20"|\
-  "ready --assignee=gascity/workflow-control --json --limit=20")
+  "ready --assignee=gascity--workflow-control --json --limit 0"|\
+  "ready --assignee=gascity/workflow-control --json --limit 0")
     printf '[{"id":"ga-legacy-ready"}]'
     ;;
   *)
@@ -2563,8 +2563,8 @@ case "$*" in
   "list --status in_progress --assignee=gascity/workflow-control --json --limit=1")
     printf '[]'
     ;;
-  "ready --assignee=gascity--workflow-control --json --limit=20"|\
-  "ready --assignee=gascity/workflow-control --json --limit=20")
+  "ready --assignee=gascity--workflow-control --json --limit 0"|\
+  "ready --assignee=gascity/workflow-control --json --limit 0")
     printf '[{"id":"ga-legacy-ready"}]'
     ;;
   *)
@@ -2582,13 +2582,13 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -2617,7 +2617,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20")
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0")
     printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
     ;;
   *)
@@ -2655,6 +2655,11 @@ func TestGeneratedBdReadCommandsStayBd104StorageCompatible(t *testing.T) {
 	}
 }
 
+// TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority pins the FETCH:
+// the routed tier asks bd for `--sort oldest --limit 0`, so a lone old P2 bead
+// is still found. The name predates ga-9t9acg.7 and no longer describes the
+// pick: the order the dog takes is priority > type > age, applied by
+// work-order.sh after the fetch (work_order_pick_test.go asserts it).
 func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	out := runEffectiveWorkQuery(t, a, map[string]string{
@@ -2662,7 +2667,7 @@ func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
     ;;
   *)
@@ -2678,24 +2683,35 @@ esac
 	}
 }
 
-// TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead is the ga-w4k2z
-// regression: a bead that keeps getting reclaimed has its updated_at bumped by
-// every reclaim but NOT its created_at, so a naive .[0:1] off the
-// created_at-sorted survivor list re-offers the exact same poisoned head to
-// every dog that polls, starving every newer bead behind it forever (measured
-// live: 13 candidates spanning ~36h, only the head ever served). The fix
-// re-ranks survivors by updated_at before taking the head, so a bead that was
-// JUST reclaimed (updated_at freshly bumped) sorts behind a bead nobody has
-// touched since creation (updated_at == created_at), even though the
+// TestEffectiveWorkQueryRoutedQueueFallbackSkipsRecentlyReclaimedHead pins the
+// FALLBACK order of tier 1: the ga-w4k2z least-recently-updated re-rank that
+// wo_pick applies when work-order.sh is missing or cannot tell. It is NOT the
+// order production uses with the lib present, so the test says so in its env:
+// WORK_ORDER_LIB names a file that does not exist.
+//
+// The ga-w4k2z regression it keeps: a bead that keeps getting reclaimed has its
+// updated_at bumped by every reclaim but NOT its created_at, so a naive .[0:1]
+// off the created_at-sorted survivor list re-offers the exact same poisoned
+// head to every dog that polls, starving every newer bead behind it forever
+// (measured live: 13 candidates spanning ~36h, only the head ever served). The
+// fallback re-ranks survivors by updated_at before taking the head, so a bead
+// that was JUST reclaimed (updated_at freshly bumped) sorts behind a bead
+// nobody has touched since creation (updated_at == created_at), even though the
 // just-reclaimed bead is older by created_at.
-func TestEffectiveWorkQueryRoutedQueueSkipsRecentlyReclaimedHead(t *testing.T) {
+//
+// With the lib present the same fixture (no pilot:reclaim-count label) picks
+// "older-just-reclaimed": updated_at alone does not demote under the `reclaim`
+// age rule. work_order_pick_test.go asserts that ("touched but never reclaimed
+// keeps its place").
+func TestEffectiveWorkQueryRoutedQueueFallbackSkipsRecentlyReclaimedHead(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	out := runEffectiveWorkQuery(t, a, map[string]string{
 		"GC_SESSION_ORIGIN": "ephemeral",
+		"WORK_ORDER_LIB":    filepath.Join(t.TempDir(), "no-such-work-order.sh"),
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"older-just-reclaimed","priority":2,"created_at":"2026-05-20T06:09:30Z","updated_at":"2026-05-20T09:59:00Z"},{"id":"newer-never-touched","priority":2,"created_at":"2026-05-20T08:00:00Z","updated_at":"2026-05-20T08:00:00Z"}]'
     ;;
   *)
@@ -2718,10 +2734,10 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"older-fallback","priority":2,"created_at":"2026-05-20T06:09:30Z","metadata":{"gc.kind":"workflow","gc.run_target":"hello-world/worker"}}]'
     ;;
   *)
@@ -2755,7 +2771,7 @@ func TestEffectiveWorkQueryRoutedQueueExcludesStoryWithLiveMoleculeStep(t *testi
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"story-live-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-live"}},{"id":"story-no-molecule","priority":2,"created_at":"2026-08-27T20:00:00Z","metadata":{}}]'
     ;;
   *"list --parent mol-live --status in_progress --json --limit 1"*)
@@ -2787,7 +2803,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithClosedMoleculeStep(t *testin
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"story-closed-molecule","priority":2,"created_at":"2026-08-27T19:00:00Z","metadata":{"molecule_id":"mol-closed"}}]'
     ;;
   *"list --parent mol-closed --status in_progress --json --limit 1"*)
@@ -2817,7 +2833,7 @@ func TestEffectiveWorkQueryRoutedQueueKeepsStoryWithNoMoleculeID(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit 0"*)
     printf '[{"id":"story-plain","priority":2,"created_at":"2026-08-27T19:00:00Z"}]'
     ;;
   *)
@@ -3301,12 +3317,15 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wq := tt.agent.EffectiveWorkQuery()
 			demand := tt.agent.EffectivePoolDemandQuery()
-			// ga-g7yt: the first-row probe now asks for a WINDOW (--limit=20) and
-			// takes the first survivor AFTER the label filter, because --limit=1
-			// then filter is a trap — a parked/held oldest row hides real work
-			// behind it. The shared predicate is still bdReadyPoolDemandShell; only
+			// ga-g7yt: the first-row probe takes the first survivor AFTER the label
+			// filter, because --limit=1 then filter is a trap — a parked/held
+			// oldest row hides real work behind it. ga-9t9acg.7: the probe now
+			// fetches the WHOLE population (--limit 0, bd's "unlimited") instead of
+			// a 20-row window, because the work-order lib orders by priority > type
+			// > age and a window cut by age alone would hide a P0 feature behind 20
+			// older rows. The shared predicate is still bdReadyPoolDemandShell; only
 			// the limit changed.
-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=20", false)
+			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit 0", false)
 			if !strings.Contains(wq, workPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
 			}
@@ -3334,7 +3353,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 					t.Errorf("%s() missing needs-human exact exclusion in %q", hay.name, hay.s)
 				}
 			}
-			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit=20", false)
+			migrationWorkPredicate := bdReadyPoolDemandMigrationShell("--limit 0", false)
 			if !strings.Contains(wq, migrationWorkPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared migration predicate %q in %q", migrationWorkPredicate, wq)
 			}
@@ -6179,6 +6198,18 @@ func runShellWithFakeBd(t *testing.T, shellCmd string, env map[string]string, bd
 
 	cmd := exec.Command("sh", "-c", shellCmd)
 	cmd.Env = []string{"PATH=" + tmp + ":" + os.Getenv("PATH")}
+	// ga-9t9acg.7: wo_pick looks the work-order lib up in WORK_ORDER_LIB, else
+	// GC_CITY_PATH, else GC_CITY. Unless a test names its own lib, point
+	// WORK_ORDER_LIB at a file that does not exist, so every test that goes
+	// through this helper pins the FALLBACK order (the pre-ga-9t9acg.7 pick) on
+	// purpose instead of by the accident of an empty env. The order the rule
+	// gives with the lib present is asserted in work_order_pick_test.go.
+	_, ownLib := env["WORK_ORDER_LIB"]
+	_, ownCityPath := env["GC_CITY_PATH"]
+	_, ownCity := env["GC_CITY"]
+	if !ownLib && !ownCityPath && !ownCity {
+		cmd.Env = append(cmd.Env, "WORK_ORDER_LIB="+filepath.Join(tmp, "no-such-work-order.sh"))
+	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

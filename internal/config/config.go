@@ -3673,6 +3673,116 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 	return `{ ` + query + ` | jq --arg target "$target" ` + shellquote.Quote(filter) + jqStderr + `; } || printf "[]"`
 }
 
+// workOrderLRUFallbackJQ is what routedReadyTierCommand did to its survivors
+// before ga-9t9acg.7 (ga-w4k2z): least-recently-updated first. It is the
+// wo_pick fallback for that tier only — every other tier fell back to bd's own
+// order, i.e. to no re-sort at all (wo_pick's default filter, `.`).
+const workOrderLRUFallbackJQ = `sort_by(.updated_at // .created_at // "")`
+
+// workOrderPickTrustsLib is the one test wo_pick applies before it prints the
+// lib's answer: the lib exited 0 AND its stdout is exactly one JSON document, an
+// array, with as many elements as the input ($wo_n, -1 when the input's length
+// could not be read, which no array matches). It is a constant so the mutation
+// control in work_order_pick_test.go can swap it for the weaker check this
+// replaces (`[ -n "$wo_out" ]`) and prove the fixtures notice.
+const workOrderPickTrustsLib = `[ "$wo_rc" -eq 0 ] && printf "%s" "$wo_out" | jq -es --argjson n "${wo_n:--1}" 'length == 1 and (.[0] | type == "array" and length == $n)' >/dev/null 2>&1`
+
+// workOrderPickFunctionScript defines wo_pick, the ONE shell stage through which
+// every work_query tier picks "which bead first" (ga-9t9acg.7, programme
+// ga-9t9acg). It must be emitted ONCE, ahead of every script that calls
+// workOrderHeadStage: the assembled queries run the assigned tiers before
+// poolDemandFirstRowFunctionScript is even defined, so the definition cannot
+// live inside any one tier.
+//
+// wo_pick reads ONE JSON array on stdin (the tier's filtered survivors) and
+// writes the same array ordered by the town rule — priority > type (feature
+// first) > age — by calling work_order_sort from
+// packs/town-deltas/assets/scripts/work-order.sh. Callers take the head.
+//
+// The age is the lib's `reclaim` rule: created_at, except updated_at for a bead
+// carrying pilot:reclaim-count:N with N >= 1. Three consequences, each checked
+// against the lib and inflight-reclaim-guard.py, not assumed:
+//   - the ga-w4k2z LRU (a bead that keeps being reclaimed does not re-take the
+//     head) survives only for beads that carry pilot:reclaim-count;
+//   - updated_at alone no longer demotes a bead. That is what avoids the
+//     ga-oc6knj regression (a bead the Pilot had just dispatched had its
+//     updated_at bumped and went to the back), and it is also a change from
+//     the old tier 1, which demoted ANY bead whose updated_at had moved;
+//   - pilot:starvation-count is NOT read. inflight-reclaim-guard.py do_reclaim
+//     stamps it INSTEAD of pilot:reclaim-count for a bead no worker ever
+//     claimed (audit-only, nothing reads it), so such a bead keeps its place.
+//
+// The ordering is the lib's, and the lib can be missing or unable to tell, so
+// wo_pick has three outcomes and never collapses them:
+//   - `[]` or empty in: written back as is, no lib call (the idle poll stays cheap).
+//   - ordered: the lib's array — and only when it exited 0 AND its stdout is
+//     exactly one JSON document, an array, as long as the input. That is the
+//     thing the next stage acts on (`jq '.[0:1]'` takes its head), so it is the
+//     thing checked: "stdout is non-empty" is not enough, because a banner
+//     printed while the lib is sourced (an `echo` left in an edited-in-place
+//     work-order.sh, a BASH_ENV file) or a lib that prints non-JSON before
+//     exiting 2 is non-empty and unusable, and `jq` would turn it into `[]`.
+//     The lib's own `work-order WARN:` lines (a bead whose priority/type/age it
+//     could not read, kept at the end of its class) reach stderr untouched —
+//     this stage never puts 2>/dev/null on them.
+//   - lib not readable, or work_order_sort cannot tell (exit ≠ 0 — the lib's
+//     contract is exit 2 with empty stdout, "I do not know", never "no bead" —
+//     or any stdout that is not that one array): one `work-order WARN:` line on
+//     stderr, then the survivors go through $1 (a jq filter, `.` when omitted)
+//     — the order the tier had before this change. Whatever the lib prints or
+//     returns, it cannot turn a non-empty JSON input into an empty answer. (If
+//     the INPUT is not JSON — bd printing garbage — the fallback prints nothing,
+//     as the query did before this change; the WARN is still written.)
+//
+// The lib is run by `bash -c '. lib && work_order_sort ...'`, never sourced into
+// the sh that runs the query, for two reasons (both reproduced by the
+// ga-9t9acg.7 harness against the real /bin/sh and /bin/dash): a POSIX-mode sh
+// EXITS when `.` cannot open its file, so `. lib 2>/dev/null && ...` would end
+// the whole query before any fallback ran; and the lib is bash (its error paths
+// use $'\n' and ${v:0:200}), which a dash sh answers with "Bad substitution" and
+// exits. In a child bash both failures are just an empty stdout and a non-zero
+// status, which is exactly the "cannot tell" the fallback handles.
+// The lib is found at $WORK_ORDER_LIB, else under $GC_CITY_PATH (then $GC_CITY).
+func workOrderPickFunctionScript() string {
+	return `wo_pick() { ` +
+		`wo_in=$(cat); ` +
+		`case "$wo_in" in ""|"[]") printf "%s" "$wo_in"; return 0;; esac; ` +
+		`wo_lib="${WORK_ORDER_LIB:-}"; ` +
+		`if [ -z "$wo_lib" ]; then wo_root="${GC_CITY_PATH:-}"; [ -n "$wo_root" ] || wo_root="${GC_CITY:-}"; ` +
+		`[ -n "$wo_root" ] && wo_lib="$wo_root/packs/town-deltas/assets/scripts/work-order.sh"; fi; ` +
+		`wo_out=""; ` +
+		`if [ -r "$wo_lib" ]; then ` +
+		// vazio → a lib printed nothing: not trusted, WARN + the previous order;
+		// falhou/ilegível → exit status ≠ 0, a banner or any non-JSON on stdout, more than
+		// one document, or an array whose length is not the input's: same inert result,
+		// never "no bead". What is TRUSTED must be what the next stage ACTS on (a JSON
+		// array that `jq '.[0:1]'` can take the head of), so the check is on that, not on
+		// stdout being non-empty.
+		`wo_out=$(printf "%s" "$wo_in" | bash -c '. "$1" && work_order_sort --age reclaim' wo "$wo_lib"); wo_rc=$?; ` +
+		// vazio/falhou → the input's length stays empty, "${wo_n:--1}" below is -1 and no
+		// output can match it: the lib's answer is not trusted (WARN + previous order).
+		`wo_n=$(printf "%s" "$wo_in" | jq 'length' 2>/dev/null); ` +
+		`if ` + workOrderPickTrustsLib + `; then printf "%s" "$wo_out"; return 0; fi; ` +
+		`echo "work-order WARN: wo_pick: work_order_sort could not tell ($wo_lib); keeping the previous order" >&2; ` +
+		`else echo "work-order WARN: wo_pick: work-order.sh not readable (WORK_ORDER_LIB, else GC_CITY_PATH/GC_CITY + packs/town-deltas/assets/scripts); keeping the previous order" >&2; fi; ` +
+		`printf "%s" "$wo_in" | jq -c "${1:-.}" 2>/dev/null; ` +
+		`}; `
+}
+
+// workOrderHeadStage is the tail every tier ends with: order the survivors with
+// wo_pick, then take the first row. fallbackJQ is wo_pick's fallback filter
+// ("" = leave bd's order alone); see workOrderPickFunctionScript. Callers must
+// have emitted workOrderPickFunctionScript() earlier in the same script, and
+// must have fetched the WHOLE population (--limit 0): a window taken before
+// the order can hide a P0 feature behind 20 older P0 bugs (ga-g7yt).
+func workOrderHeadStage(fallbackJQ string) string {
+	stage := `wo_pick`
+	if fallbackJQ != "" {
+		stage += ` '` + fallbackJQ + `'`
+	}
+	return stage + ` | jq -c '.[0:1]' 2>/dev/null`
+}
+
 // poolDemandFirstRowFunctionScript emits the work_query Tier 3 function: it
 // reads the first ready, unassigned, routed bead for the supplied target,
 // prints it, and exits 0. The caller appends a terminal fallthrough
@@ -3689,17 +3799,23 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 // shape already used for the primary tier (ga-g7yt) and the assigned
 // in-progress tiers (ga-ael6v), for the same reason: slicing before the
 // prefix filter can hide a real candidate behind a filtered-out head.
+//
+// ga-9t9acg.7: all three tiers now fetch the WHOLE population (--limit 0) and
+// end in workOrderHeadStage, so the head is the town rule's first bead
+// (priority > type > age) instead of whatever bd's window or LRU put first. The
+// script this returns CALLS wo_pick and does not define it: every caller emits
+// workOrderPickFunctionScript() ahead of it (see TestWorkOrderPickIsDefinedBeforeEveryUse).
 func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 	return `probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit=20", includeEphemeralReady) + ` 2>/dev/null); ` +
-		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + ` 2>/dev/null); ` +
+		`r=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(20, includeEphemeralReady, true) + `); ` +
-		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`legacy_ephemeral_candidates=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, true) + `); ` +
+		`r=$(printf "%s" "$legacy_ephemeral_candidates" | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`return 1; ` +
 		`}; `
@@ -3737,7 +3853,19 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// but BEFORE the sort_by/.[0:1] slice, for the same filter-then-slice
 	// reason as ga-zgfxx/ga-avvu2 AC1 above — excluding it from the unsliced
 	// survivor set could hide a real candidate behind a filtered-out head.
-	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | jq -c 'sort_by(.updated_at // .created_at // "") | .[0:1]' 2>/dev/null; }`
+	//
+	// ga-9t9acg.7: the LRU re-rank above was priority-blind — a P0 feature sat
+	// behind any older P0 bug — and --limit=20 was a window taken before any
+	// order existed. Now the whole population is fetched (--limit 0; --sort
+	// oldest stays only so the fallback sees the same ties as before) and
+	// wo_pick orders the survivors by the town rule, with the `reclaim` age rule
+	// (updated_at counts only for a bead carrying pilot:reclaim-count>=1; what
+	// that keeps and what it changes is spelled out on workOrderPickFunctionScript).
+	// The vetoes above are untouched; they still run BEFORE the order. When
+	// work-order.sh is missing or cannot tell, wo_pick falls back to the LRU
+	// re-rank above, which is now ONLY that fallback (and says so on stderr).
+	// Requires workOrderPickFunctionScript() in the same script.
+	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit 0", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | ` + workOrderHeadStage(workOrderLRUFallbackJQ) + `; }`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3835,10 +3963,14 @@ func standardAssignedWorkQueryScript(includeEphemeralReady bool) string {
 // of its own parked-but-still-owned bead and double-book itself.
 // --limit=1 widened to 20 for the same reason as routedReadyTierCommand: a
 // filtered-out top row must not hide a real in-progress bead behind it.
+// ga-9t9acg.7: widened again, to the whole population (--limit 0), and the head
+// is taken through wo_pick (town rule: priority > type > age) instead of bd's
+// default order — a session holding several in-progress beads resumes the one
+// the rule puts first. Needs workOrderPickFunctionScript() ahead of it.
 func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$id" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$id" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -3858,10 +3990,12 @@ func standardAssignedInProgressWorkQueryScript(includeEphemeralReady bool) strin
 // --limit=1 widened to 20 for the same
 // reason as routedReadyTierCommand/standardAssignedInProgressWorkQueryScript:
 // a filtered-out top row must not hide real ready work behind it.
+// ga-9t9acg.7: whole population (--limit 0) and wo_pick order, same as the
+// in-progress sibling above; needs workOrderPickFunctionScript() ahead of it.
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$id" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("id", includeEphemeralReady) +
 		`done; `
@@ -3882,7 +4016,7 @@ func legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady bool) 
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd list --status in_progress --assignee="$cand" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd list --status in_progress --assignee="$cand" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedInProgressProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3898,7 +4032,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 		`legacy=""; case "$id" in *control-dispatcher) legacy="${id%control-dispatcher}workflow-control";; esac; ` +
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
-		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit=20 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		`r=$(bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --assignee="$cand" --json --limit 0 2>/dev/null | ` + assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		ephemeralAssignedReadyProbeScript("cand", includeEphemeralReady) +
 		`done; ` +
@@ -3916,7 +4050,7 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralRea
 	_ = includeEphemeralReady
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)]' 2>/dev/null | ` +
-		assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
@@ -3936,7 +4070,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 0)
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null | ` +
-		assignedTierExclusionFilterJQ() + ` 2>/dev/null | jq -c '.[0:1]' 2>/dev/null); ` +
+		assignedTierExclusionFilterJQ() + ` 2>/dev/null | ` + workOrderHeadStage("") + `); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
 
@@ -3948,7 +4082,7 @@ func poolDemandOriginGateScript() string {
 }
 
 func routedPoolWorkQueryProbeScript(includeEphemeralReady bool, targetCount int) string {
-	script := poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
+	script := workOrderPickFunctionScript() + poolDemandOriginGateScript() + poolDemandFirstRowFunctionScript(includeEphemeralReady)
 	for i := 1; i <= targetCount; i++ {
 		script += fmt.Sprintf(`probe_pool_demand "$%d"; `, i)
 	}
@@ -4014,14 +4148,16 @@ func (a *Agent) effectiveWorkQuery(includeEphemeralReady bool) string {
 	target := a.poolDemandTarget()
 	legacyTarget := legacyWorkflowControlQualifiedName(target)
 	if legacyTarget == "" {
-		script := standardAssignedWorkQueryScript(includeEphemeralReady) +
+		script := workOrderPickFunctionScript() +
+			standardAssignedWorkQueryScript(includeEphemeralReady) +
 			poolDemandOriginGateScript() +
 			poolDemandFirstRowFunctionScript(includeEphemeralReady) +
 			`probe_pool_demand "$1"; ` +
 			`printf "[]"`
 		return shellquote.Join([]string{"sh", "-c", script, "--", target})
 	}
-	script := legacyControlAssignedWorkQueryScript(includeEphemeralReady) +
+	script := workOrderPickFunctionScript() +
+		legacyControlAssignedWorkQueryScript(includeEphemeralReady) +
 		poolDemandOriginGateScript() +
 		poolDemandFirstRowFunctionScript(includeEphemeralReady) +
 		`probe_pool_demand "$1"; ` +
@@ -4050,9 +4186,9 @@ func (a *Agent) effectiveAssignedInProgressQuery(includeEphemeralReady bool) str
 	}
 	target := a.poolDemandTarget()
 	if legacyWorkflowControlQualifiedName(target) != "" {
-		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+		return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + legacyControlAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 	}
-	return shellquote.Join([]string{"sh", "-c", standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+	return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + standardAssignedInProgressWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 }
 
 // EffectiveAssignedReadyQuery returns the assigned-ready-only command for
@@ -4075,9 +4211,9 @@ func (a *Agent) effectiveAssignedReadyQuery(includeEphemeralReady bool) string {
 	}
 	target := a.poolDemandTarget()
 	if legacyWorkflowControlQualifiedName(target) != "" {
-		return shellquote.Join([]string{"sh", "-c", legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+		return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 	}
-	return shellquote.Join([]string{"sh", "-c", standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
+	return shellquote.Join([]string{"sh", "-c", workOrderPickFunctionScript() + standardAssignedReadyWorkQueryScript(includeEphemeralReady) + `printf "[]"`})
 }
 
 // EffectiveRoutedPoolQuery returns the routed-pool-only command for prompt
