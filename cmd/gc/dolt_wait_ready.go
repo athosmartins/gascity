@@ -14,6 +14,25 @@ type managedDoltWaitReadyReport struct {
 	DeletedInodes bool
 }
 
+// managedDoltWaitReadyProbeFn is the readiness probe waitForManagedDoltReady
+// and confirmManagedDoltStillReady poll on every retry. It must never spawn a
+// `dolt` CLI subprocess: this loop retries every 500ms for up to the
+// caller's timeout (30s from gc-beads-bd.sh's ensure-ready op, which runs on
+// every single bd/gc bd invocation), and each successful poll already pays
+// for it twice (the probe itself, then confirmManagedDoltStillReady's
+// recheck). managedDoltQueryProbe forks a `dolt` CLI subprocess whenever
+// GC_DOLT_PASSWORD is empty, which is this city's default for a local
+// managed server — measured at ~120 short-lived `dolt` processes in ~80s,
+// correlated with a Dolt server death under load (ga-0y849e / ga-xyhl9d).
+// managedDoltQueryProbeDirect uses the shared doltpool connection (bounded,
+// reused across calls) and already runs unconditionally with an empty
+// password elsewhere in production (dolt_project_id.go,
+// beads_provider_lifecycle.go), so there is no CLI-fallback reason to keep
+// here. A package var (not a hardcoded call) so tests can stub it without a
+// live Dolt server, matching the existing *DirectFn pattern in
+// dolt_sql_health.go.
+var managedDoltWaitReadyProbeFn = managedDoltQueryProbeDirect
+
 func waitForManagedDoltReady(cityPath, host, port, user string, pid int, timeout time.Duration, checkDeleted bool) (managedDoltWaitReadyReport, error) {
 	report := managedDoltWaitReadyReport{}
 	if pid <= 0 {
@@ -47,7 +66,7 @@ func waitForManagedDoltReady(cityPath, host, port, user string, pid int, timeout
 			return report, fmt.Errorf("pid %d holds deleted data inodes under %s", pid, dataDir)
 		}
 		if managedDoltTCPReachable(host, port) {
-			if err := managedDoltQueryProbe(host, port, user); err == nil {
+			if err := managedDoltWaitReadyProbeFn(host, port, user); err == nil {
 				if stable, stableErr := confirmManagedDoltStillReady(cityPath, host, port, user, pid, checkDeleted, time.Second); stableErr == nil && stable {
 					report.Ready = true
 					return report, nil
@@ -80,7 +99,7 @@ func confirmManagedDoltStillReady(cityPath, host, port, user string, pid int, ch
 	if !managedDoltTCPReachable(host, port) {
 		return false, nil
 	}
-	if err := managedDoltQueryProbe(host, port, user); err != nil {
+	if err := managedDoltWaitReadyProbeFn(host, port, user); err != nil {
 		return false, nil
 	}
 	return true, nil
