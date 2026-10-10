@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -794,6 +795,142 @@ func TestDefaultScaleCheckCountsExcludesVetoLabeledCronPoolDemand(t *testing.T) 
 	}
 	if got := counts["cat"]; got != 0 {
 		t.Fatalf("defaultScaleCheckCounts[%q] = %d, want 0 for veto-labeled gc.pool_demand wisp", "cat", got)
+	}
+}
+
+// scaleCheckCountForRoutedBead runs one open, unassigned bead routed to
+// gastown.dog through the real default scale_check (Source 1, Ready()) and
+// returns what the supervisor would count for that template. The ga-wtzrho
+// cases below all need exactly this and nothing else.
+func scaleCheckCountForRoutedBead(t *testing.T, b beads.Bead) int {
+	t.Helper()
+	const template = "gastown.dog"
+	if b.Type == "" {
+		b.Type = "task"
+	}
+	b.Status = "open"
+	b.Metadata = map[string]string{"gc.routed_to": template}
+	backing := beads.NewMemStore()
+	if _, err := backing.Create(b); err != nil {
+		t.Fatalf("create bead %q: %v", b.Title, err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gastown",
+		store:    cache,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	return counts[template]
+}
+
+// ga-wtzrho: pilot:text-veto:<slug> is a veto the dog pool's own probe honors
+// (poolDemandLabelFilterJQ, ga-42mlf) but poolDemandBeadVetoed did not, so a
+// bead carrying it was refused by every dog and still counted as fresh demand.
+// Measured live 2026-09-26: ga-a9zz5y (open, unassigned, routed to gastown.dog
+// since 2026-09-20, label pilot:text-veto:diagnostic-only-text-pattern) was the
+// only bead counted on 715 supervisor ticks replayed from 09/25-09/26, and 74
+// dog sessions spawned in the 10.7 h of 09/26 claimed nothing and drained. Red
+// on pre-fix HEAD (count 1, want 0).
+func TestDefaultScaleCheckCountsExcludesPilotTextVetoPrefixVeto(t *testing.T) {
+	for _, label := range []string{
+		"pilot:text-veto:diagnostic-only-text-pattern",
+		"pilot:text-veto:engine-rebuild-text-pattern",
+		"pilot:text-veto:compliance-marker-text-pattern",
+	} {
+		got := scaleCheckCountForRoutedBead(t, beads.Bead{
+			Title:  "vetoed by the Pilot on its text",
+			Labels: []string{"ctx:ready", "exec:auto", label},
+		})
+		if got != 0 {
+			t.Errorf("defaultScaleCheckCounts = %d, want 0 for a bead labeled %q (every dog probe refuses it)", got, label)
+		}
+	}
+}
+
+// ga-wtzrho: the probe also drops titles starting with "EPIC"/"ÉPICO" followed
+// by ':' or whitespace (ga-7ha7g) and everything of issue_type epic
+// (--exclude-type=epic). Neither was mirrored by the engine, and readyExcludeTypes
+// does not list epic, so both were counted as demand no dog would take.
+func TestDefaultScaleCheckCountsExcludesEpicTitledAndEpicTypedBeads(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		bead beads.Bead
+		want int
+	}{
+		{"EPIC colon title", beads.Bead{Title: "EPIC: migrar crew GT"}, 0},
+		{"epic lowercase whitespace title", beads.Bead{Title: "epic migrar crew"}, 0},
+		{"ÉPICO colon title", beads.Bead{Title: "ÉPICO: cobertura de testes"}, 0},
+		{"épico lowercase whitespace title", beads.Bead{Title: "épico cobertura"}, 0},
+		{"issue_type epic", beads.Bead{Title: "plain title", Type: "epic"}, 0},
+		// Anchored at the start with a delimiter, like the probe: a title that
+		// only mentions "epic" must still count.
+		{"epic mid-sentence", beads.Bead{Title: "bug: EPIC titles leak into demand"}, 1},
+		{"epic without delimiter", beads.Bead{Title: "Epic-level cleanup"}, 1},
+		{"epicenter", beads.Bead{Title: "EPICENTER dashboard"}, 1},
+	} {
+		if got := scaleCheckCountForRoutedBead(t, tc.bead); got != tc.want {
+			t.Errorf("%s: defaultScaleCheckCounts = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// ga-wtzrho: the class guard. "Keep in sync with poolDemandLabelFilterJQ" was
+// a comment, and the comment is what let pilot:text-veto drift out for six
+// days. This reads the veto surface out of the dog's REAL rendered work query
+// (the pool-demand tier only: the assigned tiers above it deliberately use a
+// narrower set) and requires poolDemandBeadVetoed to veto everything the probe
+// vetoes. It is one-directional on purpose: the engine additionally vetoes the
+// in-flight labels, which the probe does not need.
+//
+// Not mirrored, and not checked here: moleculeLiveStepFilterShell (a bead whose
+// molecule has an in-progress step). It needs a store query per bead, which a
+// pure predicate cannot do.
+func TestPoolDemandVetoMirrorsWorkerProbe(t *testing.T) {
+	work := (&config.Agent{Name: "dog"}).EffectiveWorkQuery()
+	idx := strings.Index(work, "probe_pool_demand()")
+	if idx < 0 {
+		t.Fatalf("EffectiveWorkQuery() has no probe_pool_demand function: %q", work)
+	}
+	probe := work[idx:]
+	now := time.Now().UTC()
+
+	exact := regexp.MustCompile(`--exclude-label "([^"]+)"`).FindAllStringSubmatch(probe, -1)
+	if len(exact) == 0 {
+		t.Fatalf("no --exclude-label found in the pool-demand probe: %q", probe)
+	}
+	for _, m := range exact {
+		if !poolDemandBeadVetoed(beads.Bead{Labels: []string{m[1]}}, now) {
+			t.Errorf("the dog probe excludes label %q but the engine's scale_check would still count it", m[1])
+		}
+	}
+
+	prefixes := regexp.MustCompile(`startswith\("([^"]+)"\)`).FindAllStringSubmatch(probe, -1)
+	if len(prefixes) == 0 {
+		t.Fatalf("no startswith(...) veto found in the pool-demand probe: %q", probe)
+	}
+	for _, m := range prefixes {
+		prefix := m[1]
+		// The timed hold needs a numeric epoch; it has its own tests
+		// (TestDefaultScaleCheckCounts*PilotHeldUntilVeto).
+		if prefix == "pilot:held-until:" {
+			continue
+		}
+		if !poolDemandBeadVetoed(beads.Bead{Labels: []string{prefix + "parity-slug"}}, now) {
+			t.Errorf("the dog probe vetoes label prefix %q but the engine's scale_check would still count it", prefix)
+		}
+	}
+
+	if strings.Contains(probe, "--exclude-type=epic") && !poolDemandBeadVetoed(beads.Bead{Type: "epic"}, now) {
+		t.Error("the dog probe passes --exclude-type=epic but the engine's scale_check would still count an epic")
+	}
+	if strings.Contains(probe, "EPIC|ÉPICO") && !poolDemandBeadVetoed(beads.Bead{Title: "EPIC: parity"}, now) {
+		t.Error("the dog probe drops EPIC:/ÉPICO: titles but the engine's scale_check would still count one")
 	}
 }
 
