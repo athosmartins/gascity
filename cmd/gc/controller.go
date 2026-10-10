@@ -656,7 +656,34 @@ func (r *configWatchRegistrar) addOne(path string, done <-chan struct{}) bool {
 		fmt.Fprintf(r.stderr, "config watcher: cannot watch %s: %v\n", path, err) //nolint:errcheck // best-effort stderr
 		return false
 	}
+	r.removeIgnoredChildren(path)
 	return true
+}
+
+// removeIgnoredChildren undoes a kqueue-only side effect of watcher.Add on a
+// directory: to emulate inotify's per-file create/remove events, fsnotify's
+// kqueue backend (macOS/BSD) opens and individually watches every direct
+// child of a newly-added directory (see fsnotify's watchDirectoryFiles),
+// regardless of whether that child is itself excluded by
+// shouldIgnoreConfigWatchEvent. Those per-child watches hold one read fd
+// each for as long as the watcher lives, so an excluded child such as
+// .dolt-backup — high-churn Dolt backup data, never config — accumulates
+// fds it has no business holding. inotify (Linux) only opens one fd for
+// the directory itself, so this is a no-op there. Remove() errors are
+// swallowed: the child may legitimately not have been auto-watched
+// (permission denied, socket/pipe — see fsnotify addWatch).
+func (r *configWatchRegistrar) removeIgnoredChildren(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		child := filepath.Join(dir, e.Name())
+		if !shouldIgnoreConfigWatchEvent(child) {
+			continue
+		}
+		_ = r.watcher.Remove(child) //nolint:errcheck // best-effort: child may not have been auto-watched
+	}
 }
 
 func (r *configWatchRegistrar) markRecursiveRoot(root string) {
@@ -838,12 +865,16 @@ func shouldIgnoreConfigWatchEvent(path string) bool {
 	}
 	sepGC := string(filepath.Separator) + ".gc"
 	sepBeads := string(filepath.Separator) + ".beads"
+	sepDoltBackup := string(filepath.Separator) + ".dolt-backup"
 	return clean == ".gc" ||
 		clean == ".beads" ||
+		clean == ".dolt-backup" ||
 		strings.HasSuffix(clean, sepGC) ||
 		strings.HasSuffix(clean, sepBeads) ||
+		strings.HasSuffix(clean, sepDoltBackup) ||
 		strings.Contains(clean, sepGC+string(filepath.Separator)) ||
-		strings.Contains(clean, sepBeads+string(filepath.Separator))
+		strings.Contains(clean, sepBeads+string(filepath.Separator)) ||
+		strings.Contains(clean, sepDoltBackup+string(filepath.Separator))
 }
 
 // reloadResult holds the result of a config reload attempt.
