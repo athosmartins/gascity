@@ -25,8 +25,47 @@ const defaultCacheTTL = 2 * time.Second
 // sessions and logs a degraded warning.
 const defaultStaleTTL = 30 * time.Second
 
-// fetchTimeout is the hard timeout for a single runtime-state fetch.
+// fetchTimeout is the base timeout for a single runtime-state fetch. While
+// refreshes keep coming back degraded it grows (see fetchTimeoutFor): a fixed
+// 3s budget is exactly what a loaded host cannot meet, and repeating it every
+// few seconds only adds the ps load that makes it fail (ga-4ytmas).
 const fetchTimeout = 3 * time.Second
+
+// maxFetchTimeout caps the adaptive fetch timeout.
+const maxFetchTimeout = 20 * time.Second
+
+// maxDegradedStreak bounds the degraded-refresh counter. fetchTimeoutFor
+// reaches maxFetchTimeout well before it; the cap only keeps the number
+// small enough to decay back to the base timeout within a few good fetches.
+const maxDegradedStreak = 8
+
+// processRetryBase and processRetryMax bound the backoff between attempts to
+// read the process table after a failed one (see tmuxFetcher.processSnapshot).
+const (
+	processRetryBase = 5 * time.Second
+	processRetryMax  = 2 * time.Minute
+)
+
+// fetchTimeoutFor returns the fetch timeout after streak consecutive degraded
+// refreshes (a failed fetch, or a fetch whose process snapshot was unreadable):
+// the base timeout doubled per step, capped at maxFetchTimeout (3s, 6s, 12s, 20s).
+func fetchTimeoutFor(streak int) time.Duration {
+	d := fetchTimeout
+	for i := 0; i < streak && d < maxFetchTimeout; i++ {
+		d *= 2
+	}
+	return min(d, maxFetchTimeout)
+}
+
+// processRetryDelay returns how long to leave the process table alone after
+// failures consecutive failed reads: 5s, 10s, 20s ... capped at 2m.
+func processRetryDelay(failures int) time.Duration {
+	d := processRetryBase
+	for i := 1; i < failures && d < processRetryMax; i++ {
+		d *= 2
+	}
+	return min(d, processRetryMax)
+}
 
 // StateFetcher abstracts tmux subprocess calls for testability.
 type StateFetcher interface {
@@ -62,6 +101,11 @@ type processSnapshot struct {
 type runtimeStateSnapshot struct {
 	Sessions  map[string]sessionRuntimeState
 	Processes processSnapshot
+	// ProcessesUnknown is true when tmux answered but the process table could
+	// not be read (ps killed at the fetch timeout, or deliberately skipped
+	// while backing off after such a failure). Sessions is still exact;
+	// Processes is empty and means "not looked at", never "no processes".
+	ProcessesUnknown bool
 }
 
 // StateCache caches tmux runtime state to avoid spawning N subprocess calls per
@@ -74,10 +118,14 @@ type StateCache struct {
 	lastError  error
 	dirty      bool   // set by Invalidate(); cleared on successful refresh
 	generation uint64 // advanced by invalidation/eviction to reject stale refreshes
-	ttl        time.Duration
-	staleTTL   time.Duration
-	sf         singleflight.Group
-	fetcher    StateFetcher
+	// degradedStreak counts recent refreshes that failed or came back with an
+	// unreadable process table; it sizes the next fetch timeout and halves on
+	// every fully successful refresh.
+	degradedStreak int
+	ttl            time.Duration
+	staleTTL       time.Duration
+	sf             singleflight.Group
+	fetcher        StateFetcher
 }
 
 // NewStateCache creates a new cache with the given fetcher and TTL.
@@ -92,7 +140,9 @@ func NewStateCache(fetcher StateFetcher, ttl time.Duration) *StateCache {
 
 // IsRunning reports whether the named session exists in the cached set.
 // If the cache is stale, a refresh is triggered (coalesced via singleflight).
-// On refresh failure, the last-known-good cache is preserved up to staleTTL.
+// On refresh failure, the last-known-good cache is preserved up to staleTTL;
+// past that it reads false for every session, so a caller acting on false must
+// consult Uncertain() first.
 func (c *StateCache) IsRunning(name string) bool {
 	state := c.currentState()
 	session, ok := state.Sessions[name]
@@ -100,28 +150,34 @@ func (c *StateCache) IsRunning(name string) bool {
 }
 
 // Uncertain reports whether the cache currently has no trustworthy session
-// data because it has never completed a successful fetch and the most
-// recent attempt failed. This is the "read error" third state that
+// data: the most recent refresh failed and there is no last-known-good
+// snapshot young enough to serve — either none was ever fetched, or the last
+// good one has aged past staleTTL. This is the "read error" third state that
 // IsRunning/ProcessAlive cannot express: they collapse it to false, which is
 // the same value a genuinely absent session produces.
 //
-// For a session with prior known-good data, that collapse is safe: fetchedAt
-// is preserved on failure, so currentState keeps serving the last-known-good
-// snapshot for up to staleTTL before reporting false. But a session that has
-// never completed a successful fetch — e.g. one still in the "creating"
-// state, whose very first liveness check races a transient fetch failure —
-// gets none of that grace: fetchedAt.IsZero() sends currentState straight to
-// the empty-snapshot branch on the first failed attempt. Callers deciding
-// whether to treat "not running" as confirmed must check this first.
+// Within staleTTL a failed refresh is harmless: fetchedAt is preserved, so
+// currentState keeps serving the last-known-good snapshot. Two cases get no
+// such grace, and callers deciding whether to treat "not running" as
+// confirmed must check this first:
+//   - a session that has never completed a successful fetch (e.g. one still in
+//     the "creating" state, whose very first liveness check races a transient
+//     fetch failure): fetchedAt.IsZero() sends currentState straight to the
+//     empty-snapshot branch on the first failed attempt;
+//   - a host that stays too loaded to answer for longer than staleTTL
+//     (ga-4ytmas: ~3s `ps` kills for 30+ minutes): the old snapshot expires and
+//     every session starts reading as gone while tmux still has it.
 func (c *StateCache) Uncertain() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.fetchedAt.IsZero() && c.lastError != nil
+	return c.lastError != nil && (c.fetchedAt.IsZero() || time.Since(c.fetchedAt) > c.staleTTL)
 }
 
 // ProcessAlive reports whether the named session has a process matching one of
 // processNames according to the cached runtime snapshot. An empty processNames
-// slice preserves Provider.ProcessAlive's "no check possible" behavior.
+// slice preserves Provider.ProcessAlive's "no check possible" behavior. When the
+// snapshot could not read the process table (ProcessesUnknown) a live session
+// reads as alive: "could not look" must not be reported as "no such process".
 func (c *StateCache) ProcessAlive(name string, processNames []string) bool {
 	if len(processNames) == 0 {
 		return true
@@ -189,12 +245,13 @@ func (c *StateCache) EvictSession(name string) {
 // last-known-good cache is preserved and the error is logged.
 func (c *StateCache) refresh() {
 	_, _, _ = c.sf.Do("refresh", func() (interface{}, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-		defer cancel()
-
 		c.mu.RLock()
 		startGeneration := c.generation
+		timeout := fetchTimeoutFor(c.degradedStreak)
 		c.mu.RUnlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
 
 		start := time.Now()
 		state, err := c.fetcher.FetchState(ctx)
@@ -204,12 +261,20 @@ func (c *StateCache) refresh() {
 			log.Printf("tmux state cache: refresh failed in %v: %v", elapsed, err)
 			c.mu.Lock()
 			c.lastError = err
+			c.degradedStreak = min(c.degradedStreak+1, maxDegradedStreak)
 			c.mu.Unlock()
 			// Preserve last-known-good — do NOT update fetchedAt or sessions.
 			return nil, err
 		}
 
 		c.mu.Lock()
+		// Recorded before the generation check: a refresh an invalidation made
+		// obsolete is still evidence of how the host is coping.
+		if state.ProcessesUnknown {
+			c.degradedStreak = min(c.degradedStreak+1, maxDegradedStreak)
+		} else {
+			c.degradedStreak /= 2
+		}
 		if c.generation != startGeneration {
 			c.mu.Unlock()
 			if os.Getenv("GC_LOG_TMUX_CACHE") == "true" {
@@ -235,11 +300,36 @@ func (c *StateCache) refresh() {
 // tmuxFetcher implements StateFetcher using a real Tmux instance.
 type tmuxFetcher struct {
 	tm *Tmux
+
+	// Process-table backoff. After a failed read the table is left alone until
+	// procRetryAt, so a host too loaded to answer `ps` in time is not also
+	// asked every refresh (ga-4ytmas: 2000+ killed ps calls in 33 minutes).
+	procMu       sync.Mutex
+	procFailures int
+	procRetryAt  time.Time
+
+	// Test seams; nil means the real process table and the wall clock.
+	processes func(context.Context) (processSnapshot, error)
+	now       func() time.Time
+}
+
+func (f *tmuxFetcher) clock() time.Time {
+	if f.now != nil {
+		return f.now()
+	}
+	return time.Now()
 }
 
 // FetchState runs one tmux pane snapshot and one process-table snapshot.
 // Sessions where remain-on-exit has kept a dead pane (pane_dead=1) are
 // excluded — they represent exited processes, not running ones.
+//
+// The two halves fail independently. The pane list alone decides which
+// sessions exist; the process table is only needed to see inside a pane. When
+// tmux answered but the process table did not (killed at the fetch timeout on a
+// loaded host, or being left alone during backoff), the result is the pane
+// list plus ProcessesUnknown — never an error, which would discard a good
+// session list and, once staleTTL passed, report every session as gone.
 func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, error) {
 	out, err := f.tm.runCtx(ctx, "list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}\t#{pane_current_command}\t#{pane_pid}")
 	if err != nil {
@@ -278,12 +368,42 @@ func (f *tmuxFetcher) FetchState(ctx context.Context) (runtimeStateSnapshot, err
 		}
 		state.Sessions[name] = session
 	}
-	processes, err := fetchProcessSnapshot(ctx)
-	if err != nil {
-		return runtimeStateSnapshot{}, err
+	processes, ok := f.processSnapshot(ctx)
+	if !ok {
+		state.ProcessesUnknown = true
+		return state, nil
 	}
 	state.Processes = processes
 	return state, nil
+}
+
+// processSnapshot reads the process table, or reports false when it could not:
+// the read failed, or an earlier failure still has the table in backoff. A
+// successful read clears the backoff.
+func (f *tmuxFetcher) processSnapshot(ctx context.Context) (processSnapshot, bool) {
+	f.procMu.Lock()
+	skip := f.clock().Before(f.procRetryAt)
+	f.procMu.Unlock()
+	if skip {
+		return processSnapshot{}, false
+	}
+	fetch := f.processes
+	if fetch == nil {
+		fetch = fetchProcessSnapshot
+	}
+	snapshot, err := fetch(ctx)
+	f.procMu.Lock()
+	defer f.procMu.Unlock()
+	if err != nil {
+		f.procFailures++
+		delay := processRetryDelay(f.procFailures)
+		f.procRetryAt = f.clock().Add(delay)
+		log.Printf("tmux state cache: process snapshot unavailable (%v); serving pane liveness only, retrying in %v", err, delay)
+		return processSnapshot{}, false
+	}
+	f.procFailures = 0
+	f.procRetryAt = time.Time{}
+	return snapshot, true
 }
 
 func (s runtimeStateSnapshot) processAlive(sessionName string, processNames []string) bool {
@@ -300,7 +420,11 @@ func (s runtimeStateSnapshot) processAlive(sessionName string, processNames []st
 			return true
 		}
 	}
-	return false
+	// No pane matched on what is visible without the process table. If the
+	// table was not read, that is "could not look", not "no such process":
+	// calling a live session dead here is what sends it to the zombie/restart
+	// path while the host is merely too busy to answer ps.
+	return s.ProcessesUnknown
 }
 
 func (p paneRuntimeState) processAlive(names map[string]struct{}, processes processSnapshot) bool {

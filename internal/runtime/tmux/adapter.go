@@ -270,10 +270,11 @@ func (p *Provider) IsRunning(name string) bool {
 }
 
 // LivenessUncertain reports whether the provider's session-state cache has
-// no trustworthy data because it has never completed a successful fetch and
-// the most recent attempt failed. See StateCache.Uncertain: callers must
-// check this before treating IsRunning/ProcessAlive's false as a confirmed
-// "not running" for a session with no prior known-good observation.
+// no trustworthy data: the most recent fetch failed and there is no
+// last-known-good snapshot young enough to serve (none was ever fetched, or
+// it aged past staleTTL while fetches kept failing). See StateCache.Uncertain:
+// callers must check this before treating IsRunning/ProcessAlive's false as a
+// confirmed "not running".
 func (p *Provider) LivenessUncertain() bool {
 	return p.cache.Uncertain()
 }
