@@ -2293,6 +2293,7 @@ func executePlannedStartsTraced(
 		}
 		if wakeCount >= maxWakes {
 			for _, candidate := range waveCandidates {
+				markWakeBudgetDeferred(candidate.name(), clk)
 				logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_wake_budget", time.Time{}, time.Time{}, nil)
 			}
 			continue
@@ -2317,6 +2318,7 @@ func executePlannedStartsTraced(
 		for offset := 0; offset < len(ready); {
 			if wakeCount >= maxWakes {
 				for _, candidate := range ready[offset:] {
+					markWakeBudgetDeferred(candidate.name(), clk)
 					logLifecycleOutcome(stderr, "start", wave, candidate.name(), candidate.logicalTemplate(cfg), "deferred_by_wake_budget", time.Time{}, time.Time{}, nil)
 				}
 				break

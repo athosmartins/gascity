@@ -649,6 +649,13 @@ func pendingCreateNeverStartedLeaseExpired(session beads.Bead, clk clock.Clock) 
 	if strings.TrimSpace(session.Metadata["last_woke_at"]) != "" {
 		return false
 	}
+	// A create the per-tick wake budget keeps deferring is waiting for its
+	// turn, not dead. Every consumer of this lease (rollback, heal, the stuck-
+	// creating reaper, the pool-slot sweep) must agree, or one of them closes it
+	// and the replacement joins the back of the queue (ga-4ytmas).
+	if wakeBudgetHoldsPendingCreate(session, clk) {
+		return false
+	}
 	anchor := session.CreatedAt
 	if started, ok := parseRFC3339Metadata(session.Metadata["pending_create_started_at"]); ok {
 		anchor = started
