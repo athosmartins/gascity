@@ -3978,6 +3978,60 @@ func TestPruneDeadQueuedNudges_RetainsItemsWithoutBeadID(t *testing.T) {
 	}
 }
 
+// A dead-letter item with no BeadID has no durable record anywhere else, so the engine keeps it for a
+// bounded window (not forever): measured 2026-10-10 on a live city, 110 of 118 dead items had no BeadID,
+// 108 of them 7-98 days old, in a queue file that WithState reads and rewrites in full.
+func TestPruneDeadQueuedNudges_PrunesBeadlessItemsPastRetention(t *testing.T) {
+	// The fixture holds a bead-backed item, so listQueuedNudges opens a bead store: without the file
+	// provider that starts a real dolt sql-server, which the package's leak guard then fails the run for.
+	t.Setenv("GC_BEADS", "file")
+	dir := t.TempDir()
+	now := time.Now()
+
+	seed := []queuedNudge{
+		{ID: "n-ancient", Agent: "worker", Source: "session", Message: "98 days dead, no bead", DeadAt: now.Add(-98 * 24 * time.Hour)},
+		{ID: "n-eight-days", Agent: "worker", Source: "session", Message: "8 days dead, no bead", DeadAt: now.Add(-8 * 24 * time.Hour)},
+		{ID: "n-six-days", Agent: "worker", Source: "session", Message: "6 days dead, no bead", DeadAt: now.Add(-6 * 24 * time.Hour)},
+		// Cannot tell how old it is: kept (same as the bead-backed rule, which also needs a DeadAt).
+		{ID: "n-no-dead-at", Agent: "worker", Source: "session", Message: "no DeadAt"},
+		// A DeadAt in the future (clock skew) is not old.
+		{ID: "n-future", Agent: "worker", Source: "session", Message: "future DeadAt", DeadAt: now.Add(48 * time.Hour)},
+		// The bead-backed path is untouched: with no store it is retained however old it is.
+		{ID: "n-bead-backed", BeadID: "ga-wisp-x", Agent: "worker", Source: "session", Message: "bead-backed, no store", DeadAt: now.Add(-30 * 24 * time.Hour)},
+	}
+	if err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
+		state.Dead = append(state.Dead, seed...)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed dead items: %v", err)
+	}
+
+	if err := withNudgeQueueState(dir, func(state *nudgeQueueState) error {
+		return pruneDeadQueuedNudges(state, nil, now)
+	}); err != nil {
+		t.Fatalf("pruneDeadQueuedNudges: %v", err)
+	}
+
+	_, _, dead, err := listQueuedNudges(dir, "worker", now)
+	if err != nil {
+		t.Fatalf("listQueuedNudges: %v", err)
+	}
+	got := map[string]bool{}
+	for _, item := range dead {
+		got[item.ID] = true
+	}
+	for _, id := range []string{"n-ancient", "n-eight-days"} {
+		if got[id] {
+			t.Errorf("bead-less dead item %s older than 7 days was retained, want pruned", id)
+		}
+	}
+	for _, id := range []string{"n-six-days", "n-no-dead-at", "n-future", "n-bead-backed"} {
+		if !got[id] {
+			t.Errorf("dead item %s was pruned, want retained", id)
+		}
+	}
+}
+
 func TestEnqueueSupersedes_SameAgentSourceReference(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 	dir := t.TempDir()

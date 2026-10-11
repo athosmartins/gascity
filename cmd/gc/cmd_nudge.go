@@ -44,6 +44,11 @@ const (
 	defaultNudgeWaitIdleTimeout = 30 * time.Second
 )
 
+// A dead-letter item with no BeadID has no bead record to carry its terminal
+// history, so the queue entry is the only record of it. It is kept this long
+// (instead of forever) so the dead bucket cannot grow without bound.
+const defaultQueuedNudgeBeadlessDeadRetention = 7 * 24 * time.Hour
+
 var errNudgeSessionFenceMismatch = errors.New("queued nudge session fence mismatch")
 
 var (
@@ -1947,8 +1952,13 @@ func recoverExpiredInFlightNudges(state *nudgeQueueState, store beads.Store, now
 // pruneDeadQueuedNudges removes dead-letter items older than defaultQueuedNudgeDeadRetention
 // when a durable terminal bead record exists in the store. Items without a confirmed terminal
 // bead are retained so terminal history is not lost if the bead store write failed.
+//
+// An item with no BeadID has no bead record at all, so the rule above can never apply to it;
+// it is removed once its DeadAt is older than defaultQueuedNudgeBeadlessDeadRetention. An item
+// whose age cannot be established (zero DeadAt) is retained.
 func pruneDeadQueuedNudges(state *nudgeQueueState, store beads.Store, now time.Time) error {
 	cutoff := now.Add(-defaultQueuedNudgeDeadRetention)
+	beadlessCutoff := now.Add(-defaultQueuedNudgeBeadlessDeadRetention)
 	filtered := state.Dead[:0]
 	for _, item := range state.Dead {
 		if item.BeadID != "" {
@@ -1989,6 +1999,10 @@ func pruneDeadQueuedNudges(state *nudgeQueueState, store beads.Store, now time.T
 				// Terminal bead confirmed in store — safe to prune once past retention.
 				continue
 			}
+		} else if !item.DeadAt.IsZero() && item.DeadAt.Before(beadlessCutoff) {
+			// No bead record exists, so there is no terminal state to confirm; past the
+			// longer bead-less retention the queue entry is dropped rather than kept forever.
+			continue
 		}
 		filtered = append(filtered, item)
 	}
