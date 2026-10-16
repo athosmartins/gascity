@@ -29,6 +29,8 @@ type startConfig struct {
 	Env                map[string]string `json:"env,omitempty"`
 	ProcessNames       []string          `json:"process_names,omitempty"`
 	Nudge              string            `json:"nudge,omitempty"`
+	PromptSuffix       string            `json:"prompt_suffix,omitempty"`
+	PromptFlag         string            `json:"prompt_flag,omitempty"`
 	ReadyPromptPrefix  string            `json:"ready_prompt_prefix,omitempty"`
 	ReadyDelayMs       int               `json:"ready_delay_ms,omitempty"`
 	PreStart           []string          `json:"pre_start,omitempty"`
@@ -53,6 +55,8 @@ func marshalStartConfig(cfg runtime.Config) ([]byte, error) {
 		Env:                cfg.Env,
 		ProcessNames:       cfg.ProcessNames,
 		Nudge:              cfg.Nudge,
+		PromptSuffix:       cfg.PromptSuffix,
+		PromptFlag:         cfg.PromptFlag,
 		ReadyPromptPrefix:  cfg.ReadyPromptPrefix,
 		ReadyDelayMs:       cfg.ReadyDelayMs,
 		PreStart:           cfg.PreStart,

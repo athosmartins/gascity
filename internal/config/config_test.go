@@ -8769,3 +8769,13 @@ func TestPackDirsForRig(t *testing.T) {
 		t.Fatalf("PackDirsForRig(missing) = %v, want %v", got, want)
 	}
 }
+
+func TestParseSessionRemoteExec(t *testing.T) {
+	cfg, err := Parse([]byte("[workspace]\nname = \"c\"\n\n[session]\nprovider = \"hybrid\"\nremote_match = \"-remote-\"\nremote_exec = \"/city/scripts/gc-session-ssh\"\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Session.RemoteMatch != "-remote-" || cfg.Session.RemoteExec != "/city/scripts/gc-session-ssh" {
+		t.Fatalf("Session = {RemoteMatch:%q RemoteExec:%q}, want the [session] remote_match and remote_exec values", cfg.Session.RemoteMatch, cfg.Session.RemoteExec)
+	}
+}

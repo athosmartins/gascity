@@ -2609,6 +2609,10 @@
         "remote_match": {
           "type": "string",
           "description": "RemoteMatch is a substring pattern for the hybrid provider to route\nsessions to the remote (K8s) backend. Sessions whose names contain\nthis pattern go to K8s; all others stay local (tmux).\nOverridden by the GC_HYBRID_REMOTE_MATCH env var if set."
+        },
+        "remote_exec": {
+          "type": "string",
+          "description": "RemoteExec is the path of a session script (the exec: protocol) that the\nhybrid provider uses as its remote backend instead of K8s: sessions whose\nnames contain RemoteMatch are started, peeked, nudged and stopped through\nit. An \"exec:\" prefix is accepted. Overridden by the GC_HYBRID_REMOTE_EXEC\nenv var if set. When empty the remote backend stays K8s."
         }
       },
       "additionalProperties": false,

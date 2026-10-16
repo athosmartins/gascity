@@ -71,11 +71,19 @@ The `start` operation receives a JSON object on stdin:
   "lifecycle": "one_shot",
   "process_names": ["claude", "node"],
   "nudge": "initial prompt text",
+  "prompt_suffix": "'the role prompt, shell-quoted'",
+  "prompt_flag": "--prompt",
   "pre_start": ["mkdir -p /workspace", "git clone repo /workspace"]
 }
 ```
 
 All fields are optional (omitted when empty).
+
+`prompt_suffix` is the startup prompt **already shell-quoted**, and `prompt_flag`
+(possibly empty) is the CLI flag it goes after. `command` is sent without them:
+the tmux provider appends ` <prompt_flag> <prompt_suffix>` (or ` <prompt_suffix>`
+when there is no flag) to the command it runs, and a script that starts the agent
+itself must do the same, otherwise the agent starts without its role prompt.
 
 ### Startup Hints
 
@@ -144,6 +152,25 @@ responsibility. Session setup commands are the *script's* responsibility
 - **Best-effort interrupt/nudge**: Return 0 even if the session doesn't exist.
 - **Empty = unsupported**: `get-last-activity` returning empty stdout means
   the backend doesn't support activity tracking (zero time in Go).
+
+## As the remote side of the hybrid provider
+
+With `[session] provider = "hybrid"`, sessions whose names contain
+`remote_match` go to a remote backend and all others stay on local tmux. The
+remote backend is K8s by default; set `remote_exec` to a session script (or the
+`GC_HYBRID_REMOTE_EXEC` env var, which wins) and the remote sessions go through
+that script instead, using the protocol above:
+
+```toml
+[session]
+provider     = "hybrid"
+remote_match = "-remote-"
+remote_exec  = "/path/to/gc-session-ssh"   # an "exec:" prefix is accepted
+```
+
+K8s is not constructed when `remote_exec` is set, so a city without a kube
+config can run a hybrid city whose remote side is a script, for example one
+that opens the sessions on another host over ssh.
 
 ## Writing Your Own Script
 

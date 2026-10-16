@@ -1132,3 +1132,70 @@ acp_args = ["acp"]
 		t.Fatalf("WriteFile(city.toml): %v", err)
 	}
 }
+
+// writeRemoteExecScript writes a session script that records "<op> <name>" per call and answers
+// is-running with "true", so a test can tell which backend a hybrid session was routed to.
+func writeRemoteExecScript(t *testing.T) (script, calls string) {
+	t.Helper()
+	dir := t.TempDir()
+	calls = filepath.Join(dir, "calls")
+	script = filepath.Join(dir, "remote-session")
+	body := "#!/bin/sh\necho \"$1 $2\" >> " + calls + "\ncase \"$1\" in is-running) echo true;; esac\nexit 0\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script, calls
+}
+
+func readCalls(t *testing.T, calls string) string {
+	t.Helper()
+	b, err := os.ReadFile(calls)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestNewHybridProvider_RemoteExecRoutesRemoteSessionsToTheScript(t *testing.T) {
+	t.Setenv("GC_HYBRID_REMOTE_MATCH", "")
+	t.Setenv("GC_HYBRID_REMOTE_EXEC", "")
+	script, calls := writeRemoteExecScript(t)
+	sc := config.SessionConfig{Socket: "gc-test-hybrid-remote-exec", RemoteMatch: "-remote-", RemoteExec: script}
+
+	p, err := newHybridProvider(sc, "city", t.TempDir())
+	if err != nil {
+		t.Fatalf("newHybridProvider with remote_exec: %v (a script remote must not need a kube config)", err)
+	}
+	if !p.IsRunning("dog-remote-1") {
+		t.Fatal("IsRunning(dog-remote-1) = false, want the script's answer (true)")
+	}
+	if got := readCalls(t, calls); got != "is-running dog-remote-1\n" {
+		t.Fatalf("script calls = %q, want exactly one is-running for the remote-matching session", got)
+	}
+	if p.IsRunning("dog-local-1") {
+		t.Fatal("IsRunning(dog-local-1) = true: a name that does not match remote_match must stay on local tmux")
+	}
+	if got := readCalls(t, calls); strings.Contains(got, "dog-local-1") {
+		t.Fatalf("script calls = %q: the local session leaked to the remote script", got)
+	}
+}
+
+func TestNewHybridProvider_RemoteExecEnvOverridesConfigAndAcceptsExecPrefix(t *testing.T) {
+	t.Setenv("GC_HYBRID_REMOTE_MATCH", "")
+	cfgScript, cfgCalls := writeRemoteExecScript(t)
+	envScript, envCalls := writeRemoteExecScript(t)
+	t.Setenv("GC_HYBRID_REMOTE_EXEC", "exec:"+envScript)
+	sc := config.SessionConfig{Socket: "gc-test-hybrid-remote-exec", RemoteMatch: "-remote-", RemoteExec: cfgScript}
+
+	p, err := newHybridProvider(sc, "city", t.TempDir())
+	if err != nil {
+		t.Fatalf("newHybridProvider: %v", err)
+	}
+	p.IsRunning("dog-remote-1")
+	if got := readCalls(t, envCalls); got != "is-running dog-remote-1\n" {
+		t.Fatalf("env script calls = %q, want the GC_HYBRID_REMOTE_EXEC script (with its exec: prefix) to win", got)
+	}
+	if got := readCalls(t, cfgCalls); got != "" {
+		t.Fatalf("config script calls = %q, want none: the env var overrides remote_exec", got)
+	}
+}

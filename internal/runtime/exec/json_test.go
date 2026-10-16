@@ -116,3 +116,33 @@ func TestMarshalStartConfig_doesNotLeakSessionFields(t *testing.T) {
 		}
 	}
 }
+
+// The startup prompt (prompt_suffix, shell-quoted, optionally after prompt_flag) is part of what the
+// tmux adapter appends to the command; a script that starts the agent itself needs it on the wire,
+// otherwise the agent would start without its role prompt.
+func TestMarshalStartConfig_promptFields(t *testing.T) {
+	cfg := runtime.Config{
+		Command:      "claude --model sonnet",
+		PromptSuffix: `'you are a dog; it'"'"'s fine'`,
+		PromptFlag:   "--prompt",
+	}
+
+	data, err := marshalStartConfig(cfg)
+	if err != nil {
+		t.Fatalf("marshalStartConfig: %v", err)
+	}
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["prompt_suffix"] != cfg.PromptSuffix {
+		t.Errorf("prompt_suffix = %v, want %q", got["prompt_suffix"], cfg.PromptSuffix)
+	}
+	if got["prompt_flag"] != cfg.PromptFlag {
+		t.Errorf("prompt_flag = %v, want %q", got["prompt_flag"], cfg.PromptFlag)
+	}
+	if got["command"] != cfg.Command {
+		t.Errorf("command = %v, want it untouched (%q): the script appends the prompt, gc does not", got["command"], cfg.Command)
+	}
+}

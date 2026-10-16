@@ -1346,6 +1346,12 @@ type SessionConfig struct {
 	// this pattern go to K8s; all others stay local (tmux).
 	// Overridden by the GC_HYBRID_REMOTE_MATCH env var if set.
 	RemoteMatch string `toml:"remote_match,omitempty"`
+	// RemoteExec is the path of a session script (the exec: protocol) that the
+	// hybrid provider uses as its remote backend instead of K8s: sessions whose
+	// names contain RemoteMatch are started, peeked, nudged and stopped through
+	// it. An "exec:" prefix is accepted. Overridden by the GC_HYBRID_REMOTE_EXEC
+	// env var if set. When empty the remote backend stays K8s.
+	RemoteExec string `toml:"remote_exec,omitempty"`
 }
 
 // SetupTimeoutDuration returns the setup timeout as a time.Duration.

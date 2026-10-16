@@ -936,14 +936,22 @@ func openCityEventsProviderWithConfig(providerConfig func() config.EventsConfig,
 }
 
 // newHybridProvider constructs a composite provider that routes sessions to
-// tmux (local) or k8s (remote) based on session name. The GC_HYBRID_REMOTE_MATCH
-// env var controls which sessions go to k8s. If unset, all sessions route to
-// local tmux.
+// tmux (local) or a remote backend based on session name. The remote backend is
+// k8s, or the session script named by remote_exec / GC_HYBRID_REMOTE_EXEC (the
+// env var wins, an "exec:" prefix is accepted) when one is set. The
+// GC_HYBRID_REMOTE_MATCH env var controls which sessions go remote. If unset,
+// all sessions route to local tmux.
 func newHybridProvider(sc config.SessionConfig, cityName, cityPath string) (runtime.Provider, error) {
 	local := sessiontmux.NewProviderWithConfig(tmuxConfigFromSession(sc, cityName, cityPath))
-	remote, err := sessionk8s.NewProvider()
-	if err != nil {
-		return nil, fmt.Errorf("hybrid: k8s backend: %w", err)
+	var remote runtime.Provider
+	if script := hybridRemoteExecScript(sc); script != "" {
+		remote = sessionexec.NewProvider(script)
+	} else {
+		k8s, err := sessionk8s.NewProvider()
+		if err != nil {
+			return nil, fmt.Errorf("hybrid: k8s backend: %w", err)
+		}
+		remote = k8s
 	}
 	pattern := sc.RemoteMatch
 	if v := os.Getenv("GC_HYBRID_REMOTE_MATCH"); v != "" {
@@ -952,4 +960,14 @@ func newHybridProvider(sc config.SessionConfig, cityName, cityPath string) (runt
 	return sessionhybrid.New(local, remote, func(name string) bool {
 		return pattern != "" && strings.Contains(name, pattern)
 	}), nil
+}
+
+// hybridRemoteExecScript returns the session script that backs the hybrid
+// provider's remote side, or "" when the remote side is k8s.
+func hybridRemoteExecScript(sc config.SessionConfig) string {
+	script := sc.RemoteExec
+	if v := os.Getenv("GC_HYBRID_REMOTE_EXEC"); v != "" {
+		script = v
+	}
+	return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(script), "exec:"))
 }
