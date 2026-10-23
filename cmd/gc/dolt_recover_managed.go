@@ -42,6 +42,11 @@ func recoverManagedDoltProcess(cityPath, host, port, user, logLevel string, time
 	}
 
 	report := managedDoltRecoverReport{}
+	// Recovery stops a running Dolt before it starts a new one; under a hold
+	// it must not even do the stop (ga-3risy2).
+	if hold := readManagedDoltHold(cityPath); hold.Blocks() {
+		return report, managedDoltHoldError(hold)
+	}
 	lockFile, layout, err := openManagedDoltLifecycleLock(cityPath)
 	if err != nil {
 		return report, err

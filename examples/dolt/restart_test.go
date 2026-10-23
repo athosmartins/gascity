@@ -255,3 +255,114 @@ func TestRestartRejectsRemoteHostWithDiagnostic(t *testing.T) {
 		t.Fatalf("restart invoked gc-beads-bd despite remote-host refusal; ops log:\n%s\noutput:\n%s", data, out)
 	}
 }
+
+// installHoldHelperForRestart copies the real dolt-hold.sh next to the fake
+// gc-beads-bd, the way the materialized bd pack ships it.
+func installHoldHelperForRestart(t *testing.T, cityPath, root string) {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join(root, "..", "bd", "assets", "scripts", "dolt-hold.sh"))
+	if err != nil {
+		t.Fatalf("read dolt-hold.sh: %v", err)
+	}
+	dst := filepath.Join(cityPath, ".gc", "system", "packs", "bd", "assets", "scripts", "dolt-hold.sh")
+	if err := os.WriteFile(dst, src, 0o644); err != nil {
+		t.Fatalf("write dolt-hold.sh: %v", err)
+	}
+}
+
+func writeRestartHold(t *testing.T, cityPath, content string) {
+	t.Helper()
+	holdDir := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt")
+	if err := os.MkdirAll(holdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(holdDir, "dolt-hold"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A managed-Dolt hold (ga-3risy2) means Dolt is down on purpose. restart must
+// refuse BEFORE its stop step: refusing at start would already have taken a
+// running server down. --force is for ENOSPC evidence, not for holds.
+func TestRestartRefusesUnderHoldBeforeStopping(t *testing.T) {
+	for _, args := range [][]string{nil, {"--force"}} {
+		name := "plain"
+		if len(args) > 0 {
+			name = strings.Join(args, " ")
+		}
+		t.Run(name, func(t *testing.T) {
+			root := repoRoot(t)
+			cityPath := t.TempDir()
+			bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+			installHoldHelperForRestart(t, cityPath, root)
+			writeRestartHold(t, cityPath, "owner=mayor\nreason=hq table swap\n")
+
+			out, err := runRestartWithEnv(t, cityPath, root, nil, args...)
+			if err == nil {
+				t.Fatalf("gc dolt restart %v succeeded under a hold:\n%s", args, out)
+			}
+			for _, want := range []string{"refused", "on hold", "mayor", "hq table swap"} {
+				if !strings.Contains(string(out), want) {
+					t.Fatalf("output lacks %q:\n%s", want, out)
+				}
+			}
+			if data, readErr := os.ReadFile(bdLog); readErr == nil && strings.TrimSpace(string(data)) != "" {
+				t.Fatalf("restart ran lifecycle ops under a hold: %q", data)
+			}
+		})
+	}
+}
+
+func TestRestartProceedsOnceHoldExpired(t *testing.T) {
+	root := repoRoot(t)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+	installHoldHelperForRestart(t, cityPath, root)
+	writeRestartHold(t, cityPath, "expires_at=1\nowner=mayor\n") // 1970: long gone
+
+	out, err := runRestart(t, cityPath, root, port)
+	if err != nil {
+		t.Fatalf("gc dolt restart refused with an expired hold: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	if got := strings.Join(strings.Fields(string(data)), " "); got != "stop start" {
+		t.Fatalf("expected ops 'stop start' after the hold expired, got %q\n%s", got, out)
+	}
+}
+
+// Without the helper the early check cannot run, and the only thing left
+// between a hold and a running stop is gc-beads-bd start, which refuses AFTER
+// the stop. That is a degraded guard, not a silent one: restart says so on
+// stderr and carries on.
+func TestRestartWarnsWhenHoldHelperIsMissing(t *testing.T) {
+	root := repoRoot(t)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+	// installHoldHelperForRestart deliberately not called.
+
+	out, err := runRestart(t, cityPath, root, port)
+	if err != nil {
+		t.Fatalf("gc dolt restart failed without the hold helper: %v\n%s", err, out)
+	}
+	for _, want := range []string{"dolt-hold.sh", "skipping the early hold check"} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("output lacks %q (a skipped guard must say so):\n%s", want, out)
+		}
+	}
+	data, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	if got := strings.Join(strings.Fields(string(data)), " "); got != "stop start" {
+		t.Fatalf("expected ops 'stop start', got %q\n%s", got, out)
+	}
+}

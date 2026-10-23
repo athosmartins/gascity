@@ -49,6 +49,24 @@ LOG_FILE="${GC_DOLT_LOG_FILE:-$PACK_STATE_DIR/dolt.log}"
 BD_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$GC_BEADS_BD_SCRIPT")" && pwd)"
 . "$BD_SCRIPT_DIR/dolt-enospc.sh"
 
+# A managed-Dolt hold (ga-3risy2) means Dolt is down on purpose. Refuse BEFORE
+# the stop below: gc-beads-bd start would refuse too, but only after the stop
+# had already taken a running server down. --force does not override a hold;
+# remove the hold file instead. The helper is read when present; harnesses
+# that ship only gc-beads-bd skip this early check (and say so) and still get
+# the refusal from gc-beads-bd start.
+if [ -r "$BD_SCRIPT_DIR/dolt-hold.sh" ]; then
+  . "$BD_SCRIPT_DIR/dolt-hold.sh"
+  if dolt_hold_blocks; then
+    echo "gc dolt restart: refused: $DOLT_HOLD_MESSAGE" >&2
+    exit 1
+  fi
+else
+  # A guard that is skipped says so: under a hold, gc-beads-bd start refuses,
+  # but only after the stop below has already taken a running server down.
+  echo "gc dolt restart: warning: $BD_SCRIPT_DIR/dolt-hold.sh is not readable; skipping the early hold check" >&2
+fi
+
 if recovery_should_skip_due_to_enospc; then
   if [ "$force_restart" != "true" ]; then
     echo "gc dolt restart: recent Dolt log shows ENOSPC; refusing restart because it can amplify recovery writes" >&2

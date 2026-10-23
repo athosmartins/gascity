@@ -128,6 +128,11 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 	if err != nil {
 		return managedDoltStartReport{}, err
 	}
+	// Last line of defence behind the call-site checks (ga-3risy2): every
+	// route that spawns the managed Dolt ends here.
+	if hold := readManagedDoltHold(cityPath); hold.Blocks() {
+		return managedDoltStartReport{}, managedDoltHoldError(hold)
+	}
 	if err := checkManagedDoltDiskPreflight(layout.DataDir, doltDiskMinFreeBytes(), doltDiskWarnFreeBytes(), os.Stderr); err != nil {
 		return managedDoltStartReport{}, err
 	}

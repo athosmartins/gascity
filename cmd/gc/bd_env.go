@@ -754,7 +754,17 @@ const recoverManagedBDCommandGateFileName = "recover-managed-bd-trigger.stamp"
 // Fails open (returns true) on any error resolving or touching the gate
 // file: this gate exists to suppress amplification, not to become a new,
 // silent way for recovery to stop happening altogether.
+//
+// The one exception is a managed-Dolt hold (ga-3risy2, dolt_hold.go): while
+// the operator has parked Dolt on purpose, no recovery is allowed. That check
+// comes first and returns false without touching the cooldown stamp, so a
+// refused call spends nothing a real outage will need after the release. An
+// unreadable hold file also refuses; unlike the gate file above, it is an
+// explicit operator signal, so "could not tell" must not start Dolt.
 func recoverManagedBDCommandAllowed(cityPath string) bool {
+	if readManagedDoltHold(cityPath).Blocks() {
+		return false
+	}
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
 		return true

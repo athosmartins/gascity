@@ -1088,6 +1088,13 @@ func healthBeadsProvider(cityPath string) error {
 				if isBreakerOpenError(err) {
 					return err
 				}
+				// Held on purpose (ga-3risy2): an unhealthy managed Dolt is
+				// the expected state, not something to recover. Checked
+				// before the cooldown stamp so a refused attempt does not
+				// spend the window a real outage will need after release.
+				if hold := readManagedDoltHold(cityPath); hold.Blocks() {
+					return fmt.Errorf("%w: %s; health check failed (%w); not recovering", errManagedDoltHeld, hold.Describe(), err)
+				}
 				// Recover backoff: refuse a 2nd recover within
 				// providerRecoverCooldown of the prior one, keyed per
 				// city. This alone breaks the low-RSS restart-loop where

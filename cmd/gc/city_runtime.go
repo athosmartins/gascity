@@ -2717,6 +2717,12 @@ func ensureManagedDoltPublishedForRuntime(
 	if portFn(cityPath) != "" {
 		return
 	}
+	// A stopped Dolt with no published port is exactly what healthFn exists to
+	// recover; under a hold that is the one thing that must not happen (ga-3risy2).
+	if hold := readManagedDoltHold(cityPath); hold.Blocks() {
+		noteManagedDoltHeld(cityPath, stderr, logPrefix, hold)
+		return
+	}
 	if err := healthFn(cityPath); err != nil {
 		fmt.Fprintf(stderr, "%s: managed dolt health preflight: %v\n", logPrefix, err) //nolint:errcheck // best-effort stderr
 	}

@@ -1915,6 +1915,14 @@ op_start() {
         exit 2
     fi
 
+    # A hold is "Dolt is down on purpose" (ga-3risy2). Refuse before anything
+    # is touched: no identity setup, no lock, and no kill of a server that is
+    # running but not reusable. Exit 1 (not 2: the Go side reads 2 as "not
+    # needed", i.e. success).
+    if dolt_hold_blocks; then
+        die "dolt start refused: $DOLT_HOLD_MESSAGE"
+    fi
+
     local gc_helper_bin
     gc_helper_bin=$(resolve_gc_helper_bin)
 
@@ -2686,12 +2694,74 @@ else
     }
 fi
 
+# Managed-Dolt hold (ga-3risy2): a file that says "Dolt is down on purpose,
+# nobody starts it". op_start and op_recover refuse while it holds. Same
+# sibling-helper pattern as dolt-enospc.sh above.
+hold_helper="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/dolt-hold.sh"
+if [ -r "$hold_helper" ]; then
+    . "$hold_helper"
+else
+    # Focused harnesses run this prelude without sibling assets. Production
+    # always has dolt-hold.sh next to this script. This reader is stricter than
+    # the helper, never looser: whatever the helper holds on, it holds on too.
+    # It does not read expiry (the file's mere presence holds, so it can hold
+    # where the helper has released an expired hold), and a path it cannot see
+    # clearly is a hold. Only "the parent is gone" (the nearest ancestor that
+    # exists is a searchable directory) or "the parent is a searchable
+    # directory without the file" releases.
+    dolt_hold_blocks() {
+        _dh_file="${GC_DOLT_HOLD_FILE:-}"
+        if [ -z "$_dh_file" ]; then
+            DOLT_HOLD_MESSAGE="dolt hold: pack state dir unknown, cannot look for the hold file; treating it as a hold"
+            # empty (no path to look at) -> hold; failed -> n/a, nothing is read yet
+            [ -n "${PACK_STATE_DIR:-}" ] || return 0
+            _dh_file="$PACK_STATE_DIR/dolt-hold"
+        fi
+        DOLT_HOLD_MESSAGE="dolt hold file present or unreadable ($_dh_file); fallback reader does not read expiry, remove the file to release it"
+        # empty (no directory named) or failed (dirname) -> hold, never "gone"
+        _dh_dir=$(dirname "$_dh_file") || _dh_dir=""
+        [ -n "$_dh_dir" ] || return 0
+        # [ -e parent ] is false for ENOENT but also for EACCES/ENOTDIR on a
+        # component above the parent, which Go holds on. The parent is gone
+        # only if the nearest ancestor that exists is a searchable directory.
+        if [ ! -e "$_dh_dir" ] && [ ! -h "$_dh_dir" ]; then
+            _dh_anc="$_dh_dir"
+            while [ ! -e "$_dh_anc" ] && [ ! -h "$_dh_anc" ]; do
+                _dh_up=$(dirname "$_dh_anc") || _dh_up=""
+                if [ -z "$_dh_up" ] || [ "$_dh_up" = "$_dh_anc" ]; then
+                    break
+                fi
+                _dh_anc="$_dh_up"
+            done
+            if { [ -e "$_dh_anc" ] || [ -h "$_dh_anc" ]; } && [ -d "$_dh_anc" ] && [ -x "$_dh_anc" ]; then
+                return 1
+            fi
+            return 0
+        fi
+        # The parent is there (a link counts). Unreadable (a broken link, a
+        # regular file, or not searchable) -> hold.
+        if [ ! -d "$_dh_dir" ] || [ ! -x "$_dh_dir" ]; then
+            return 0
+        fi
+        if [ -e "$_dh_file" ] || [ -h "$_dh_file" ]; then
+            return 0
+        fi
+        return 1
+    }
+fi
+
 # op_recover stops the dolt server, restarts it, and verifies health.
 op_recover() {
     local read_only_status
 
     if is_remote; then
         die "recovery not supported for remote dolt servers"
+    fi
+
+    # Recovery stops a running server before it starts a new one; under a
+    # hold it must not do the stop either (ga-3risy2).
+    if dolt_hold_blocks; then
+        die "dolt recovery refused: $DOLT_HOLD_MESSAGE"
     fi
 
     # Skip auto-recovery when dolt has been failing due to disk exhaustion.
