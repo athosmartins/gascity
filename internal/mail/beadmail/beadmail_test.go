@@ -1362,6 +1362,254 @@ func TestReply(t *testing.T) {
 	}
 }
 
+func createReplySession(t *testing.T, store beads.Store, alias, sessionName string) beads.Bead {
+	t.Helper()
+	b, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        alias,
+			"session_name": sessionName,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create session %q: %v", alias, err)
+	}
+	return b
+}
+
+// TestReplyToOwnMessageGoesToOriginalRecipient pins ga-yi067e: replying to a
+// message the replier sent must continue the thread to the person the original
+// was addressed to. Addressing it to the original sender made from == to.
+func TestReplyToOwnMessageGoesToOriginalRecipient(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	sent, err := p.Send("alice", "bob", "Hello", "first message")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply, err := p.Reply(sent.ID, "alice", "", "follow-up")
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if reply.To != "bob" {
+		t.Errorf("Reply To = %q, want %q (original recipient)", reply.To, "bob")
+	}
+	if reply.From != "alice" {
+		t.Errorf("Reply From = %q, want %q", reply.From, "alice")
+	}
+	if reply.ThreadID != sent.ThreadID {
+		t.Errorf("Reply ThreadID = %q, want %q (inherited)", reply.ThreadID, sent.ThreadID)
+	}
+	if reply.ReplyTo != sent.ID {
+		t.Errorf("Reply ReplyTo = %q, want %q", reply.ReplyTo, sent.ID)
+	}
+	b, err := store.Get(reply.ID)
+	if err != nil {
+		t.Fatalf("Get reply: %v", err)
+	}
+	if b.Assignee != "bob" {
+		t.Errorf("reply bead Assignee = %q, want %q", b.Assignee, "bob")
+	}
+	aliceInbox, err := p.Inbox("alice")
+	if err != nil {
+		t.Fatalf("Inbox(alice): %v", err)
+	}
+	if len(aliceInbox) != 0 {
+		t.Errorf("Inbox(alice) = %#v, want empty: the follow-up must not land in the replier's own inbox", aliceInbox)
+	}
+	bobInbox, err := p.Inbox("bob")
+	if err != nil {
+		t.Fatalf("Inbox(bob): %v", err)
+	}
+	if len(bobInbox) != 2 {
+		t.Errorf("Inbox(bob) = %d messages, want original and follow-up", len(bobInbox))
+	}
+}
+
+// TestReplyToOwnMessageMatchesBySessionIDAcrossAliasRename covers the
+// from_session_id half of the match: the replier's display alias changed since
+// the original was sent, so only the stable session ID shows it is the same
+// sender.
+func TestReplyToOwnMessageMatchesBySessionIDAcrossAliasRename(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	witness := createReplySession(t, store, "old-witness", "witness-gc-1")
+	original, err := p.Send("old-witness", "mayor", "Status", "first")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if err := store.SetMetadataBatch(witness.ID, session.UpdatedAliasMetadata(witness.Metadata, "new-witness")); err != nil {
+		t.Fatalf("SetMetadataBatch(alias rename): %v", err)
+	}
+
+	reply, err := p.Reply(original.ID, "new-witness", "", "second")
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if reply.To != "mayor" {
+		t.Fatalf("Reply To = %q, want %q (original recipient)", reply.To, "mayor")
+	}
+	if reply.From != "new-witness" {
+		t.Fatalf("Reply From = %q, want %q", reply.From, "new-witness")
+	}
+}
+
+// TestReplyToOwnMessageMatchesByDisplayWhenOriginalHasNoSessionRoute covers the
+// resolved-from-route half of the match: the original was sent before the
+// sender had a session (so it carries no from_session_id), and the replier now
+// resolves to one. The display address is the only thing both sides share.
+func TestReplyToOwnMessageMatchesByDisplayWhenOriginalHasNoSessionRoute(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	original, err := p.Send("witness", "mayor", "Status", "first")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	createReplySession(t, store, "witness", "witness-gc-1")
+
+	reply, err := p.Reply(original.ID, "witness", "", "second")
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if reply.To != "mayor" {
+		t.Fatalf("Reply To = %q, want %q (original recipient)", reply.To, "mayor")
+	}
+}
+
+// TestReplyToOwnReplyKeepsSessionRouteOfOriginalRecipient replies twice in a
+// row: the second reply answers the replier's own first reply, so it has to go
+// to the same person, carrying that person's stable session route.
+func TestReplyToOwnReplyKeepsSessionRouteOfOriginalRecipient(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	alice := createReplySession(t, store, "alice", "alice-gc-1")
+	createReplySession(t, store, "bob", "bob-gc-1")
+
+	sent, err := p.Send("alice", "bob", "Hello", "first")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	first, err := p.Reply(sent.ID, "bob", "", "first reply")
+	if err != nil {
+		t.Fatalf("first Reply: %v", err)
+	}
+	if first.To != "alice" {
+		t.Fatalf("first Reply To = %q, want %q", first.To, "alice")
+	}
+
+	second, err := p.Reply(first.ID, "bob", "", "second reply")
+	if err != nil {
+		t.Fatalf("second Reply: %v", err)
+	}
+	if second.To != "alice" {
+		t.Fatalf("second Reply To = %q, want %q (the person bob already wrote to)", second.To, "alice")
+	}
+	if second.From != "bob" {
+		t.Fatalf("second Reply From = %q, want %q", second.From, "bob")
+	}
+	b, err := store.Get(second.ID)
+	if err != nil {
+		t.Fatalf("Get second reply: %v", err)
+	}
+	if b.Assignee != alice.ID {
+		t.Errorf("second reply Assignee = %q, want alice's stable session ID %q", b.Assignee, alice.ID)
+	}
+	if b.Metadata[toSessionIDMetadataKey] != alice.ID {
+		t.Errorf("second reply %s = %q, want %q", toSessionIDMetadataKey, b.Metadata[toSessionIDMetadataKey], alice.ID)
+	}
+	if b.Metadata[toDisplayMetadataKey] != "alice" {
+		t.Errorf("second reply %s = %q, want %q", toDisplayMetadataKey, b.Metadata[toDisplayMetadataKey], "alice")
+	}
+	aliceInbox, err := p.Inbox("alice")
+	if err != nil {
+		t.Fatalf("Inbox(alice): %v", err)
+	}
+	if len(aliceInbox) != 2 {
+		t.Errorf("Inbox(alice) = %d messages, want both replies from bob", len(aliceInbox))
+	}
+}
+
+// TestReplyToOwnMessageWithoutRecipientFailsLoudly: if the original has no
+// recipient there is nobody to follow up with, and sending to self is the bug
+// being fixed. The reply must fail and create nothing.
+func TestReplyToOwnMessageWithoutRecipientFailsLoudly(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	original, err := store.Create(beads.Bead{
+		Title:       "Orphan",
+		Description: "no recipient",
+		Type:        "message",
+		From:        "alice",
+		Labels:      []string{"thread:thread-orphan"},
+	})
+	if err != nil {
+		t.Fatalf("Create original: %v", err)
+	}
+
+	_, err = p.Reply(original.ID, "alice", "", "follow-up")
+	if err == nil {
+		t.Fatal("Reply to own message with no recipient succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "no recipient") {
+		t.Errorf("Reply error = %q, want it to say the original has no recipient", err)
+	}
+	// Replies are ephemeral (wisp tier) and the original is not, so only a
+	// both-tiers read can see a reply that should not have been created.
+	messages, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Errorf("open messages = %d, want 1 (the original only; a failed reply must not create one)", len(messages))
+	}
+}
+
+// TestReplyToSelfAddressedMessageStaysSelfAddressed: a note the sender really
+// addressed to themselves is a self-thread on purpose, so its follow-up goes to
+// the same place instead of erroring.
+func TestReplyToSelfAddressedMessageStaysSelfAddressed(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	note, err := p.Send("alice", "alice", "Note to self", "remember")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := p.Reply(note.ID, "alice", "", "also remember")
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if reply.To != "alice" {
+		t.Errorf("Reply To = %q, want %q", reply.To, "alice")
+	}
+}
+
+// TestReplyFromOtherSenderStillGoesToOriginalSender is the control: when the
+// replier is not the original sender, nothing about the old routing changes.
+func TestReplyFromOtherSenderStillGoesToOriginalSender(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	sent, err := p.Send("alice", "bob", "Hello", "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := p.Reply(sent.ID, "carol", "", "cc'd in")
+	if err != nil {
+		t.Fatalf("Reply: %v", err)
+	}
+	if reply.To != "alice" {
+		t.Errorf("Reply To = %q, want %q (original sender)", reply.To, "alice")
+	}
+}
+
 // TestReplyDerivesSubjectFromOriginal ensures an empty subject is replaced
 // with "Re: <original-subject>", so underlying stores that require a
 // non-empty title (e.g. BdStore → `bd create`) don't reject the reply.

@@ -1914,6 +1914,8 @@ gc mail read <id> [flags]
 ## gc mail reply
 
 Reply to a message. The reply is addressed to the original sender.
+If you sent the original yourself, the reply is a follow-up addressed to its
+recipient instead.
 
 Inherits the thread ID from the original message for conversation tracking.
 Use --notify to nudge the recipient after replying.

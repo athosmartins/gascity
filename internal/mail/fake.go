@@ -234,6 +234,17 @@ func (f *Fake) Reply(id, from, subject, body string) (Message, error) {
 		return Message{}, fmt.Errorf("replying to %q: %w", id, ErrNotFound)
 	}
 
+	// Reply goes to the original sender; replying to your own message is a
+	// follow-up to its recipient instead (same rule as beadmail, ga-yi067e).
+	// vazio → a blank replier or sender never counts as "the same sender"; falhou/ilegível → n/a, plain field reads
+	to := original.msg.From
+	if from != "" && from == original.msg.From {
+		to = original.msg.To
+		if to == "" {
+			return Message{}, fmt.Errorf("replying to %q: original was sent by the replier and has no recipient to follow up with", id)
+		}
+	}
+
 	threadID := original.msg.ThreadID
 	if threadID == "" {
 		threadID = fakeThreadID()
@@ -243,7 +254,7 @@ func (f *Fake) Reply(id, from, subject, body string) (Message, error) {
 	m := Message{
 		ID:        fmt.Sprintf("fake-%d", f.seq),
 		From:      from,
-		To:        original.msg.From, // reply to sender
+		To:        to,
 		Subject:   subject,
 		Body:      body,
 		CreatedAt: time.Now(),

@@ -108,7 +108,11 @@ type Provider interface {
 	Check(recipient string) ([]Message, error)
 
 	// Reply creates a reply to an existing message. Inherits ThreadID
-	// from the original, sets ReplyTo to the original's ID.
+	// from the original, sets ReplyTo to the original's ID. The reply is
+	// addressed to the original sender; when from IS the original sender it
+	// is a follow-up addressed to the original's recipient instead (and
+	// fails if the original has none). Providers that delegate addressing to
+	// an external script (exec) leave that rule to the script.
 	Reply(id, from, subject, body string) (Message, error)
 
 	// Thread returns all messages sharing a thread ID, ordered by time.

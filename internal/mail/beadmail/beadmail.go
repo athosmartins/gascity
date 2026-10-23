@@ -460,23 +460,13 @@ func (p *Provider) Check(recipient string) ([]mail.Message, error) {
 
 // Reply creates a reply to an existing message. Inherits ThreadID from the
 // original, sets ReplyTo to the original's ID. Reply is addressed to the
-// original sender.
+// original sender, except when the replier IS the original sender: replying to
+// your own message is a follow-up in the same thread, so it goes to the
+// original's recipient (addressing it to the sender would mail yourself).
 func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	original, err := p.store.Get(id)
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
-	}
-	toSessionID := strings.TrimSpace(original.Metadata[fromSessionIDMetadataKey])
-	to := toSessionID
-	if to == "" {
-		to = strings.TrimSpace(original.From)
-	}
-	if to == "" {
-		return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
-	}
-	toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
-	if toDisplay == "" {
-		toDisplay = strings.TrimSpace(original.From)
 	}
 	from, metadata, err := p.resolveSenderRoute(from)
 	if err != nil {
@@ -485,11 +475,42 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	if metadata == nil {
 		metadata = make(map[string]string)
 	}
-	if toSessionID != "" {
-		metadata[toSessionIDMetadataKey] = toSessionID
-	}
-	if toDisplay != "" {
+
+	var to string
+	if replierIsOriginalSender(from, metadata, original) {
+		// A follow-up to your own message goes where the original went, with the
+		// same stable route the original was stored with.
+		to = strings.TrimSpace(original.Assignee)
+		if to == "" {
+			return mail.Message{}, fmt.Errorf("beadmail reply: original message %s was sent by the replier and has no recipient to follow up with", id)
+		}
+		if toSessionID := strings.TrimSpace(original.Metadata[toSessionIDMetadataKey]); toSessionID != "" {
+			metadata[toSessionIDMetadataKey] = toSessionID
+		}
+		toDisplay := strings.TrimSpace(original.Metadata[toDisplayMetadataKey])
+		if toDisplay == "" {
+			toDisplay = to
+		}
 		metadata[toDisplayMetadataKey] = toDisplay
+	} else {
+		toSessionID := strings.TrimSpace(original.Metadata[fromSessionIDMetadataKey])
+		to = toSessionID
+		if to == "" {
+			to = strings.TrimSpace(original.From)
+		}
+		if to == "" {
+			return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
+		}
+		toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
+		if toDisplay == "" {
+			toDisplay = strings.TrimSpace(original.From)
+		}
+		if toSessionID != "" {
+			metadata[toSessionIDMetadataKey] = toSessionID
+		}
+		if toDisplay != "" {
+			metadata[toDisplayMetadataKey] = toDisplay
+		}
 	}
 
 	threadID := extractLabel(original.Labels, "thread:")
@@ -503,7 +524,7 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 		Title:       deriveReplyTitle(subject, original.Title, body),
 		Description: body,
 		Type:        "message",
-		Assignee:    to, // reply goes back to sender
+		Assignee:    to, // original sender, or the original's recipient on a reply to your own message
 		From:        from,
 		Labels:      labels,
 		Metadata:    metadata,
@@ -513,6 +534,27 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
 	}
 	return beadToMessage(b), nil
+}
+
+// replierIsOriginalSender reports whether the replier sent the original
+// message. from and route are the replier's identity as returned by
+// resolveSenderRoute. The same stable session ID matches, and so does the same
+// display address (the alias can change or be reused across sessions, the
+// address is what readers see as "from"). A side with no identity never
+// matches: two blank senders are not the same sender.
+func replierIsOriginalSender(from string, route map[string]string, original beads.Bead) bool {
+	// vazio → no identity on that side, never a match; falhou/ilegível → n/a, plain field reads that cannot fail
+	replierSession := strings.TrimSpace(route[fromSessionIDMetadataKey])
+	originalSession := strings.TrimSpace(original.Metadata[fromSessionIDMetadataKey])
+	if replierSession != "" && replierSession == originalSession {
+		return true
+	}
+	replierAddress := strings.TrimSpace(from)
+	originalAddress := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
+	if originalAddress == "" {
+		originalAddress = strings.TrimSpace(original.From)
+	}
+	return replierAddress != "" && replierAddress == originalAddress
 }
 
 // deriveReplyTitle returns a non-empty title for a reply message. Callers
