@@ -1237,3 +1237,47 @@ func TestRegisterManagedDoltTestProcessSnapshotsIdentity(t *testing.T) {
 		t.Errorf("StartIdentity = %q, want non-empty snapshot", got.StartIdentity)
 	}
 }
+
+// TestStartManagedDoltProcessWithOptions_BlankHostBindsLoopback pins the bind
+// default (ga-k7o6ou): a caller that names no listener host gets the loopback
+// interface, never the wildcard. The config file written here is what
+// `dolt sql-server --config` reads, so it is the artifact asserted on; the
+// readiness probe must target the same host the listener binds.
+func TestStartManagedDoltProcessWithOptions_BlankHostBindsLoopback(t *testing.T) {
+	const port = 17795
+	var readyHost string
+	cityPath := installStartManagedDoltLoopStubs(t, startManagedDoltLoopStubs{
+		startFn: func(cityPath, _, _ string, _ *os.File) (managedDoltStartedProcess, error) {
+			return managedDoltStartedProcess{CityPath: cityPath, PID: 0}, nil
+		},
+		waitReadyFn: func(_, host, _, _ string, _ int, _ time.Duration, _ bool) (managedDoltWaitReadyReport, error) {
+			readyHost = host
+			return managedDoltWaitReadyReport{Ready: true, PIDAlive: true}, nil
+		},
+		logSuffixFn:     func(_ string, _ int64) (string, error) { return "", nil },
+		portAvailableFn: func(_ string, _ int) bool { return true },
+		retryWindow:     50 * time.Millisecond,
+	})
+
+	if _, err := startManagedDoltProcessWithOptions(cityPath, "", strconv.Itoa(port), "root", "warning", -1, time.Second, false); err != nil {
+		t.Fatalf("startManagedDoltProcessWithOptions: %v", err)
+	}
+
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolveManagedDoltRuntimeLayout: %v", err)
+	}
+	config, err := os.ReadFile(layout.ConfigFile)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", layout.ConfigFile, err)
+	}
+	if !strings.Contains(string(config), "  host: 127.0.0.1\n") {
+		t.Errorf("blank host must render a loopback listener, config:\n%s", config)
+	}
+	if strings.Contains(string(config), "0.0.0.0") {
+		t.Errorf("blank host must not render the wildcard, config:\n%s", config)
+	}
+	if readyHost != "127.0.0.1" {
+		t.Errorf("readiness probed host %q, want the bound host 127.0.0.1", readyHost)
+	}
+}

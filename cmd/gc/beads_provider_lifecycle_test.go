@@ -9115,6 +9115,69 @@ func TestGcBeadsBdStartUsesGCBinManagedConfigWriter(t *testing.T) {
 	}
 }
 
+// TestGcBeadsBdStartBindHost pins the listener host the provider hands to
+// `gc dolt-state start-managed` (ga-k7o6ou): loopback unless GC_DOLT_HOST names
+// the wildcard explicitly. The fake gc renders `host:` from the --host it was
+// given, so the generated dolt-config.yaml is what Dolt would have bound.
+func TestGcBeadsBdStartBindHost(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostEnv  string // empty means GC_DOLT_HOST is not set at all
+		wantHost string
+	}{
+		{name: "unset binds loopback", hostEnv: "", wantHost: "127.0.0.1"},
+		{name: "explicit wildcard is the opt-in", hostEnv: "0.0.0.0", wantHost: "0.0.0.0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cityPath := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := MaterializeBuiltinPacks(cityPath); err != nil {
+				t.Fatalf("MaterializeBuiltinPacks: %v", err)
+			}
+			script := gcBeadsBdScriptPath(cityPath)
+
+			binDir := filepath.Join(t.TempDir(), "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			fakeGC := writeFakeManagedConfigWriterGC(t, binDir, filepath.Join(t.TempDir(), "gc-invocation"))
+			writeFakeManagedConfigWriterDolt(t, binDir)
+
+			extra := []string{
+				"GC_CITY_PATH=" + cityPath,
+				"GC_BIN=" + fakeGC,
+				"PATH=" + strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
+			}
+			if tt.hostEnv != "" {
+				extra = append(extra, "GC_DOLT_HOST="+tt.hostEnv)
+			}
+			env := sanitizedBaseEnv(extra...)
+			cmd := exec.Command(script, "start")
+			cmd.Env = env
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("gc-beads-bd start failed: %v\n%s", err, out)
+			}
+			t.Cleanup(func() {
+				stop := exec.Command(script, "stop")
+				stop.Env = env
+				_ = stop.Run()
+			})
+
+			configData, err := os.ReadFile(filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt-from-gc", "dolt-config.yaml"))
+			if err != nil {
+				t.Fatalf("ReadFile(dolt-config.yaml): %v", err)
+			}
+			want := "  host: " + tt.wantHost + "\n"
+			if !strings.Contains(string(configData), want) {
+				t.Fatalf("dolt-config.yaml listener host != %s, config:\n%s", tt.wantHost, configData)
+			}
+		})
+	}
+}
+
 func TestGcBeadsBdStartManagedHelperDoesNotInheritStartLockFD(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {

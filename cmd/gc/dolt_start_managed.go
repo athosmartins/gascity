@@ -113,6 +113,11 @@ func init() {
 	os.Exit(runManagedDoltTestWatchdog(os.Args[2:], os.Stdout, os.Stderr))
 }
 
+// managedDoltDefaultBindHost is the listener host used when a caller names none. The managed
+// server runs as root with an empty password, so the default is loopback; listening on every
+// interface (0.0.0.0) has to be asked for by name (ga-k7o6ou).
+const managedDoltDefaultBindHost = "127.0.0.1"
+
 func startManagedDoltProcess(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltStartReport, error) {
 	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, timeout, true)
 }
@@ -131,7 +136,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		return managedDoltStartReport{}, fmt.Errorf("invalid port %q", port)
 	}
 	if strings.TrimSpace(host) == "" {
-		host = "0.0.0.0"
+		host = managedDoltDefaultBindHost
 	}
 	if strings.TrimSpace(user) == "" {
 		user = "root"
@@ -305,8 +310,8 @@ func resolveManagedDoltStartAddressInUseRetryWindow(cityPath string) time.Durati
 // became free within the window. A non-positive retryWindow returns false
 // immediately (no wait).
 //
-// The host argument matches the host dolt will bind to (typically "0.0.0.0"
-// in production); using the same host for the probe and the bind avoids
+// The host argument matches the host dolt will bind to (loopback unless the
+// caller asked for the wildcard); using the same host for the probe and the bind avoids
 // false-positive availability reports caused by interface-specific bind
 // states. The poll interval is shrunk to the retry window when the window is
 // shorter than the default 2s, so a sub-2s window still gets one check
