@@ -58,5 +58,31 @@ else
     echo "gc dolt sql: no dolt server running and no databases found" >&2
     exit 1
   fi
+  # ga-06wmmp: dolt.lock is what a server start, swap, restore or maintenance window holds while the server is
+  # down (gc-beads-bd.sh op_start takes the same $PACK_STATE_DIR/dolt.lock with `flock -n 9`). Opening the data dir
+  # here (mkdir .dolt/tmp, manifest rewrite) goes around it, so refuse while somebody holds it.
+  # Three states: free (no lock file, or flock takes it) -> go on; held (flock exit 1) -> refuse, exit 75;
+  # cannot tell (no flock, any other flock exit, or a lock path that cannot be stat'ed) -> warn and go on: refusing
+  # there would break `gc dolt sql` wherever flock is missing.
+  lock_file="${GC_DOLT_LOCK_FILE:-$PACK_STATE_DIR/dolt.lock}"
+  lock_dir="${lock_file%/*}"
+  # empty -> no lock file (state dir absent or searchable) means nobody ever started a server here: free (flock is not even called, it would create the file);
+  # failed/unreadable -> flock exit other than 0/1, no flock, a lock path that is not a regular file, or a state dir that cannot be searched = cannot tell: warning on stderr, then go on as before
+  if [ -f "$lock_file" ]; then
+    if command -v flock >/dev/null 2>&1; then
+      lock_rc=0
+      flock -n "$lock_file" true 2>/dev/null || lock_rc=$?
+      if [ "$lock_rc" = 1 ]; then
+        echo "gc dolt sql: no dolt server running and the dolt lock is held ($lock_file): a server start, swap, restore or maintenance window owns the data dir, so it is not opened in embedded mode. Retry when it ends." >&2
+        exit 75
+      elif [ "$lock_rc" != 0 ]; then
+        echo "gc dolt sql: warning: cannot probe the dolt lock $lock_file (flock exit $lock_rc); opening in embedded mode anyway" >&2
+      fi
+    else
+      echo "gc dolt sql: warning: flock is not installed, cannot tell whether the dolt lock $lock_file is held; opening in embedded mode anyway" >&2
+    fi
+  elif [ -e "$lock_file" ] || { [ -d "$lock_dir" ] && [ ! -x "$lock_dir" ]; }; then
+    echo "gc dolt sql: warning: cannot stat the dolt lock $lock_file (not a regular file, or its directory cannot be searched); opening in embedded mode anyway" >&2
+  fi
   exec dolt --data-dir "$data_dir" sql "$@"
 fi
