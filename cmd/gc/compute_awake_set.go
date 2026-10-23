@@ -266,6 +266,17 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if !bead.ManualSession || bead.State == "closed" || bead.Drained {
 			continue
 		}
+		// A manual session that idle_timeout put to sleep stays asleep. Without
+		// this the kill is undone on the same tick (or the next): a manual
+		// session is always "desired", so the reconciler wakes it again as a
+		// fresh process with nothing to do, and the idle_timeout of a pool
+		// agent whose sessions are opened with `gc session new` (the Pilot's
+		// dog-remote) never frees the slot. It wakes again only through the
+		// passes that carry real demand: explicit wake, assigned work, pending
+		// create, a pending interaction or an attached client. See ga-2hd02v.1.22.
+		if bead.State == "asleep" && bead.SleepReason == "idle-timeout" {
+			continue
+		}
 		if _, ok := agentsByName[bead.Template]; ok {
 			desired[bead.SessionName] = "manual"
 		}
