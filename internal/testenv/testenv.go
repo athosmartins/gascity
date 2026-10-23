@@ -103,6 +103,8 @@ var LeakVectorVars = []string{
 	"GC_DOLT_PORT",
 	"GC_DOLT_USER",
 	"GC_HOME",
+	"GC_RIG",
+	"GC_RIG_ROOT",
 	"GC_SESSION_ID",
 	"GC_SESSION_NAME",
 	"GC_TMUX_SESSION",

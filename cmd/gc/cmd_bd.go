@@ -231,7 +231,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// auto-detection scans every non-flag token for a known prefix
 	// regardless of the subcommand word, so either shape resolves the same
 	// rig/city target; it does not need to see metadataArgs.
-	target, err := resolveBdScopeTarget(cfg, cityPath, rigName, bdArgs)
+	target, err := resolveBdScopeTargetForSession(cfg, cityPath, rigName, bdArgs, strings.TrimSpace(cityName) == "", stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -393,9 +393,27 @@ func extractRigFlag(args []string) (string, []string) {
 	return rigName, rest
 }
 
-// resolveBdScopeTarget determines the canonical scope root for a bd command.
-// Priority: explicit rig name > bead prefix auto-detection > enclosing rig > city root.
+// resolveBdScopeTarget determines the canonical scope root for a bd command
+// without consulting the agent session. Priority: explicit rig name > bead
+// prefix auto-detection > enclosing rig > city root. doBd uses
+// resolveBdScopeTargetForSession, which adds the session rig (GC_RIG).
 func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []string) (execStoreTarget, error) {
+	return resolveBdScopeTargetForSession(cfg, cityPath, rigName, args, false, io.Discard)
+}
+
+// resolveBdScopeTargetForSession is resolveBdScopeTarget plus the rig the
+// agent session is bound to (ga-q2i6b7, gt-wvey3). Priority: explicit rig name
+// > bead prefix auto-detection > session rig (GC_RIG) > enclosing rig > city
+// root.
+//
+// Without the session step a rig agent whose cwd is not inside a bound rig
+// path (a witness or refinery runs from its agent home under the city) fell
+// through to the city store, so `gc bd mol wisp` wrote to hq while `gc hook`,
+// which resolves the same identity to its rig store, read from the rig db.
+//
+// useSessionRig is false when the caller named a city explicitly (--city): a
+// GC_RIG exported by some other session says nothing about that city.
+func resolveBdScopeTargetForSession(cfg *config.City, cityPath, rigName string, args []string, useSessionRig bool, stderr io.Writer) (execStoreTarget, error) {
 	resolveRigPaths(cityPath, cfg.Rigs)
 	if rigName != "" {
 		rig, ok := rigByName(cfg, rigName)
@@ -440,6 +458,12 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 		}
 	}
 
+	if useSessionRig {
+		if target, ok := bdSessionRigTarget(cfg, cityPath, stderr); ok {
+			return target, nil
+		}
+	}
+
 	if rig, ok, err := bdRigFromCwd(cfg, cityPath); err != nil {
 		return execStoreTarget{}, err
 	} else if ok {
@@ -449,6 +473,54 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 	}
 
 	return cityTarget, nil
+}
+
+// bdSessionRigTarget maps the rig the agent session is bound to (GC_RIG, set
+// together with GC_RIG_ROOT, BEADS_DIR and GC_BEADS_SCOPE_ROOT by
+// template_resolve.go for rig-scoped agents) to its bd scope target. ok=false
+// means "no usable session rig"; the caller then resolves from cwd and city
+// exactly as it did before the session step existed.
+//
+// A name that is not a bound rig of this city, or that points at a different
+// store than GC_BEADS_SCOPE_ROOT, is a stale environment (for example a
+// tmux-server variable that outlived the session it was written for). It is
+// reported on stderr and ignored rather than turned into a hard failure, so a
+// leaked variable cannot make every `gc bd` call in the shell fail.
+func bdSessionRigTarget(cfg *config.City, cityPath string, stderr io.Writer) (execStoreTarget, bool) {
+	// vazio → no session rig, return not-ok so cwd/city decide (city-scoped
+	// sessions export GC_RIG="" on purpose); falhou/ilegível → os.Getenv
+	// cannot fail, whitespace-only counts as vazio.
+	name := strings.TrimSpace(os.Getenv("GC_RIG"))
+	if name == "" {
+		return execStoreTarget{}, false
+	}
+	// vazio → name not in the city config: warn and return not-ok (cwd/city
+	// decide); falhou/ilegível → rigByName only reads the loaded config, same
+	// warn-and-not-ok outcome for an unbound rig (empty path).
+	rig, ok := rigByName(cfg, name)
+	if !ok {
+		fmt.Fprintf(stderr, "gc bd: warning: GC_RIG=%q is not a rig of this city; ignoring it\n", name) //nolint:errcheck // best-effort stderr
+		return execStoreTarget{}, false
+	}
+	if strings.TrimSpace(rig.Path) == "" {
+		fmt.Fprintf(stderr, "gc bd: warning: GC_RIG=%q is declared but has no path binding; ignoring it\n", name) //nolint:errcheck // best-effort stderr
+		return execStoreTarget{}, false
+	}
+	target := bdRigScopeTarget(cityPath, rig)
+	// vazio → no GC_BEADS_SCOPE_ROOT to cross-check (hand-set GC_RIG), trust
+	// GC_RIG as resolveContext does; falhou/ilegível → os.Getenv cannot fail,
+	// and a path samePath cannot confirm equal counts as stale env: warn and
+	// return not-ok (cwd/city decide).
+	if scopeRoot := strings.TrimSpace(os.Getenv("GC_BEADS_SCOPE_ROOT")); scopeRoot != "" && !samePath(scopeRoot, target.ScopeRoot) {
+		fmt.Fprintf(stderr, "gc bd: warning: GC_RIG=%q resolves to %s but GC_BEADS_SCOPE_ROOT=%s; treating the session environment as stale and ignoring GC_RIG\n", name, target.ScopeRoot, scopeRoot) //nolint:errcheck // best-effort stderr
+		return execStoreTarget{}, false
+	}
+	// vazio → cwd is in no bound rig, nothing to report; falhou/ilegível →
+	// bdRigFromCwd error (getwd/resolve failure) is dropped, no note printed.
+	if cwdRig, inRig, err := bdRigFromCwd(cfg, cityPath); err == nil && inRig && cwdRig.Name != rig.Name {
+		fmt.Fprintf(stderr, "gc bd: note: cwd is in rig %q but this session is bound to rig %q; using %q (pass --rig %s to target the cwd rig)\n", cwdRig.Name, rig.Name, rig.Name, cwdRig.Name) //nolint:errcheck // best-effort stderr
+	}
+	return target, true
 }
 
 func bdRigForArg(cfg *config.City, arg string) (config.Rig, bool) {
