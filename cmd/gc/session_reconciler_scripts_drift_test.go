@@ -381,3 +381,265 @@ func TestReconcileSessionBeads_ScriptsDriftDoesNotDrainAwakeWorkerWithAssignedWo
 			ds, env.stdout.String(), env.stderr.String())
 	}
 }
+
+// ga-epdbe3 — scripts-only CopyFiles drift must never drain a resume-wake
+// (interactive crew) session.
+//
+// Incident: peter-wa (a Remote Control crew session, wake_mode unset →
+// "resume", not pinned per wa-14p4c, not a tmux client) was drained
+// mid-conversation with the human because editing one file under scripts/
+// re-hashed the staged .gc/scripts CopyFiles entry → config-drift → the
+// non-named drain path. The staged copy is inert for the session, so the
+// reconciler now accepts a scripts-only drift in place for resume-wake
+// sessions (rebaselining only the core hash) while every other drift, the
+// fresh-wake pool workers, gate-reviewers and stuck-creating sessions behave
+// exactly as before.
+
+const resumeWakeCrewTemplate = "peter-wa"
+
+// setupResumeWakeScriptsDrift wires an ALIVE, non-creating session of `template`
+// (agent config `agentCfg`) whose live desired config is `tp` and whose stored
+// start-time fingerprint reflects `mutate(cur)`. The stored breakdown uses the
+// same BreakdownV1 shape as the start path.
+func setupResumeWakeScriptsDrift(
+	t *testing.T,
+	name, template string,
+	agentCfg config.Agent,
+	tp TemplateParams,
+	mutate func(current runtime.Config) runtime.Config,
+) (*reconcilerTestEnv, beads.Bead, runtime.Config) {
+	t.Helper()
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{Agents: []config.Agent{agentCfg}}
+	env.desiredState[name] = tp
+	_ = env.sp.Start(context.Background(), name, runtime.Config{Command: tp.Command})
+	session := env.createSessionBead(name, template)
+
+	currentCfg := sessionCoreConfigForHash(tp, session)
+	oldCfg := mutate(currentCfg)
+	started := runtime.CoreFingerprint(oldCfg)
+	if started == runtime.CoreFingerprint(currentCfg) {
+		t.Fatalf("test setup: stored (old) and live (current) core hashes must differ")
+	}
+	breakdownJSON, err := json.Marshal(runtime.CoreFingerprintBreakdown(oldCfg))
+	if err != nil {
+		t.Fatalf("marshaling stored breakdown: %v", err)
+	}
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": started,
+		"core_hash_breakdown": string(breakdownJSON),
+	})
+	env.markSessionActive(&session)
+	return env, session, currentCfg
+}
+
+func resumeWakeCrewTP(name, command string, copyFiles ...runtime.CopyEntry) TemplateParams {
+	return TemplateParams{
+		Command:      command,
+		SessionName:  name,
+		TemplateName: resumeWakeCrewTemplate,
+		Hints:        agent.StartupHints{CopyFiles: copyFiles},
+	}
+}
+
+// The fix: an active resume-wake crew session whose ONLY drift is the staged
+// scripts content hash is NOT drained, its core baseline is moved to the
+// current config (so the next tick sees no drift), and its live baseline is
+// left untouched.
+func TestReconcileSessionBeads_ConfigDriftScriptsOnlyAcceptedInPlaceForResumeWakeCrew(t *testing.T) {
+	name := "peter-wa-scripts-only"
+	tp := resumeWakeCrewTP(name, "steady-cmd",
+		settingsCopyEntry("settings-hash"),
+		scriptsCopyEntry("scripts-hash-NEW"))
+	env, session, currentCfg := setupResumeWakeScriptsDrift(t, name, resumeWakeCrewTemplate,
+		config.Agent{Name: resumeWakeCrewTemplate}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.CopyFiles = []runtime.CopyEntry{
+				settingsCopyEntry("settings-hash"),
+				scriptsCopyEntry("scripts-hash-OLD"),
+			}
+			return old
+		})
+	env.setSessionMetadata(&session, map[string]string{
+		"started_live_hash": "live-baseline-sentinel",
+		"live_hash":         "live-baseline-sentinel",
+	})
+
+	env.reconcile([]beads.Bead{session})
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("ga-epdbe3: resume-wake crew with scripts-only content drift must NOT be drained; got drain=%+v stderr=%s",
+			ds, env.stderr.String())
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("reloading session bead: %v", err)
+	}
+	if want := runtime.CoreFingerprint(currentCfg); got.Metadata["started_config_hash"] != want {
+		t.Errorf("started_config_hash = %q, want rebaselined to current %q", got.Metadata["started_config_hash"], want)
+	}
+	if got.Metadata["started_live_hash"] != "live-baseline-sentinel" || got.Metadata["live_hash"] != "live-baseline-sentinel" {
+		t.Errorf("live baseline must be left untouched; started_live_hash=%q live_hash=%q",
+			got.Metadata["started_live_hash"], got.Metadata["live_hash"])
+	}
+
+	// The accepted drift is gone: a second tick neither drains nor re-logs.
+	env.reconcile([]beads.Bead{got})
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("second tick after accepted drift must not drain; got drain=%+v stderr=%s", ds, env.stderr.String())
+	}
+}
+
+// An already-begun config-drift drain on such a session is canceled when the
+// drift turns out to be scripts-only.
+func TestReconcileSessionBeads_ConfigDriftScriptsOnlyCancelsBegunDrainForResumeWakeCrew(t *testing.T) {
+	name := "peter-wa-begun-drain"
+	tp := resumeWakeCrewTP(name, "steady-cmd", scriptsCopyEntry("scripts-hash-NEW"))
+	env, session, _ := setupResumeWakeScriptsDrift(t, name, resumeWakeCrewTemplate,
+		config.Agent{Name: resumeWakeCrewTemplate}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-OLD")}
+			return old
+		})
+	if !beginSessionDrain(session, env.sp, env.dt, "config-drift", env.clk, time.Minute) {
+		t.Fatalf("test setup: could not begin config-drift drain")
+	}
+
+	env.reconcile([]beads.Bead{session})
+
+	if ds := env.dt.get(session.ID); ds != nil {
+		t.Fatalf("a begun config-drift drain must be canceled on scripts-only drift; got drain=%+v stderr=%s",
+			ds, env.stderr.String())
+	}
+}
+
+// Guard: a real Command change on a resume-wake crew still drains.
+func TestReconcileSessionBeads_ConfigDriftStillDrainsResumeWakeCrewOnCommandChange(t *testing.T) {
+	name := "peter-wa-cmd-drift"
+	tp := resumeWakeCrewTP(name, "new-cmd", scriptsCopyEntry("scripts-hash-SAME"))
+	env, session, _ := setupResumeWakeScriptsDrift(t, name, resumeWakeCrewTemplate,
+		config.Agent{Name: resumeWakeCrewTemplate}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.Command = "old-cmd"
+			old.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-SAME")}
+			return old
+		})
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("regression: Command drift on resume-wake crew MUST still drain; stderr=%s", env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// Guard: scripts drift bundled with a real Command change is not scripts-only,
+// so the crew still drains — a scripts edit cannot mask a genuine change.
+func TestReconcileSessionBeads_ConfigDriftStillDrainsResumeWakeCrewWhenScriptsAlongsideCommand(t *testing.T) {
+	name := "peter-wa-cmd-and-scripts"
+	tp := resumeWakeCrewTP(name, "new-cmd", scriptsCopyEntry("scripts-hash-NEW"))
+	env, session, _ := setupResumeWakeScriptsDrift(t, name, resumeWakeCrewTemplate,
+		config.Agent{Name: resumeWakeCrewTemplate}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.Command = "old-cmd"
+			old.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-OLD")}
+			return old
+		})
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("hardening: Command+scripts drift on resume-wake crew MUST drain; stderr=%s", env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// Guard: a structural CopyFiles change (scripts entry added) is not a content
+// drift of an existing entry, so the crew still drains.
+func TestReconcileSessionBeads_ConfigDriftStillDrainsResumeWakeCrewOnStructuralCopyChange(t *testing.T) {
+	name := "peter-wa-structural"
+	tp := resumeWakeCrewTP(name, "steady-cmd", scriptsCopyEntry("scripts-hash"))
+	env, session, _ := setupResumeWakeScriptsDrift(t, name, resumeWakeCrewTemplate,
+		config.Agent{Name: resumeWakeCrewTemplate}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.CopyFiles = nil // scripts entry did not exist at start
+			return old
+		})
+
+	env.reconcile([]beads.Bead{session})
+
+	if ds := env.dt.get(session.ID); ds == nil {
+		t.Fatalf("regression: structural CopyFiles change on resume-wake crew MUST still drain; stderr=%s", env.stderr.String())
+	}
+}
+
+// Scoping: an idle (non-creating) wake_mode=fresh pool worker with a
+// scripts-only drift is NOT covered by the resume-wake acceptance — it drains
+// exactly as before (the bead's "idle dog/worker may still drain as today").
+func TestReconcileSessionBeads_ScriptsOnlyDriftStillDrainsIdleFreshWakeWorker(t *testing.T) {
+	name := "wa-worker-idle"
+	tp := TemplateParams{
+		Command:      "steady-cmd",
+		SessionName:  name,
+		TemplateName: scriptsDriftWorkerTemplate,
+		Hints:        agent.StartupHints{CopyFiles: []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-NEW")}},
+	}
+	env, session, _ := setupResumeWakeScriptsDrift(t, name, scriptsDriftWorkerTemplate,
+		config.Agent{Name: scriptsDriftWorkerTemplate, WakeMode: "fresh"}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-OLD")}
+			return old
+		})
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("scoping: idle fresh-wake worker with scripts-only drift must still drain as today; stderr=%s", env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}
+
+// Scoping: a gate-reviewer is excluded from the resume-wake acceptance even
+// when its agent config carries no wake_mode (effective "resume"): with no
+// pending verdict it drains on a scripts-only drift exactly as before.
+func TestReconcileSessionBeads_ScriptsOnlyDriftStillDrainsGateReviewerWithoutWakeMode(t *testing.T) {
+	name := "gate-reviewer-adhoc-scripts"
+	tp := TemplateParams{
+		Command:      "steady-cmd",
+		SessionName:  name,
+		TemplateName: gateReviewerTemplateName,
+		Hints:        agent.StartupHints{CopyFiles: []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-NEW")}},
+	}
+	env, session, _ := setupResumeWakeScriptsDrift(t, name, gateReviewerTemplateName,
+		config.Agent{Name: gateReviewerTemplateName}, tp,
+		func(current runtime.Config) runtime.Config {
+			old := current
+			old.CopyFiles = []runtime.CopyEntry{scriptsCopyEntry("scripts-hash-OLD")}
+			return old
+		})
+
+	env.reconcile([]beads.Bead{session})
+
+	ds := env.dt.get(session.ID)
+	if ds == nil {
+		t.Fatalf("scoping: gate-reviewer must be excluded from the resume-wake scripts-only acceptance; stderr=%s", env.stderr.String())
+	}
+	if ds.reason != "config-drift" {
+		t.Errorf("drain reason = %q, want config-drift", ds.reason)
+	}
+}

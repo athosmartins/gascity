@@ -1862,6 +1862,38 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							}
 							continue
 						}
+						// Resume-wake (interactive crew) sessions are never drained
+						// for a scripts-only CopyFiles drift (ga-epdbe3). Editing ANY
+						// file under the city scripts/ tree re-hashes the staged
+						// .gc/scripts copy, and that copy is inert for the session
+						// (no Go consumer reads it; city scripts are fresh-read at
+						// use). Draining a crew that is not tmux-attached (Remote
+						// Control is not a tmux client) and not pinned closed
+						// peter-wa mid-conversation with the human. Accept the drift
+						// in place instead: rebaseline the core hash so the staged
+						// copy is simply re-hashed at the next natural restart.
+						// Any co-occurring Command/Env/hook/settings drift, or a
+						// structural CopyFiles change, makes the predicate false and
+						// still drains. Creating-state sessions keep the existing
+						// behavior (a stuck start must still be recycled).
+						if resumeWakeScriptsOnlyConfigDrift(*session, cfg, cfgAgent, agentCfg, stateBeforeHeal) {
+							if err := rebaselineSessionCoreHash(session, store, agentCfg, currentHash); err != nil {
+								// Fail safe: a session we could not rebaseline is
+								// neither drained nor marked accepted; the next
+								// tick re-evaluates.
+								fmt.Fprintf(stderr, "session reconciler: accepting scripts-only config drift in place for %s: %v\n", name, err) //nolint:errcheck
+								continue
+							}
+							drainCancelled := cancelSessionConfigDriftDrain(*session, sp, dt)
+							fmt.Fprintf(stderr, "config-drift %s: scripts-only content drift accepted in place (resume-wake session never drained for inert .gc/scripts); stored=%s current=%s\n", name, truncateHashForLog(storedHash), truncateHashForLog(currentHash)) //nolint:errcheck
+							if trace != nil {
+								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeAcceptedProtected), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+									"active_reason":  "resume_scripts_content_only",
+									"drain_canceled": drainCancelled,
+								}), nil, "")
+							}
+							continue
+						}
 						if isNamedSessionBead(*session) {
 							// Defer config-drift restart for named sessions
 							// that are actively in use (pending interaction,
@@ -4098,6 +4130,57 @@ func silentRebaselineSessionHashes(session *beads.Bead, store beads.Store, agent
 	}
 	if err := store.SetMetadataBatch(session.ID, patch); err != nil {
 		return fmt.Errorf("rebaselining hashes: %w", err)
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string, len(patch))
+	}
+	for k, v := range patch {
+		session.Metadata[k] = v
+	}
+	return nil
+}
+
+// resumeWakeScriptsOnlyConfigDrift reports whether a config drift on a live
+// session is the inert scripts-copy-only drift on a resume-wake (interactive
+// crew) session: the session's agent resumes its conversation across restarts
+// (wake_mode is not "fresh"), the session is past its creating window, it is
+// not a gate-reviewer, and the ONLY drifted field is the content hash of the
+// staged .gc/scripts CopyFiles entry (runtime.ConfigDriftIsCopyEntryContentOnly).
+// ga-epdbe3.
+func resumeWakeScriptsOnlyConfigDrift(
+	session beads.Bead,
+	cfg *config.City,
+	cfgAgent *config.Agent,
+	agentCfg runtime.Config,
+	stateBeforeHeal sessionpkg.State,
+) bool {
+	if cfgAgent == nil || cfgAgent.EffectiveWakeMode() != "resume" {
+		return false
+	}
+	if stateBeforeHeal == sessionpkg.StateCreating {
+		return false
+	}
+	if sessionIsGateReviewerTemplate(session, cfg) {
+		return false
+	}
+	return runtime.ConfigDriftIsCopyEntryContentOnly(session.Metadata["core_hash_breakdown"], agentCfg, runtime.ScriptsCopyRelDst)
+}
+
+// rebaselineSessionCoreHash moves only the core config-drift baseline
+// (started_config_hash and core_hash_breakdown) to agentCfg, leaving
+// started_live_hash/live_hash untouched so a concurrent live-only drift is
+// still detected and re-applied on the next tick. Contrast with
+// silentRebaselineSessionHashes, which rebaselines all four fields.
+func rebaselineSessionCoreHash(session *beads.Bead, store beads.Store, agentCfg runtime.Config, currentHash string) error {
+	if session == nil || store == nil {
+		return nil
+	}
+	patch, err := softReloadAcceptedHashMetadata(agentCfg, currentHash)
+	if err != nil {
+		return fmt.Errorf("preparing core hash rebaseline: %w", err)
+	}
+	if err := store.SetMetadataBatch(session.ID, patch); err != nil {
+		return fmt.Errorf("rebaselining core hash: %w", err)
 	}
 	if session.Metadata == nil {
 		session.Metadata = make(map[string]string, len(patch))
