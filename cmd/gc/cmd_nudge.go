@@ -529,8 +529,16 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 		fmt.Fprintln(stderr, "gc nudge poll: session not specified (set $GC_ALIAS/$GC_SESSION_ID or pass an alias/id)") //nolint:errcheck
 		return 1
 	}
-	target, err := resolveNudgeTarget(targetID, stderr)
-	if err != nil {
+	// vazio → resolveNudgeTarget returns ErrSessionNotFound, retried like any
+	// other error (a closed store is reported as "not found" too, so the two
+	// cannot be told apart here); falhou/ilegível → retry with backoff, then exit
+	// 1 with the reason on stderr (which now reaches the poller log).
+	var target nudgeTarget
+	if err := retryNudgePollStartup("resolving the session", stderr, func() error {
+		var resolveErr error
+		target, resolveErr = resolveNudgeTarget(targetID, stderr)
+		return resolveErr
+	}); err != nil {
 		fmt.Fprintf(stderr, "gc nudge poll: %v\n", err) //nolint:errcheck
 		return 1
 	}
@@ -553,30 +561,192 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	defer release()
 
 	sp := newSessionProvider()
-	store := openNudgeBeadStore(target.cityPath)
-	if store == nil {
-		fmt.Fprintf(stderr, "gc nudge poll: opening city store for %q\n", target.agentKey()) //nolint:errcheck
+	// vazio → a nil store means the open failed (there is no "empty store");
+	// falhou → same retry/exit-1 path as above.
+	var store beads.Store
+	if err := retryNudgePollStartup("opening the city store", stderr, func() error {
+		store = openNudgeBeadStore(target.cityPath)
+		if store == nil {
+			return fmt.Errorf("opening city store for %q", target.agentKey())
+		}
+		return nil
+	}); err != nil {
+		fmt.Fprintf(stderr, "gc nudge poll: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	var missingSince time.Time
-	for {
-		obs, err := workerObserveNudgeTarget(target, store, sp)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc nudge poll: %v\n", err) //nolint:errcheck
-			return 1
+	return runNudgePollLoop(target, store, sp, interval, quiescence, stderr)
+}
+
+// The poller depends on reads that go to Dolt/bd, which blip under load. A read
+// that failed is "unknown" -- never "the session is gone" and never "the queue is
+// empty" (ga-55jx16q). These bound how it waits while it cannot tell.
+const (
+	// defaultNudgePollErrorBackoffMax caps the wait between rounds while the
+	// session cannot be observed.
+	defaultNudgePollErrorBackoffMax = 30 * time.Second
+	// defaultNudgePollUnknownCeiling is how long a poller keeps running when it
+	// can neither observe the session NOR read the queue (so it cannot prove
+	// there is nothing to deliver). With a readable queue it never needs this:
+	// queued items expire on their own TTL, which empties the queue.
+	defaultNudgePollUnknownCeiling = 30 * time.Minute
+	// defaultNudgePollStartupAttempts bounds the startup reads (resolving the
+	// session, opening the store); the waits double from 1s (1+2+4+8+16 = 31s).
+	defaultNudgePollStartupAttempts = 6
+)
+
+var (
+	// Test seams for cmd_nudge_poller_resilience_test.go; keep those tests serial.
+	nudgePollSleep        = time.Sleep
+	nudgePollNow          = time.Now
+	nudgePollerExecutable = os.Executable
+)
+
+// retryNudgePollStartup runs one of the poller's startup reads up to
+// defaultNudgePollStartupAttempts times, doubling the wait from 1s. A failed read
+// is a Dolt/bd blip until proven otherwise; the poller must not die of it.
+func retryNudgePollStartup(what string, stderr io.Writer, fn func() error) error {
+	wait := time.Second
+	var err error
+	for attempt := 1; attempt <= defaultNudgePollStartupAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
 		}
-		if !obs.Running {
-			now := time.Now()
-			if shouldKeepNudgePollerAlive(target, missingSince, now) {
-				if missingSince.IsZero() {
-					missingSince = now
-				}
-				time.Sleep(interval)
-				continue
+		if attempt == defaultNudgePollStartupAttempts {
+			break
+		}
+		fmt.Fprintf(stderr, "gc nudge poll: %s failed (attempt %d/%d, retrying in %s): %v\n", what, attempt, defaultNudgePollStartupAttempts, wait, err) //nolint:errcheck
+		nudgePollSleep(wait)
+		wait *= 2
+	}
+	return fmt.Errorf("%s failed after %d attempts: %w", what, defaultNudgePollStartupAttempts, err)
+}
+
+// nudgePollErrorBackoff is how long the poller waits after failedRounds
+// consecutive rounds that could not observe the session: the interval, doubling
+// per failed round up to defaultNudgePollErrorBackoffMax. An interval already
+// above the cap is the operator's choice and is kept.
+func nudgePollErrorBackoff(interval time.Duration, failedRounds int) time.Duration {
+	if failedRounds <= 0 || interval >= defaultNudgePollErrorBackoffMax {
+		return interval
+	}
+	if failedRounds > 10 {
+		failedRounds = 10 // bound the shift; 2s<<10 is already far above the cap
+	}
+	wait := interval << uint(failedRounds)
+	if wait <= 0 || wait > defaultNudgePollErrorBackoffMax {
+		return defaultNudgePollErrorBackoffMax
+	}
+	return wait
+}
+
+type nudgePollAction int
+
+const (
+	// nudgePollDeliver: the session was observed running; try to deliver.
+	nudgePollDeliver nudgePollAction = iota
+	// nudgePollWait: nothing to do this round; observe again after a pause.
+	nudgePollWait
+	// nudgePollExit: stop the poller (reason says why).
+	nudgePollExit
+)
+
+// nudgePollDecision is the outcome of one poller round plus the two streaks the
+// loop carries into the next one.
+type nudgePollDecision struct {
+	action   nudgePollAction
+	exitCode int
+	reason   string
+	// missingSince: start of the current run of rounds that SAW the session not
+	// running (bounded by defaultNudgePollStartGrace).
+	missingSince time.Time
+	// unknownSince: start of the current run of rounds that could NOT observe the
+	// session at all (bounded by defaultNudgePollUnknownCeiling, and only when the
+	// queue is unreadable too).
+	unknownSince time.Time
+}
+
+// decideNudgePollRound turns one observation into an action. The rule that
+// matters: a FAILED observation is not "the session is gone" (the old poller
+// exited 1 on it, for good, and nothing re-armed it). Failed observation is a
+// third state: keep the queue, wait, and look again. The poller ends only when it
+// has VERIFIED there is nothing left to deliver.
+func decideNudgePollRound(target nudgeTarget, obs worker.LiveObservation, obsErr error, missingSince, unknownSince, now time.Time) nudgePollDecision {
+	if obsErr != nil {
+		if unknownSince.IsZero() {
+			unknownSince = now
+		}
+		// vazio → queue verified empty: nothing to lose, exit 0 (the next enqueue
+		// starts a new poller); falhou/ilegível → NOT empty: keep waiting, and give
+		// up loudly only after defaultNudgePollUnknownCeiling of not knowing.
+		pending, inFlight, _, queueErr := listQueuedNudgesForTarget(target.cityPath, target, now)
+		switch {
+		case queueErr == nil && len(pending) == 0 && len(inFlight) == 0:
+			return nudgePollDecision{
+				action:       nudgePollExit,
+				reason:       "the session cannot be observed and the queue is verifiably empty; the next enqueue starts a new poller",
+				missingSince: missingSince,
+				unknownSince: unknownSince,
 			}
-			return 0
+		case queueErr != nil && now.Sub(unknownSince) >= defaultNudgePollUnknownCeiling:
+			return nudgePollDecision{
+				action:       nudgePollExit,
+				exitCode:     1,
+				reason:       fmt.Sprintf("could neither observe the session nor read the queue for %s (last queue error: %v)", now.Sub(unknownSince).Round(time.Second), queueErr),
+				missingSince: missingSince,
+				unknownSince: unknownSince,
+			}
 		}
-		missingSince = time.Time{}
+		return nudgePollDecision{action: nudgePollWait, missingSince: missingSince, unknownSince: unknownSince}
+	}
+	if !obs.Running {
+		if shouldKeepNudgePollerAlive(target, missingSince, now) {
+			if missingSince.IsZero() {
+				missingSince = now
+			}
+			return nudgePollDecision{action: nudgePollWait, missingSince: missingSince}
+		}
+		return nudgePollDecision{action: nudgePollExit, reason: "the session is not running and nothing is left to deliver (or the start grace is over)"}
+	}
+	return nudgePollDecision{action: nudgePollDeliver}
+}
+
+// runNudgePollLoop is the legacy per-session poller body. It returns only when
+// decideNudgePollRound says to stop; every exit leaves its reason on stderr, which
+// ensureNudgePoller now points at the poller log (it used to be thrown away).
+func runNudgePollLoop(target nudgeTarget, store beads.Store, sp runtime.Provider, interval, quiescence time.Duration, stderr io.Writer) int {
+	var missingSince, unknownSince time.Time
+	failedRounds := 0
+	for {
+		now := nudgePollNow()
+		// vazio → a successful observation of a stopped session is a real answer
+		// (Running=false), handled by decideNudgePollRound; falhou/ilegível → the
+		// third state: logged once per streak, backed off, never fatal by itself.
+		obs, obsErr := nudgeObserveTarget(target, store, sp)
+		if obsErr != nil {
+			failedRounds++
+			if failedRounds == 1 {
+				fmt.Fprintf(stderr, "gc nudge poll: observing %s failed, will retry (backoff up to %s): %v\n", target.agentKey(), defaultNudgePollErrorBackoffMax, obsErr) //nolint:errcheck
+			}
+		} else if failedRounds > 0 {
+			fmt.Fprintf(stderr, "gc nudge poll: observation recovered after %d failed round(s)\n", failedRounds) //nolint:errcheck
+			failedRounds = 0
+		}
+
+		d := decideNudgePollRound(target, obs, obsErr, missingSince, unknownSince, now)
+		missingSince, unknownSince = d.missingSince, d.unknownSince
+		switch d.action {
+		case nudgePollExit:
+			verb := "exiting"
+			if d.exitCode != 0 {
+				verb = "giving up"
+			}
+			fmt.Fprintf(stderr, "gc nudge poll: %s: %s\n", verb, d.reason) //nolint:errcheck
+			return d.exitCode
+		case nudgePollWait:
+			nudgePollSleep(nudgePollErrorBackoff(interval, failedRounds))
+			continue
+		}
+
 		delivered, pollErr := tryDeliverQueuedNudgesByPoller(target, store, sp, quiescence, obs)
 		if pollErr != nil {
 			fmt.Fprintf(stderr, "gc nudge poll: %v\n", pollErr) //nolint:errcheck
@@ -584,13 +754,16 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 		if delivered {
 			continue
 		}
-		time.Sleep(interval)
+		nudgePollSleep(interval)
 	}
 }
 
 func shouldKeepNudgePollerAlive(target nudgeTarget, missingSince, now time.Time) bool {
+	// vazio → queue verified empty (no error, nothing pending or in flight): stop;
+	// falhou/ilegível → NOT empty: an unreadable queue cannot prove there is nothing
+	// to deliver, so the poller stays (still bounded by the start grace below).
 	pending, inFlight, _, err := listQueuedNudgesForTarget(target.cityPath, target, now)
-	if err != nil || (len(pending) == 0 && len(inFlight) == 0) {
+	if err == nil && len(pending) == 0 && len(inFlight) == 0 {
 		return false
 	}
 	if missingSince.IsZero() {
@@ -1352,14 +1525,28 @@ func ensureNudgePoller(cityPath, agentName, sessionName string) error {
 		if running, _ := existingPollerPID(pidPath, cityPath, sessionName, agentName); running {
 			return nil
 		}
-		exe, err := os.Executable()
+		exe, err := nudgePollerExecutable()
 		if err != nil {
 			return err
 		}
 		cmd := exec.Command(exe, nudgepoller.CommandArgs(cityPath, sessionName, agentName)...)
 		cmd.Env = os.Environ()
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
+		// The poller outlives this process, so its stdout/stderr MUST be real files.
+		// Never io.Discard (or any non-*os.File writer): os/exec turns that into a
+		// pipe whose read end lives in THIS short-lived CLI, and once we exit the
+		// poller dies of SIGPIPE on its first write to fd 1/2 -- every gc start
+		// prints a pack-drift warning to stderr, so that is within ~1 s, with no
+		// trace (ga-55jx16q: a crew's wait-idle nudge stayed PENDING for hours).
+		// A log file keeps the poller's last words; if the log cannot be opened,
+		// leave both nil so os/exec opens the null device (also a real fd) rather
+		// than not starting a poller at all.
+		// vazio → a new log (O_TRUNC, like the session submit poller);
+		// falhou → no log, /dev/null: delivery matters more than diagnostics.
+		if logFile, logErr := os.OpenFile(nudgePollerLogPath(cityPath, sessionName, agentName), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); logErr == nil {
+			defer logFile.Close() //nolint:errcheck
+			cmd.Stdout = logFile
+			cmd.Stderr = logFile
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if err := cmd.Start(); err != nil {
 			return err
@@ -2080,6 +2267,11 @@ func withNudgeQueueState(cityPath string, fn func(*nudgeQueueState) error) error
 
 func nudgePollerPIDPath(cityPath, sessionName, agentName string) string {
 	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".pid")
+}
+
+// nudgePollerLogPath is the same file the session submit poller logs to.
+func nudgePollerLogPath(cityPath, sessionName, agentName string) string {
+	return citylayout.RuntimePath(cityPath, "nudges", "pollers", nudgepoller.PollerFileStem(sessionName, agentName)+".log")
 }
 
 var errNudgePollerRunning = errors.New("nudge poller already running")
