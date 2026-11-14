@@ -2414,6 +2414,16 @@ func sweepUndesiredPoolSessionBeads(
 		if isManualSessionBead(bead) || isNamedSessionBead(bead) {
 			continue
 		}
+		// pin_awake is the operator's durable "keep this session" (gc session
+		// pin; ga-84rm): it survives config churn, so it must survive this
+		// sweep too. The sweep closed oracle-wa's pinned bead 8 min after the
+		// 13/11 boot as "no assigned work" and took the conversation armed on
+		// it along (ga-esorlre.6). Unpin (gc session unpin) makes it sweepable.
+		// E12: vazio (sem pin_awake) -> varre como antes; falhou/ilegivel
+		// (valor que nao e exatamente "true") -> nao e pin, varre como antes.
+		if sessionPinnedAwake(bead) {
+			continue
+		}
 		// Don't sweep beads that the reconciler still considers "start
 		// requested" — their work assignment window hasn't opened. The
 		// pending_create_claim lease mirrors the reconciler's recovery model:

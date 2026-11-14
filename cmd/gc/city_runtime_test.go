@@ -93,6 +93,69 @@ func TestSweepUndesiredPoolSessionBeads_KeepsRunningSessionsOpen(t *testing.T) {
 	}
 }
 
+// ga-esorlre.6: the sweep closed oracle-wa's pinned bead (asleep, city-stop, no
+// runtime) 8 min after the 13/11 boot as "no assigned work", and the
+// conversation armed on it went with it. pin_awake is the operator's durable
+// "keep this session"; the unpinned twin must still be swept (the control keeps
+// this test from passing because the fixture was never sweepable).
+func TestSweepUndesiredPoolSessionBeads_SkipsPinnedAwakeBead(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pin        string
+		wantClosed int
+	}{
+		{"pinned is kept", "true", 0},
+		{"unpinned control is swept", "", 1},
+		{"unreadable pin value is not a pin", "yes", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			meta := map[string]string{
+				"session_name":         "worker-bd-123",
+				"template":             "worker",
+				"agent_name":           "worker",
+				"pool_slot":            "1",
+				poolManagedMetadataKey: boolMetadata(true),
+				"state":                "asleep",
+				"sleep_reason":         "city-stop",
+				"continuation_epoch":   "1",
+				"generation":           "1",
+			}
+			if tc.pin != "" {
+				meta["pin_awake"] = tc.pin
+			}
+			bead, err := store.Create(beads.Bead{
+				Title:    "worker",
+				Type:     sessionBeadType,
+				Labels:   []string{sessionBeadLabel, "agent:worker"},
+				Metadata: meta,
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			closed := sweepUndesiredPoolSessionBeads(
+				store,
+				nil,
+				newSessionBeadSnapshot([]beads.Bead{bead}),
+				nil,
+				&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(1)}}},
+				runtime.NewFake(),
+				false,
+			)
+			if closed != tc.wantClosed {
+				t.Fatalf("closed = %d, want %d", closed, tc.wantClosed)
+			}
+			got, err := store.Get(bead.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if wasClosed := got.Status == "closed"; wasClosed != (tc.wantClosed == 1) {
+				t.Fatalf("bead status = %q, want closed=%v", got.Status, tc.wantClosed == 1)
+			}
+		})
+	}
+}
+
 func TestPoolSweepWouldDrain(t *testing.T) {
 	store := beads.NewMemStore()
 	bead, err := store.Create(beads.Bead{

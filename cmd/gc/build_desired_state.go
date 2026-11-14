@@ -3140,7 +3140,7 @@ func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, templ
 	if isFailedCreateSessionBead(bead) {
 		return false
 	}
-	if bead.Metadata["state"] == "asleep" {
+	if bead.Metadata["state"] == "asleep" && !reusableAsleepCityStopPoolBead(bp, cfgAgent, template, bead, used) {
 		return false
 	}
 	if isManualSessionBeadForAgent(bead, cfgAgent) {
@@ -3158,6 +3158,45 @@ func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, templ
 	return resolvedSessionTemplate(bead, reuseTemplateConfig(bp)) == template
 }
 
+// reusableAsleepCityStopPoolBead reports whether an ASLEEP pool bead may be
+// reused instead of planning a fresh one: only a bead put to sleep by `gc stop`
+// (sleep_reason=city-stop) of a template with min_active_sessions>0, and only
+// while the beads already taken for this template this tick are fewer than the
+// minimum. That is exactly the set ComputeAwakeSet revives with the
+// "min-active" reason (cityStopPoolBeads, #2739), so the two sides agree: the
+// bead is both desired and woken, never desired-but-cold (the deadlock the
+// blanket asleep skip above exists to prevent).
+//
+// Without this the reboot planned a fresh bead next to the asleep one, the
+// asleep one fell out of desiredState and was swept as "no assigned work", and
+// the conversation armed on it (session_key, session.resume_armed_id) was
+// orphaned with it: the crew came back on a NEW conversation (ga-esorlre.6,
+// oracle-wa 13/11, sweep 8 min after boot).
+//
+// Any other asleep bead (idle-timeout, drained, template without a minimum)
+// keeps the old rule: not reused, the reconciler closes it.
+// E12: vazio (sem sleep_reason, minimo 0, bp sem snapshot) -> NAO reaproveita,
+// como antes; falhou/ilegivel (sleep_reason de outro valor) -> NAO reaproveita.
+func reusableAsleepCityStopPoolBead(bp *agentBuildParams, cfgAgent *config.Agent, template string, bead beads.Bead, used map[string]bool) bool {
+	if bp == nil || bp.sessionBeads == nil || cfgAgent == nil {
+		return false
+	}
+	if strings.TrimSpace(bead.Metadata["sleep_reason"]) != sleepReasonCityStop {
+		return false
+	}
+	minActive := cfgAgent.EffectiveMinActiveSessions()
+	if minActive <= 0 {
+		return false
+	}
+	taken := 0
+	for _, other := range bp.sessionBeads.Open() {
+		if other.ID != bead.ID && used[other.ID] && resolvedSessionTemplate(other, reuseTemplateConfig(bp)) == template {
+			taken++
+		}
+	}
+	return taken < minActive
+}
+
 func reusablePoolSessionBeads(bp *agentBuildParams, cfgAgent *config.Agent, template string, used map[string]bool) []beads.Bead {
 	if bp == nil || bp.sessionBeads == nil {
 		return nil
@@ -3169,6 +3208,11 @@ func reusablePoolSessionBeads(bp *agentBuildParams, cfgAgent *config.Agent, temp
 		}
 	}
 	sortSessionBeadsByCreatedAtThenID(candidates)
+	// A live bead is taken before an asleep city-stop one: ComputeAwakeSet only
+	// revives the asleep ones for the deficit the live beads leave.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].Metadata["state"] != "asleep" && candidates[j].Metadata["state"] == "asleep"
+	})
 	return candidates
 }
 

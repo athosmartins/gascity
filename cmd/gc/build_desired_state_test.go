@@ -9752,6 +9752,80 @@ func TestSelectOrCreatePoolSessionBead_SkipsAsleepBeads(t *testing.T) {
 	}
 }
 
+// ga-esorlre.6: a min_active_sessions template's asleep city-stop bead is the
+// one ComputeAwakeSet revives ("min-active", #2739). Pool realization must pick
+// the SAME bead; planning a fresh one next to it orphaned the asleep bead (and
+// the conversation armed on it) and the sweep then closed it.
+func TestSelectOrCreatePoolSessionBead_ReusesAsleepCityStopBeadWithinMinActive(t *testing.T) {
+	mk := func(t *testing.T, store beads.Store, id, state, sleepReason string) beads.Bead {
+		t.Helper()
+		meta := map[string]string{
+			"template":     "oracle",
+			"session_name": "oracle-" + id,
+			"state":        state,
+			"pool_managed": "true",
+			"session_key":  "00000000-0000-4000-8000-" + id,
+		}
+		if sleepReason != "" {
+			meta["sleep_reason"] = sleepReason
+		}
+		b, err := store.Create(beads.Bead{Title: "oracle", Type: sessionBeadType, Labels: []string{sessionBeadLabel, "template:oracle"}, Metadata: meta})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	run := func(t *testing.T, minActive int, sleepReason string, takenBefore int) (asleepID, gotID string) {
+		store := beads.NewMemStore()
+		cfgAgent := config.Agent{Name: "oracle", MinActiveSessions: intPtr(minActive), MaxActiveSessions: intPtr(3)}
+		used := map[string]bool{}
+		var all []beads.Bead
+		for i := 0; i < takenBefore; i++ {
+			live := mk(t, store, fmt.Sprintf("%012d", i+1), "active", "")
+			used[live.ID] = true
+			all = append(all, live)
+		}
+		asleep := mk(t, store, "000000000099", "asleep", sleepReason)
+		all = append(all, asleep)
+		bp := &agentBuildParams{beadStore: store, sessionBeads: newSessionBeadSnapshot(all), agents: []config.Agent{cfgAgent}}
+		got, _, err := selectOrCreatePoolSessionBead(bp, &cfgAgent, "oracle", nil, used, map[int]bool{})
+		if err != nil {
+			t.Fatalf("selectOrCreatePoolSessionBead: %v", err)
+		}
+		return asleep.ID, got.ID
+	}
+	t.Run("city-stop asleep bead of a min_active=1 template is the one reused", func(t *testing.T) {
+		asleep, got := run(t, 1, "city-stop", 0)
+		if got != asleep {
+			t.Fatalf("got %q, want the asleep city-stop bead %q (a fresh bead orphans the armed conversation)", got, asleep)
+		}
+	})
+	t.Run("idle-timeout asleep bead is not reused", func(t *testing.T) {
+		asleep, got := run(t, 1, "idle-timeout", 0)
+		if got == asleep {
+			t.Fatal("an idle-timeout asleep bead must keep the old rule: fresh session instead")
+		}
+	})
+	t.Run("no sleep_reason is not reused", func(t *testing.T) {
+		asleep, got := run(t, 1, "", 0)
+		if got == asleep {
+			t.Fatal("an asleep bead without city-stop must not be reused")
+		}
+	})
+	t.Run("template without a minimum is not reused", func(t *testing.T) {
+		asleep, got := run(t, 0, "city-stop", 0)
+		if got == asleep {
+			t.Fatal("min_active_sessions=0: ComputeAwakeSet does not revive it, so reusing it would leave it desired but cold")
+		}
+	})
+	t.Run("beyond the minimum is not reused", func(t *testing.T) {
+		asleep, got := run(t, 1, "city-stop", 1)
+		if got == asleep {
+			t.Fatal("the minimum is already met by a taken bead: ComputeAwakeSet would not revive this one")
+		}
+	})
+}
+
 func TestSelectOrCreatePoolSessionBead_ReusesActiveBeforeCreatingNew(t *testing.T) {
 	// An active (awake) pool session IS reused — no fresh bead created.
 	store := beads.NewMemStore()
