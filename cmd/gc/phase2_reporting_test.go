@@ -194,9 +194,11 @@ func initialMessageResumeResult(tc phase2ProviderCase, prepared *preparedStart) 
 	case strings.TrimSpace(prepared.cfg.PromptFlag) != "":
 		return workertest.Fail(tc.profileID, workertest.RequirementInputInitialMessageResume,
 			fmt.Sprintf("PromptFlag = %q, want no flag startup prompt replay on resume", prepared.cfg.PromptFlag)).WithEvidence(evidence)
-	case got != "Base worker prompt":
+	case got != resumeNotice:
+		// ga-esorlre.3: a resumed conversation already opens with the startup
+		// prompt, so the restart payload is the short resume notice, not a replay.
 		return workertest.Fail(tc.profileID, workertest.RequirementInputInitialMessageResume,
-			fmt.Sprintf("restart prompt payload = %q, want base worker prompt on resume", got)).WithEvidence(evidence)
+			fmt.Sprintf("restart prompt payload = %q, want the short resume notice on resume (ga-esorlre.3)", got)).WithEvidence(evidence)
 	case strings.Contains(prepared.cfg.Nudge, "Do the first task."):
 		return workertest.Fail(tc.profileID, workertest.RequirementInputInitialMessageResume,
 			fmt.Sprintf("cfg.Nudge = %q, want no replayed initial message", prepared.cfg.Nudge)).WithEvidence(evidence)
@@ -271,9 +273,10 @@ func resumeRestartPromptResult(tc phase2ProviderCase, prepared *preparedStart, r
 	case strings.TrimSpace(prepared.cfg.PromptFlag) != "":
 		return workertest.Fail(tc.profileID, requirement,
 			fmt.Sprintf("PromptFlag = %q, want no flag startup prompt replay on resume", prepared.cfg.PromptFlag)).WithEvidence(evidence)
-	case got != "Base worker prompt":
+	case got != resumeNotice:
+		// ga-esorlre.3: see initialMessageResumeResult.
 		return workertest.Fail(tc.profileID, requirement,
-			fmt.Sprintf("restart prompt payload = %q, want base worker prompt", got)).WithEvidence(evidence)
+			fmt.Sprintf("restart prompt payload = %q, want the short resume notice (ga-esorlre.3)", got)).WithEvidence(evidence)
 	case strings.Contains(prepared.cfg.Nudge, "Do the first task."):
 		return workertest.Fail(tc.profileID, requirement,
 			fmt.Sprintf("cfg.Nudge = %q, want no replayed initial_message on resume", prepared.cfg.Nudge)).WithEvidence(evidence)
