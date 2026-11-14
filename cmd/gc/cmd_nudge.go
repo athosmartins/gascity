@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -1238,12 +1239,52 @@ func splitQueuedNudgesForTarget(target nudgeTarget, items []queuedNudge) ([]queu
 	var rejected []queuedNudge
 	for _, item := range items {
 		if !queuedNudgeMatchesTargetFence(target, item) {
+			if queuedNudgeReaddressableToTarget(target, item) {
+				deliverable = append(deliverable, item)
+				continue
+			}
 			rejected = append(rejected, item)
 			continue
 		}
 		deliverable = append(deliverable, item)
 	}
 	return deliverable, rejected
+}
+
+// queuedNudgeReaddressableToTarget reports whether a nudge whose fence no
+// longer matches should still be delivered to the live conversation of the same
+// session (ga-5aovajz.1).
+//
+// A fresh wake bumps continuation_epoch on the SAME session bead (the mayor was
+// at epoch 201 -> 209 in a week). Dead-lettering every nudge queued under the
+// previous epoch dropped 136 of 783 closed nudges (17%; 130 source "session",
+// 6 "mail", none "wait"), including a P0 gate
+// FAIL for a crew; the sender saw "Queued" and exit 0 and was never told.
+// Only nudges addressed to the agent (a person or a role: source "session" or
+// "mail") are re-addressed. A "wait" nudge belongs to the conversation that
+// registered the wait (cmd_wait.go checks registered_epoch itself), so it keeps
+// the fence. The match is strict: the same session bead (or an item with no
+// session), both epochs readable, and the item strictly OLDER than the live
+// one. An unreadable or newer item epoch is the "cannot tell" state and keeps
+// the previous behavior (rejected), not a guess.
+func queuedNudgeReaddressableToTarget(target nudgeTarget, item queuedNudge) bool {
+	switch item.Source {
+	case "session", "mail":
+	default:
+		return false
+	}
+	if item.SessionID != "" && item.SessionID != target.sessionID {
+		return false
+	}
+	itemEpoch, err := strconv.Atoi(strings.TrimSpace(item.ContinuationEpoch))
+	if err != nil {
+		return false
+	}
+	targetEpoch, err := strconv.Atoi(strings.TrimSpace(target.continuationEpoch))
+	if err != nil {
+		return false
+	}
+	return itemEpoch < targetEpoch
 }
 
 func splitQueuedNudgesForDelivery(store beads.Store, items []queuedNudge) ([]queuedNudge, map[string][]queuedNudge, error) {
