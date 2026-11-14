@@ -3820,6 +3820,73 @@ func workOrderPickFunctionScript() string {
 		`}; `
 }
 
+// diskHoldFunctionScript defines the shell function disk_hold (stdin: a JSON array of
+// beads; stdout: the array the pool may hand out). ga-z1drlu7 (P1), the engine half of
+// ga-vln2py's disk floor: with the free disk under the new-work floor (5 GB, the city's
+// disk-headroom-lib.sh) the routed pool tier offers NO NEW STORY, and the reconciler's
+// count form does not count one as demand. Without it the claude-headless template the
+// engine synthesizes per rig (no prompt, no work_query, no scale_check of the city's own)
+// started a session for the same story three times in one afternoon with the mini at
+// 1.3-4.7 GB free; only the agent's own restraint stopped the damage, and a builder
+// started on a disk that low is what filled it on 17/10 and took Dolt down.
+//
+// THREE states, read from the lib in a child bash (`disk_headroom_state`, which prints
+// exactly ok | low | unknown), never two:
+//
+//   - ok       -> the array passes through untouched.
+//   - low      -> the array loses its NEW STORIES (DISK_HOLD_NEW_STORIES_JQ, the ONE
+//     definition, owned by the lib: a story type with none of the formula marks gc.kind /
+//     gc.step_ref / gc.pool_demand). Formula work, and any shape the lib does not positively
+//     recognise as a story, still flows: it is what gets the city out of a low-disk hole.
+//   - anything else (lib not readable, child failed, printed a banner, df unreadable,
+//     "unknown") -> the array passes through untouched and a WARN says so: FAIL OPEN, a df
+//     hiccup must not starve the pool. Same decision as scripts/pool-probe.sh.
+//
+// vazio/falhou/ilegível: low but the hold text is empty or jq cannot apply it -> `[]`
+// (INERT: nothing is offered and nothing is counted); that is "I could not tell what is
+// safe to hand out", never "go ahead" and never a crash of the query. Only the routed
+// pool tier calls it: assigned work (crash recovery, pre-assigned beads) is never held. The
+// two legacy tiers (tier 2, the gc.run_target migration rows, which are gc.kind=workflow
+// by construction; tier 3, the ephemeral wisps) are not held either, exactly as in
+// scripts/pool-probe.sh: they are the city's own formula work. A routed wisp that carries
+// no formula mark at all would be a "story" by the lib's definition and flows there too;
+// the dog pool's measured shape (17/10, 1684 beads) has none.
+//
+// The lib is found at $DISK_HEADROOM_LIB, else under $GC_CITY_PATH (then $GC_CITY), the
+// same lookup as wo_pick, and is read in a CHILD bash for the same reasons (a POSIX sh
+// EXITS when `.` cannot open its file; the lib is bash). A line is appended to
+// $DISK_HOLD_LOG (else <city>/.gc/logs/disk-hold.log) whenever the disk is not ok: the hold
+// was applied, the reading was unreadable (fail-open), or the hold could not be applied
+// (inert); best effort, because a full disk is exactly when that write fails. The
+// pool-probe script writes its own pool-probe.log and is not changed by this.
+func diskHoldFunctionScript() string {
+	return `disk_hold() { ` +
+		`dh_in=$(cat); ` +
+		`case "$dh_in" in ""|"[]") printf "%s" "$dh_in"; return 0;; esac; ` +
+		`dh_lib="${DISK_HEADROOM_LIB:-}"; dh_root="${GC_CITY_PATH:-}"; [ -n "$dh_root" ] || dh_root="${GC_CITY:-}"; ` +
+		`if [ -z "$dh_lib" ] && [ -n "$dh_root" ]; then dh_lib="$dh_root/packs/town-deltas/assets/scripts/disk-headroom-lib.sh"; fi; ` +
+		`dh_log="${DISK_HOLD_LOG:-}"; if [ -z "$dh_log" ] && [ -n "$dh_root" ]; then dh_log="$dh_root/.gc/logs/disk-hold.log"; fi; ` +
+		// vazio (no lib path / not readable) and falhou/ilegível (child failed, banner, df unreadable):
+		// dh_state stays "" or is not exactly ok|low, so it lands in the fail-open arm below.
+		`dh_state=""; if [ -r "$dh_lib" ]; then dh_state=$(bash -c '. "$1" && disk_headroom_state' dh "$dh_lib"); fi; ` +
+		`case "$dh_state" in ` +
+		`ok) printf "%s" "$dh_in"; return 0;; ` +
+		`low) ;; ` +
+		`*) echo "disk-hold WARN: free disk unreadable (lib=${dh_lib:-unset}); new stories not held back (fail-open)" >&2; ` +
+		`[ -n "$dh_log" ] && [ -d "${dh_log%/*}" ] && printf "%s disk-hold[%s]: free disk unreadable (lib=%s) - fail-open\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${target:-?}" "${dh_lib:-unset}" >> "$dh_log" || true; ` +
+		`printf "%s" "$dh_in"; return 0;; ` +
+		`esac; ` +
+		// low: read the story definition from the lib (vazio/falhou -> empty text -> the inert arm below)
+		`dh_jq=$(bash -c '. "$1" && printf "%s" "$DISK_HOLD_NEW_STORIES_JQ"' dh "$dh_lib"); ` +
+		`if [ -n "$dh_jq" ] && dh_out=$(printf "%s" "$dh_in" | jq -c "$dh_jq") && [ -n "$dh_out" ]; then ` +
+		`[ -n "$dh_log" ] && [ -d "${dh_log%/*}" ] && printf "%s disk-hold[%s]: free disk under the floor - hold applied: new stories held back\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${target:-?}" >> "$dh_log" || true; ` +
+		`printf "%s" "$dh_out"; return 0; fi; ` +
+		`echo "disk-hold WARN: free disk under the floor but the hold could not be applied (lib=$dh_lib or jq); offering nothing" >&2; ` +
+		`[ -n "$dh_log" ] && [ -d "${dh_log%/*}" ] && printf "%s disk-hold[%s]: free disk under the floor - hold could not be applied, offering nothing\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${target:-?}" >> "$dh_log" || true; ` +
+		`printf "[]"; ` +
+		`}; `
+}
+
 // workOrderHeadStage is the tail every tier ends with: order the survivors with
 // wo_pick, then take the first row. fallbackJQ is wo_pick's fallback filter
 // ("" = leave bd's order alone); see workOrderPickFunctionScript. Callers must
@@ -3857,7 +3924,7 @@ func workOrderHeadStage(fallbackJQ string) string {
 // script this returns CALLS wo_pick and does not define it: every caller emits
 // workOrderPickFunctionScript() ahead of it (see TestWorkOrderPickIsDefinedBeforeEveryUse).
 func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
-	return `probe_pool_demand() { ` +
+	return diskHoldFunctionScript() + `probe_pool_demand() { ` +
 		`target="$1"; ` +
 		`[ -z "$target" ] && return 1; ` +
 		`r=$(` + routedReadyTierCommand(includeEphemeralReady) + `); ` +
@@ -3916,7 +3983,7 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// work-order.sh is missing or cannot tell, wo_pick falls back to the LRU
 	// re-rank above, which is now ONLY that fallback (and says so on stderr).
 	// Requires workOrderPickFunctionScript() in the same script.
-	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit 0", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | ` + workOrderHeadStage(workOrderLRUFallbackJQ) + `; }`
+	return `{ ` + bdReadyPoolDemandShell("--sort oldest --limit 0", includeEphemeralReady) + ` 2>/dev/null | ` + poolDemandLabelFilterJQ() + ` 2>/dev/null | ` + moleculeLiveStepFilterShell() + ` 2>/dev/null | disk_hold | ` + workOrderHeadStage(workOrderLRUFallbackJQ) + `; }`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -3970,10 +4037,14 @@ func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 	// fails (non-zero) on a genuine jq crash, never on an ordinary bd list
 	// --parent miss, so this does not reintroduce the masking failure mode
 	// TestEffectiveScaleCheckUsesReadyOnly guards against.
-	script := `target="$1"; ` +
+	script := diskHoldFunctionScript() + `target="$1"; ` +
 		`ready_json=$(` + bdReadyPoolDemandShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`ready_json=$(printf "%s" "$ready_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
 		`ready_json=$(printf "%s" "$ready_json" | ` + moleculeLiveStepFilterShell() + `) || exit $?; ` +
+		// ga-z1drlu7: the same disk hold the worker's probe applies, so the reconciler does not
+		// start a session for a story the probe would then refuse to hand out (the spawn loop).
+		// Every branch of disk_hold returns 0: ok/unknown pass through, low holds, an unusable hold prints [].
+		`ready_json=$(printf "%s" "$ready_json" | disk_hold) || exit $?; ` +
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_json" | ` + poolDemandLabelFilterJQ() + `) || exit $?; ` +
