@@ -1081,6 +1081,87 @@ func TestPrepareStartCandidate_ResumeCapableWithoutSessionKeyKeepsStartupPrompt(
 	}
 }
 
+func TestRestartPromptNudge_ResumeSendsShortNoticeNotTheWholePrompt(t *testing.T) {
+	t.Setenv(resumeFullPromptEnv, "")
+	big := strings.Repeat("startup prompt line\n", 5000)
+	got := restartPromptNudge(big, "base nudge")
+	if strings.Contains(got, "startup prompt line") {
+		t.Fatalf("resumed nudge carries the whole startup prompt (%d bytes), want only the short notice", len(got))
+	}
+	if want := resumeNotice + startupPromptNudgeSeparator + "base nudge"; got != want {
+		t.Fatalf("restartPromptNudge = %q, want %q", got, want)
+	}
+	if got := restartPromptNudge(big, ""); got != resumeNotice {
+		t.Fatalf("restartPromptNudge without a base nudge = %q, want the notice alone", got)
+	}
+	if got := restartPromptNudge("  ", "base nudge"); got != "base nudge" {
+		t.Fatalf("restartPromptNudge with no prompt = %q, want the base nudge untouched", got)
+	}
+}
+
+func TestRestartPromptNudge_EnvKeepsTheFullPromptOnResume(t *testing.T) {
+	t.Setenv(resumeFullPromptEnv, "1")
+	got := restartPromptNudge("startup prompt", "base nudge")
+	if want := "startup prompt" + startupPromptNudgeSeparator + "base nudge"; got != want {
+		t.Fatalf("restartPromptNudge with %s=1 = %q, want %q", resumeFullPromptEnv, got, want)
+	}
+}
+
+func TestPrepareStartCandidate_ResumedSessionGetsTheShortNoticeAndStillMarksThePromptDelivered(t *testing.T) {
+	t.Setenv(resumeFullPromptEnv, "")
+	store := beads.NewMemStore()
+	session, err := store.Create(beads.Bead{
+		Title:  "thies-wa",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel, "agent:thies-wa"},
+		Metadata: map[string]string{
+			"template":            "thies-wa",
+			"session_name":        "thies-wa",
+			"started_config_hash": "previous-start",
+			"session_key":         "0a1b2c3d-0000-4000-8000-000000000001",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prepared, err := prepareStartCandidate(startCandidate{
+		session: &session,
+		tp: TemplateParams{
+			TemplateName: "thies-wa",
+			SessionName:  "thies-wa",
+			Command:      "claude --model opus",
+			Prompt:       "You are Thies. " + strings.Repeat("long doctrine ", 4000),
+			ResolvedProvider: &config.ResolvedProvider{
+				Name:        "claude",
+				PromptMode:  "arg",
+				ResumeFlag:  "--resume",
+				ResumeStyle: "flag",
+			},
+		},
+		order: 0,
+	}, &config.City{}, store, &clock.Fake{Time: time.Date(2026, 11, 13, 3, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatalf("prepareStartCandidate: %v", err)
+	}
+
+	if !strings.Contains(prepared.cfg.Command, "--resume 0a1b2c3d-0000-4000-8000-000000000001") {
+		t.Fatalf("prepared.cfg.Command = %q, want a resume of the stored session_key", prepared.cfg.Command)
+	}
+	if prepared.cfg.PromptSuffix != "" {
+		t.Fatalf("PromptSuffix = %q, want empty on a resumed wake", prepared.cfg.PromptSuffix)
+	}
+	if strings.Contains(prepared.cfg.Nudge, "long doctrine") {
+		t.Fatalf("Nudge carries the startup prompt (%d bytes), want only the short notice", len(prepared.cfg.Nudge))
+	}
+	if !strings.Contains(prepared.cfg.Nudge, resumeNotice) {
+		t.Fatalf("Nudge = %q, want it to carry the resume notice", prepared.cfg.Nudge)
+	}
+	if prepared.cfg.Env[startupPromptDeliveredEnv] != "1" {
+		t.Fatalf("%s = %q, want 1: the prompt IS in the resumed conversation, `gc prime` must not print it again", startupPromptDeliveredEnv, prepared.cfg.Env[startupPromptDeliveredEnv])
+	}
+}
+
 func TestPrepareStartCandidate_DoesNotAppendCLIResumeFlagForACP(t *testing.T) {
 	store := beads.NewMemStore()
 	session, err := store.Create(beads.Bead{

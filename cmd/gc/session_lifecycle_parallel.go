@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -1259,11 +1260,25 @@ func appendInitialMessageToStartupNudge(nudge, msg string) string {
 	return userMessage
 }
 
+// resumeFullPromptEnv, when set to "1" in the supervisor's environment, restores
+// the old behaviour of re-sending the whole startup prompt on a resumed wake.
+const resumeFullPromptEnv = "GC_RESUME_FULL_PROMPT"
+
+// resumeNotice is what a RESUMED session gets instead of its startup prompt: the
+// conversation it resumes already opens with that prompt, so re-sending it
+// (~89k chars for the Mayor and the crews) only duplicates ~20k tokens per
+// reboot (ga-esorlre.3).
+const resumeNotice = "[gascity] Sessão retomada na mesma conversa depois de um reinício. " +
+	"O prompt de partida já está no início desta conversa e NÃO foi reenviado; rode `gc prime` se precisar reler a doutrina atual."
+
 func restartPromptNudge(prompt, nudge string) string {
 	if strings.TrimSpace(prompt) == "" {
 		return nudge
 	}
-	return prependStartupPromptToNudge(prompt, nudge)
+	if os.Getenv(resumeFullPromptEnv) == "1" {
+		return prependStartupPromptToNudge(prompt, nudge)
+	}
+	return prependStartupPromptToNudge(resumeNotice, nudge)
 }
 
 func startupRateLimitScreenDetected(
