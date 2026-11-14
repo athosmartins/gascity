@@ -351,6 +351,19 @@ func orderSetSignature(aa []orders.Order) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
+// orderDispatchBudget returns how many orders one controller tick may start:
+// [orders] max_dispatches_per_tick when it is a positive integer, otherwise
+// defaultMaxOrderDispatchesPerTick. Zero, a negative value and "unset" all mean
+// the default; the dispatcher's own "<= 0 = unlimited" is not reachable from
+// config. The default must stay equal to the one documented on
+// config.OrdersConfig.MaxDispatchesPerTick (and in docs/reference/config.md).
+func orderDispatchBudget(cfg *config.City) int {
+	if cfg != nil && cfg.Orders.MaxDispatchesPerTick > 0 {
+		return cfg.Orders.MaxDispatchesPerTick
+	}
+	return defaultMaxOrderDispatchesPerTick
+}
+
 func buildOrderDispatcherFromOrderSet(cityPath string, cfg *config.City, allAA []orders.Order, rec events.Recorder, stderr io.Writer) orderDispatcher {
 	if cfg == nil {
 		cfg = &config.City{}
@@ -386,7 +399,7 @@ func buildOrderDispatcherFromOrderSet(cityPath string, cfg *config.City, allAA [
 		rec:                  rec,
 		stderr:               lockedStderr(stderr),
 		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
-		maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick,
+		maxDispatchesPerTick: orderDispatchBudget(cfg),
 		cfg:                  cfg,
 		cityName:             loadedCityName(cfg, cityPath),
 		dispatchCtx:          dispatchCtx,

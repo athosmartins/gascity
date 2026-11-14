@@ -1750,6 +1750,12 @@ type OrdersConfig struct {
 	// No order gets more than this duration. Go duration string (e.g., "60s").
 	// Empty means uncapped (no override).
 	MaxTimeout string `toml:"max_timeout,omitempty"`
+	// MaxDispatchesPerTick caps how many orders one controller tick may start.
+	// Orders due beyond the cap wait for a later tick; a rotating cursor keeps
+	// the wait fair. A positive integer. Unset or 0 keeps the default of 4.
+	// Raise it when more orders are due on every tick than the cap lets through,
+	// so that each one runs far less often than its interval says.
+	MaxDispatchesPerTick int `toml:"max_dispatches_per_tick,omitempty" jsonschema:"default=4"`
 	// Overrides apply per-order field overrides after scanning.
 	// Each override targets an order by name and optionally by rig.
 	Overrides []OrderOverride `toml:"overrides,omitempty"`
