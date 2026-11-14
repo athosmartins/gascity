@@ -2788,10 +2788,14 @@ func sessionHasOpenAssignedWorkForReachableStore(
 	session beads.Bead,
 ) (bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfig(session, cfg)
-	storeRef, ok := assignedWorkStoreRefForSession(cityPath, cfg, session)
-	if !ok {
+	// ga-3l2z0dz: a session whose work_dir is outside every rig resolves to
+	// storeRef "" yet claims from a rig store, so it is searched everywhere.
+	// E12: vazio → sem trabalho em nenhum store (libera); falhou/ilegível em
+	// QUALQUER store → erro (o chamador não fecha nem reinicia).
+	if assignedWorkSearchesEveryStore(cityPath, cfg, session) {
 		return sessionHasOpenAssignedWorkInStores(store, rigStores, identifiers)
 	}
+	storeRef, _ := assignedWorkStoreRefForSession(cityPath, cfg, session)
 	if storeRef == "" {
 		return sessionHasOpenAssignedWorkInStoreByIdentifiers(store, identifiers)
 	}
@@ -2813,10 +2817,11 @@ func sessionHasAwakeAssignedWorkForReachableStore(
 	session beads.Bead,
 ) (bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfig(session, cfg)
-	storeRef, ok := assignedWorkStoreRefForSession(cityPath, cfg, session)
-	if !ok {
+	// ga-3l2z0dz: same blind spot as the open variant (see there); E12 as above.
+	if assignedWorkSearchesEveryStore(cityPath, cfg, session) {
 		return sessionHasAwakeAssignedWorkInStores(store, rigStores, identifiers)
 	}
+	storeRef, _ := assignedWorkStoreRefForSession(cityPath, cfg, session)
 	if storeRef == "" {
 		return sessionHasAwakeAssignedWorkInStoreByIdentifiers(store, identifiers)
 	}
@@ -2828,20 +2833,7 @@ func sessionHasAwakeAssignedWorkForReachableStore(
 }
 
 func assignedWorkStoreRefForSession(cityPath string, cfg *config.City, session beads.Bead) (string, bool) {
-	if cfg == nil {
-		return "", false
-	}
-	template := normalizedSessionTemplate(session, cfg)
-	if template == "" {
-		template = strings.TrimSpace(session.Metadata["template"])
-	}
-	if template == "" {
-		template = strings.TrimSpace(session.Metadata["common_name"])
-	}
-	if template == "" {
-		return "", false
-	}
-	agentCfg := findAgentByTemplate(cfg, template)
+	agentCfg := assignedWorkAgentForSession(cfg, session)
 	if agentCfg == nil {
 		return "", false
 	}
@@ -2851,6 +2843,52 @@ func assignedWorkStoreRefForSession(cityPath string, cfg *config.City, session b
 	// pool-template agent (wa-worker, ps-worker) is its rig's store, not the
 	// city store (gt-69j2v).
 	return assignedWorkRoutingStoreRefForAgent(cityPath, cfg, agentCfg), true
+}
+
+// assignedWorkAgentForSession resolves the configured agent behind a session
+// bead (nil when the template is not resolvable).
+func assignedWorkAgentForSession(cfg *config.City, session beads.Bead) *config.Agent {
+	if cfg == nil {
+		return nil
+	}
+	template := normalizedSessionTemplate(session, cfg)
+	if template == "" {
+		template = strings.TrimSpace(session.Metadata["template"])
+	}
+	if template == "" {
+		template = strings.TrimSpace(session.Metadata["common_name"])
+	}
+	if template == "" {
+		return nil
+	}
+	return findAgentByTemplate(cfg, template)
+}
+
+// assignedWorkSearchesEveryStore reports whether a session's live assigned work
+// must be looked for in the city store AND every rig store: the agent template
+// is not resolvable (!ok), or it resolves to the city scope (storeRef == "")
+// only because its work_dir is OUTSIDE every rig.
+//
+// ga-3l2z0dz: workdirutil.RoutingRigName returns "" for three different agents.
+// (1) no dir and no work_dir: the session runs at the city root and its bd is
+// the city store, so "city store only" is right and stays (pinned by the
+// ...IgnoresUnreachableRigAssignedWork tests). (2) dir set but not a rig: not
+// touched here. (3) no dir and a work_dir that is not inside any rig —
+// wa-worker-remote, dog-remote, kimi-worker-remote and the dog pool
+// (work_dir = ".gc/agents/dogs/{{.AgentBase}}"). A session of kind (3) claims
+// from a rig store, but the store is not derivable from the config, so a probe
+// that read only the city store saw "no work" for a session whose in_progress
+// bead lived in the rig. Only kind (3) is widened.
+func assignedWorkSearchesEveryStore(cityPath string, cfg *config.City, session beads.Bead) bool {
+	storeRef, ok := assignedWorkStoreRefForSession(cityPath, cfg, session)
+	if !ok {
+		return true
+	}
+	if storeRef != "" {
+		return false
+	}
+	agentCfg := assignedWorkAgentForSession(cfg, session)
+	return agentCfg != nil && strings.TrimSpace(agentCfg.Dir) == "" && strings.TrimSpace(agentCfg.WorkDir) != ""
 }
 
 // firstOpenAssignedWorkBeadForReachableStore returns the first open or
@@ -2874,8 +2912,10 @@ func firstOpenAssignedWorkBeadForReachableStore(
 	session beads.Bead,
 ) (beads.Bead, bool, error) {
 	identifiers := sessionAssignmentIdentifiersForConfig(session, cfg)
-	storeRef, ok := assignedWorkStoreRefForSession(cityPath, cfg, session)
-	if !ok {
+	storeRef, _ := assignedWorkStoreRefForSession(cityPath, cfg, session)
+	// ga-3l2z0dz: fans out like the unresolvable-template case when the work_dir
+	// is outside every rig (see assignedWorkSearchesEveryStore); E12 as above.
+	if assignedWorkSearchesEveryStore(cityPath, cfg, session) {
 		if bead, found, err := firstOpenAssignedWorkBeadInStoreByIdentifiers(store, identifiers); err != nil || found {
 			return bead, found, err
 		}
@@ -3095,11 +3135,12 @@ func collectSessionAssignedWork(cityPath string, cfg *config.City, store beads.S
 		return nil
 	}
 	// Route to the same store the gate routed to.
-	storeRef, ok := assignedWorkStoreRefForSession(cityPath, cfg, session)
+	storeRef, _ := assignedWorkStoreRefForSession(cityPath, cfg, session)
 	switch {
-	case !ok:
-		// No agent template resolvable: gate fans out across the
-		// primary store + all rig stores. Mirror that.
+	case assignedWorkSearchesEveryStore(cityPath, cfg, session):
+		// No agent template resolvable, or a work_dir outside every rig
+		// (ga-3l2z0dz): gate fans out across the primary store + all rig
+		// stores. Mirror that.
 		if err := collect(store); err != nil {
 			return out, err
 		}
